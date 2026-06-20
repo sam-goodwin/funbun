@@ -46,7 +46,15 @@ declare module "bun:closure" {
    * module for closures that reference imports. It is async because the bundler
    * is async.
    *
+   * Handles arrow / `function` / `class` / extracted-method roots, captured
+   * object state (pruned to referenced members), and named / default /
+   * namespace (`import * as`) imports. Throws for native or bound-function
+   * roots, and for closures whose imports can't be resolved (e.g. no source
+   * location). `export * as` re-export barrels are a known sharp edge — the
+   * namespace is kept whole but the result is still correct.
+   *
    * @param fn The function to serialize.
+   * @param replacer Optional {@link ClosureReplacer} to transform/filter captured values.
    * @returns A promise for the bundled ES module source.
    * @example
    * ```ts
@@ -56,5 +64,5 @@ declare module "bun:closure" {
    * const moduleSource = await bundle(greet); // renderTemplate inlined + tree-shaken
    * ```
    */
-  function bundle(fn: Function): Promise<string>;
+  function bundle(fn: Function, replacer?: ClosureReplacer): Promise<string>;
 }

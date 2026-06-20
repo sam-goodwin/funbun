@@ -1311,7 +1311,20 @@ function collectReferencedNames(transpiler: any, source: string): Set<string> {
       refs.add(n.name);
       return;
     }
-    if (n.type === "FunctionDeclaration" || n.type === "FunctionExpression" || n.type === "ArrowFunctionExpression") {
+    if (n.type === "MemberExpression") {
+      // `obj.prop` references `obj`, not `prop` (a property name). Only a
+      // computed `obj[expr]` references the property expression.
+      walk(n.object);
+      if (n.computed) walk(n.property);
+      return;
+    }
+    if (
+      n.type === "FunctionDeclaration" ||
+      n.type === "FunctionExpression" ||
+      n.type === "ArrowFunctionExpression" ||
+      n.type === "ClassDeclaration" ||
+      n.type === "ClassExpression"
+    ) {
       if (n.id) bound.add(n.id.name);
       for (const p of n.params || []) if (p?.type === "Identifier") bound.add(p.name);
     }
@@ -1331,7 +1344,7 @@ function collectReferencedNames(transpiler: any, source: string): Set<string> {
 // bundler resolves + inlines + tree-shakes them. Unlike `serialize`, closures
 // that reference imported bindings produce a working standalone module. Async
 // (the bundler is async). Returns the bundled ESM source.
-async function bundle(fn: Function): Promise<string> {
+async function bundle(fn: Function, replacer?: Replacer): Promise<string> {
   if (typeof fn !== "function") {
     throw new TypeError("bundle() expects a function");
   }
@@ -1340,7 +1353,14 @@ async function bundle(fn: Function): Promise<string> {
   const Bun = (globalThis as any).Bun;
   const transpiler = new Bun.Transpiler();
 
+  // A bound function also stringifies as `[native code]`, so check it first.
+  if ((fn as any)[Symbol.boundFunction] !== undefined) {
+    throw new TypeError("Cannot bundle a bound function as the root; use serialize() instead");
+  }
   const source = fn.toString();
+  if (isNativeFunctionSource(source)) {
+    throw new TypeError("Cannot bundle a native function (no JavaScript source is available)");
+  }
   const location = (fn as any)[Symbol.sourceLocation];
   const url: string | undefined = location?.url;
 
@@ -1352,7 +1372,7 @@ async function bundle(fn: Function): Promise<string> {
     refs: new Map(),
     counter: 0,
     sharedIds,
-    replacer: undefined,
+    replacer: typeof replacer === "function" ? replacer : undefined,
     sourceBlocks: [],
     keepSets: computeKeepSets(fn),
   };
@@ -1408,22 +1428,34 @@ async function bundle(fn: Function): Promise<string> {
 
   // 4. Re-import the remaining referenced module-level dependencies (named imports
   //    that JSC does not surface as free variables) from their original sources.
+  //    Names we can neither bind to state, a global, nor an import are dangling —
+  //    most commonly because the closure's source module couldn't be located.
+  const unresolved: string[] = [];
   for (const name of collectReferencedNames(transpiler, source)) {
     if (stateNames.has(name) || emitted.has(name) || name in (globalThis as any)) continue;
     const binding = bindings.get(name);
     if (binding) emitImport(name, binding);
+    else unresolved.push(name);
+  }
+  if (unresolved.length > 0) {
+    const where = url ? `module "${url}"` : "an unknown module (no source location available)";
+    throw new Error(
+      `Cannot bundle closure: it references ${unresolved.map(n => `"${n}"`).join(", ")}, ` +
+        `which is neither captured state nor an import resolvable from ${where}.`,
+    );
   }
 
-  // 4. Synthetic entry wiring imports + state to the reconstructed closure.
+  // 5. Synthetic entry wiring imports + state to the reconstructed closure. The
+  //    root is reconstructed form-aware (arrow / function / class / method).
   const entry = [
     ...importLines,
     stateNames.size ? `import { ${[...stateNames].join(", ")} } from "bun-closure:state";` : "",
-    `export default (${source});`,
+    `export default ${functionSourceToExpression(source, "default")};`,
   ]
     .filter(Boolean)
     .join("\n");
 
-  // 5. Drive the bundler; it resolves + inlines + tree-shakes the real imports.
+  // 6. Drive the bundler; it resolves + inlines + tree-shakes the real imports.
   const result = await Bun.build({
     entrypoints: ["bun-closure:entry"],
     format: "esm",

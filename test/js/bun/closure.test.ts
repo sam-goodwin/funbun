@@ -1153,4 +1153,52 @@ describe("bundle (bundler-backed)", () => {
     expect(lines.find(l => l.startsWith("RESULT:"))).toBe("RESULT:USED");
     expect({ stderr, exitCode }).toEqual({ stderr: expect.any(String), exitCode: 0 });
   });
+
+  test("handles method / class / generator roots and the replacer", async () => {
+    using dir = tempDir(`closure-bundle-forms-${counter++}`, {
+      "main.mjs": `
+        import { bundle } from "bun:closure";
+        import { writeFileSync } from "node:fs";
+        let i = 0;
+        const rt = async (fn, replacer) => {
+          const out = await bundle(fn, replacer);
+          const f = new URL(\`./o\${i++}.mjs\`, import.meta.url);
+          writeFileSync(f, out);
+          return { out, mod: await import(f.href) };
+        };
+        const obj = { greet(n) { return "hi " + n; } };
+        const method = (await rt(obj.greet)).mod.default("x");
+        class Pt { constructor(x) { this.x = x; } get() { return this.x; } }
+        const cls = new (await rt(Pt)).mod.default(7).get();
+        async function* gen() { yield 1; yield 2; }
+        const genVals = await Array.fromAsync((await rt(gen)).mod.default());
+        const secret = { token: "SECRET", keep: "KEEP" };
+        const r = await rt(() => secret.keep + ":" + secret.token, (k, v) => (k === "token" ? "REDACTED" : v));
+        console.log(JSON.stringify({ method, cls, genVals, replacerHidSecret: !r.out.includes("SECRET"), replaced: r.mod.default() }));
+      `,
+    });
+
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), String(dir) + "/main.mjs"],
+      env: { ...bunEnv, BUN_DEBUG_QUIET_LOGS: "1" },
+      stderr: "pipe",
+      stdout: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+
+    expect(JSON.parse(stdout.trim())).toEqual({
+      method: "hi x",
+      cls: 7,
+      genVals: [1, 2],
+      replacerHidSecret: true,
+      replaced: "KEEP:REDACTED",
+    });
+    expect({ stderr, exitCode }).toEqual({ stderr: expect.any(String), exitCode: 0 });
+  });
+
+  test("rejects native and bound roots with a clear error", async () => {
+    const { bundle } = (await import("bun:closure")) as any;
+    await expect(bundle(Math.max)).rejects.toThrow("Cannot bundle a native function");
+    await expect(bundle((() => {}).bind(null))).rejects.toThrow("Cannot bundle a bound function");
+  });
 });
