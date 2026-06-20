@@ -494,6 +494,15 @@ function emitObject(value: object, ctx: Context): string {
   const existing = ctx.refs.get(value);
   if (existing !== undefined) return existing;
 
+  // Built-ins whose contents can't be enumerated or whose state can't be
+  // captured: reject loudly rather than silently emitting an empty object.
+  if (value instanceof WeakMap || value instanceof WeakSet) {
+    throw new TypeError("Cannot serialize a WeakMap/WeakSet (its entries are not enumerable)");
+  }
+  if (value instanceof Promise) {
+    throw new TypeError("Cannot serialize a Promise");
+  }
+
   const name = REF_PREFIX + ctx.counter++;
   // Record BEFORE recursing so a self-reference resolves to `name`.
   ctx.refs.set(value, name);
@@ -783,11 +792,12 @@ function functionSourceToExpression(source: string, name: string): string {
     return `(${trimmed.replace(/^(get|set)\s+[^(]*/, "function ")})`;
   }
   // Method shorthand of any name shape — `foo(){}`, `async foo(){}`, `*gen(){}`,
-  // `async *g(){}`, `[Symbol.iterator](){}`, `"str-key"(){}`, `123(){}`. The
+  // `async *g(){}`, `async* [Symbol.iterator](){}`, `"str-key"(){}`, `123(){}`.
+  // `async` and `*` may appear with or without surrounding whitespace. The
   // property name is irrelevant to the function value, so drop it and emit a
   // plain (async/generator) function expression.
   const method = trimmed.match(
-    /^(async\s+)?(\*\s*)?(?:[A-Za-z_$][\w$]*|\[[\s\S]*?\]|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\d[\w.]*)\s*(\([\s\S]*)$/,
+    /^(async\b)?\s*(\*)?\s*(?:[A-Za-z_$][\w$]*|\[[\s\S]*?\]|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\d[\w.]*)\s*(\([\s\S]*)$/,
   );
   if (method !== null) {
     const asyncPart = method[1] ? "async " : "";

@@ -934,3 +934,74 @@ test("captures a function and a value imported from another module", async () =>
   expect(stdout.trim()).toBe("30");
   expect(exitCode).toBe(0);
 });
+
+describe("unserializable values throw clearly (no silent loss)", () => {
+  test("WeakMap", () => {
+    let w = new WeakMap();
+    void w;
+    expect(() => serialize(() => w)).toThrow("WeakMap");
+  });
+  test("WeakSet", () => {
+    let w = new WeakSet();
+    void w;
+    expect(() => serialize(() => w)).toThrow("WeakSet");
+  });
+  test("Promise", () => {
+    let p = Promise.resolve(1);
+    void p;
+    expect(() => serialize(() => p)).toThrow("Promise");
+  });
+});
+
+describe("more closure topologies", () => {
+  test("three-level nested closures sharing an outer cell", async () => {
+    function level1() {
+      let total = 0;
+      function level2() {
+        function level3(n: number) {
+          total += n;
+          return total;
+        }
+        return level3;
+      }
+      return level2();
+    }
+    void level1;
+    const add = (await roundtrip(level1))();
+    expect(add(5)).toBe(5);
+    expect(add(3)).toBe(8);
+  });
+
+  test("default parameter that captures a free variable", async () => {
+    let fallback = 99;
+    void fallback;
+    const f = await roundtrip((x = fallback) => x);
+    expect(f()).toBe(99);
+    expect(f(1)).toBe(1);
+  });
+
+  test("function using arguments", async () => {
+    const sum = await roundtrip(function () {
+      let t = 0;
+      for (let i = 0; i < arguments.length; i++) t += arguments[i] as number;
+      return t;
+    });
+    expect((sum as any)(1, 2, 3, 4)).toBe(10);
+  });
+
+  test("async iteration over a captured async iterable", async () => {
+    let source = {
+      async *[Symbol.asyncIterator]() {
+        yield 1;
+        yield 2;
+      },
+    };
+    void source;
+    const collect = await roundtrip(async () => {
+      const out: number[] = [];
+      for await (const x of source) out.push(x);
+      return out;
+    });
+    await expect(collect()).resolves.toEqual([1, 2]);
+  });
+});
