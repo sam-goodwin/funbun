@@ -4288,3 +4288,63 @@ describe("ALS rich: intermixing & complex stores", () => {
     expect(outB.peer).toBe(outA);
   });
 });
+
+describe("ALS rich: edge cases", () => {
+  test("run(undefined) captures no context (no wrapping)", async () => {
+    const als = new AsyncLocalStorage<string>();
+    const code = als.run(undefined as any, () => serialize(() => als.getStore() ?? "empty"));
+    expect(code).not.toMatch(/\.run\(/); // no wrapper emitted
+    const reified = await reify<() => string>(code);
+    expect(reified()).toBe("empty");
+  });
+
+  test("a reified closure called many times re-enters the context each call", async () => {
+    const als = new AsyncLocalStorage<number>();
+    let n = 0;
+    const code = als.run(5, () =>
+      serialize(() => {
+        const s = als.getStore()!;
+        return s; // pure read; must be stable across calls
+      }),
+    );
+    void n;
+    const reified = await reify<() => number>(code);
+    expect([reified(), reified(), reified()]).toEqual([5, 5, 5]);
+  });
+
+  test("mutating the store object AFTER serialize does not affect the snapshot", async () => {
+    const als = new AsyncLocalStorage<{ v: number }>();
+    const store = { v: 1 };
+    const code = als.run(store, () => serialize(() => als.getStore()!.v));
+    store.v = 999; // mutate original after serializing
+    const reified = await reify<() => number>(code);
+    expect(reified()).toBe(1); // snapshot value, not the later mutation
+  });
+
+  test("the body reads getStore multiple times consistently", async () => {
+    const als = new AsyncLocalStorage<string>();
+    const code = als.run("Z", () => serialize(() => [als.getStore(), als.getStore(), als.getStore()].join("-")));
+    const reified = await reify<() => string>(code);
+    expect(reified()).toBe("Z-Z-Z");
+  });
+
+  test("re-serializing a reified closure (serialize → reify → serialize) keeps the context", async () => {
+    const als = new AsyncLocalStorage<string>();
+    const code1 = als.run("persist", () => serialize(() => als.getStore()));
+    using dir1 = tempDir(`als-re-${Math.random().toString(36).slice(2)}`, { "mod.mjs": code1 });
+    const mod1 = await import(`${String(dir1)}/mod.mjs`);
+    const fn1 = mod1.default as () => string;
+    expect(fn1()).toBe("persist");
+    // serialize the reified function again — it references the reconstructed ALS
+    const code2 = serialize(fn1);
+    const fn2 = await reify<() => string>(code2);
+    expect(fn2()).toBe("persist"); // context survives a second round-trip
+  });
+
+  test("a closure capturing the ALS but NOT calling getStore still reconstructs", async () => {
+    const als = new AsyncLocalStorage<string>();
+    const code = als.run("unused", () => serialize(() => (typeof als.run === "function" ? "ok" : "no")));
+    const reified = await reify<() => string>(code);
+    expect(reified()).toBe("ok");
+  });
+});

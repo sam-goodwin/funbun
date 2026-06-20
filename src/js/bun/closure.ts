@@ -106,10 +106,18 @@ function serialize(fn: Function, replacer?: Replacer): string {
   }
 
   const { sharedIds, cellInfo } = analyzeSharedCells(fn);
+  // Start the generated-ref counter past any `__bunClosure$N` already present as a
+  // free-variable name, so re-serializing already-serialized output (whose
+  // generated names become free variables) doesn't collide.
+  let counterStart = 0;
+  for (const variable of cellInfo.values()) {
+    const m = /^__bunClosure\$(\d+)$/.exec(variable.name);
+    if (m !== null) counterStart = Math.max(counterStart, Number(m[1]) + 1);
+  }
   const ctx: Context = {
     module: [],
     refs: new Map(),
-    counter: 0,
+    counter: counterStart,
     sharedIds,
     imports: new Set(),
     replacer: typeof replacer === "function" ? replacer : undefined,
