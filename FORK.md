@@ -281,6 +281,46 @@ This is the next major piece of work and is intentionally a larger, separate
 effort (the internal AST is bundler-shaped, not a clean ESTree, so the JS-facing
 shape needs design).
 
+### 7.1 Landed: `Bun.Transpiler.prototype.ast(code, loader?)`
+
+The first slice of §7 is implemented: `new Bun.Transpiler().ast(code)` parses a
+source string with Bun's native parser and returns the AST as a tree of plain
+JS objects — `{ type, start, ...fields }`, recursively expanded. It covers
+identifiers, literals, member/index/call/new, unary/binary/conditional,
+array/object/spread, arrow/function, and full classes (methods, fields,
+accessors, statics, `#private`). Unmapped node kinds surface as
+`{ type: "Unsupported", node }` so a walk never panics; coverage grows
+incrementally. `ast()` forces dead-code-elimination / minify / tree-shaking
+**off** around the parse so the AST is faithful (pure unused statements and
+constant folds aren't dropped). Lives in `AstJsConverter`
+(`src/runtime/api/JSTranspiler.rs`); registered via `JSBundler.classes.ts`.
+
+Two findings shaped the scope:
+
+- **Bun's parser erases TypeScript types** (annotations/interfaces/aliases are
+  skipped, never stored), so this is a **JS-level** AST. A type-level AST at
+  runtime is not reachable through Bun's parser — it would need the TS compiler.
+- **Bun discards the AST after loading a module** (parse → print JS → free
+  arena). So any runtime AST means a **re-parse**; there is no retained AST to
+  hand back, and `fn.toString()` is post-transpile JS.
+
+### 7.2 Landed: source-map-aware positions
+
+Building on §6: `fn[Symbol.sourceLocation]` previously reported the
+transpiled-JS position (e.g. line 1) rather than the original source (e.g.
+`.ts` line 6) — unlike stack traces, which Bun *does* remap. It now routes the
+executable's position through the module's registered source map via a new host
+export `Bun__resolveSourceMapPosition` (wrapping
+`VirtualMachine::resolve_source_mapping`, the same machinery stack-frame
+remapping uses), falling back to the raw position when no map is registered.
+This is the position-mapping foundation for the value-level `fn[Symbol.ast]`
+accessor (every AST node's position will resolve to the original source the
+same way).
+
+The remaining work for `fn[Symbol.ast]`: take a function/method/class value,
+re-parse its own source (form-aware), and attach each node's original-source
+position via the same source map.
+
 ---
 
 ## 8. File map
