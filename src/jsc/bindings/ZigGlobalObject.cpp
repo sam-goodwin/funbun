@@ -69,6 +69,7 @@
 #include "JavaScriptCore/Symbol.h"
 #include "JavaScriptCore/SymbolInlines.h"
 #include "JavaScriptCore/FunctionExecutable.h"
+#include "JavaScriptCore/SourceProvider.h"
 #include "JavaScriptCore/UnlinkedFunctionExecutable.h"
 #include "JavaScriptCore/UnlinkedFunctionCodeBlock.h"
 #include "JavaScriptCore/UnlinkedCodeBlock.h"
@@ -3122,6 +3123,33 @@ JSC_DEFINE_CUSTOM_GETTER(functionBoundDetailsGetter, (JSC::JSGlobalObject * glob
     return JSC::JSValue::encode(result);
 }
 
+// ===================== Symbol.sourceLocation (experimental) =====================
+// Returns { url, line, column } for where a JavaScript function was defined
+// (1-based line/column), or undefined for native functions. Used to build source
+// maps for serialized closures so thrown errors point back to the original file.
+JSC_DEFINE_CUSTOM_GETTER(functionSourceLocationGetter, (JSC::JSGlobalObject * globalObject, JSC::EncodedJSValue thisValue, JSC::PropertyName))
+{
+    JSC::VM& vm = JSC::getVM(globalObject);
+
+    JSC::JSFunction* function = dynamicDowncast<JSC::JSFunction>(JSC::JSValue::decode(thisValue));
+    if (!function || function->isHostFunction())
+        return JSC::JSValue::encode(JSC::jsUndefined());
+
+    JSC::FunctionExecutable* executable = function->jsExecutable();
+    if (!executable)
+        return JSC::JSValue::encode(JSC::jsUndefined());
+
+    const JSC::SourceCode& source = executable->source();
+    JSC::SourceProvider* provider = source.provider();
+    WTF::String url = provider ? provider->sourceURL() : WTF::String();
+
+    JSC::JSObject* result = JSC::constructEmptyObject(globalObject);
+    result->putDirect(vm, JSC::Identifier::fromString(vm, "url"_s), JSC::jsString(vm, url), 0);
+    result->putDirect(vm, JSC::Identifier::fromString(vm, "line"_s), JSC::jsNumber(executable->firstLine()), 0);
+    result->putDirect(vm, JSC::Identifier::fromString(vm, "column"_s), JSC::jsNumber(executable->startColumn()), 0);
+    return JSC::JSValue::encode(result);
+}
+
 // This is like `putDirectBuiltinFunction` but for the global static list.
 #define globalBuiltinFunction(vm, globalObject, identifier, function, attributes) JSC::JSGlobalObject::GlobalPropertyInfo(identifier, JSFunction::create(vm, function, globalObject), attributes)
 
@@ -3300,6 +3328,24 @@ void GlobalObject::addBuiltinGlobals(JSC::VM& vm)
         if (JSC::JSObject* symbolConstructor = symbolConstructorValue.getObject()) {
             symbolConstructor->putDirect(vm, JSC::Identifier::fromString(vm, "boundFunction"_s),
                 JSC::Symbol::create(vm, vm.symbolRegistry().symbolForKey(boundFunctionKey)),
+                PropertyAttribute::DontEnum | PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly | 0);
+        }
+    }
+
+    // ----- Symbol.sourceLocation (experimental) -----
+    // Exposes a function's definition site as `fn[Symbol.sourceLocation]`.
+    {
+        const auto sourceLocationKey = "Symbol.sourceLocation"_s;
+        this->functionPrototype()->putDirectCustomAccessor(vm,
+            JSC::Identifier::fromUid(vm.symbolRegistry().symbolForKey(sourceLocationKey)),
+            JSC::CustomGetterSetter::create(vm, functionSourceLocationGetter, nullptr),
+            PropertyAttribute::DontEnum | PropertyAttribute::ReadOnly | PropertyAttribute::CustomAccessor | 0);
+
+        JSC::JSValue symbolConstructorValue = this->get(this, JSC::Identifier::fromString(vm, "Symbol"_s));
+        RETURN_IF_EXCEPTION(scope, );
+        if (JSC::JSObject* symbolConstructor = symbolConstructorValue.getObject()) {
+            symbolConstructor->putDirect(vm, JSC::Identifier::fromString(vm, "sourceLocation"_s),
+                JSC::Symbol::create(vm, vm.symbolRegistry().symbolForKey(sourceLocationKey)),
                 PropertyAttribute::DontEnum | PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly | 0);
         }
     }

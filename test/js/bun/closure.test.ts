@@ -362,3 +362,13 @@ test("reconstructs a bound method preserving bound this", async () => {
   const fn = await roundtrip(() => [bound(), bound()]);
   expect(fn()).toEqual([1, 2]);
 });
+
+test("Symbol.sourceLocation reports a function's definition site", () => {
+  const fn = (x: number) => x;
+  const loc = (fn as any)[Symbol.sourceLocation];
+  expect(typeof loc.url).toBe("string");
+  expect(loc.url).toContain("closure.test");
+  expect(typeof loc.line).toBe("number");
+  expect(typeof loc.column).toBe("number");
+  expect((Math.max as any)[Symbol.sourceLocation]).toBeUndefined();
+});
