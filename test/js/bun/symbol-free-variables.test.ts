@@ -227,3 +227,32 @@ test("module-level captured variables are included; imports and globals are excl
   expect(JSON.parse(lines[1])).toBe("number");
   expect({ stderr, exitCode }).toEqual({ stderr: expect.any(String), exitCode: 0 });
 });
+
+test("Symbol.sourceLocation maps through the source map to the original .ts position", async () => {
+  // The interface + type alias are erased during transpile, so `target` is on
+  // TS line 6 but generated-JS line 1. sourceLocation must report line 6 (the
+  // original), the same position a stack trace would show — not the JS line.
+  using dir = tempDir("source-location-ts", {
+    "loc.ts": `interface Foo {
+  a: number;
+  b: string;
+}
+type Bar = Foo | null;
+function target(): number { return 42; }
+console.log(JSON.stringify((target as any)[Symbol.sourceLocation]));
+`,
+  });
+
+  await using proc = Bun.spawn({
+    cmd: [bunExe(), String(dir) + "/loc.ts"],
+    env: { ...bunEnv, BUN_DEBUG_QUIET_LOGS: "1" },
+    stderr: "pipe",
+    stdout: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+
+  const loc = JSON.parse(stdout.trim());
+  expect(loc.line).toBe(6);
+  expect(loc.url).toEndWith("loc.ts");
+  expect({ stderr, exitCode }).toEqual({ stderr: expect.any(String), exitCode: 0 });
+});

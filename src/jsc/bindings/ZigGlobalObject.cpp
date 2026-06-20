@@ -3127,8 +3127,12 @@ JSC_DEFINE_CUSTOM_GETTER(functionBoundDetailsGetter, (JSC::JSGlobalObject * glob
 
 // ===================== Symbol.sourceLocation (experimental) =====================
 // Returns { url, line, column } for where a JavaScript function was defined
-// (1-based line/column), or undefined for native functions. Used to build source
-// maps for serialized closures so thrown errors point back to the original file.
+// (1-based line/column), or undefined for native functions. Line/column are
+// remapped through the module's source map so they point at the ORIGINAL source
+// (e.g. the .ts), matching how stack traces are reported, rather than the
+// transpiled output JSC actually executes.
+extern "C" bool Bun__resolveSourceMapPosition(void* bunVM, const BunString* path, int lineZeroBased, int columnZeroBased, int* outLineZeroBased, int* outColumnZeroBased);
+
 JSC_DEFINE_CUSTOM_GETTER(functionSourceLocationGetter, (JSC::JSGlobalObject * globalObject, JSC::EncodedJSValue thisValue, JSC::PropertyName))
 {
     JSC::VM& vm = JSC::getVM(globalObject);
@@ -3145,10 +3149,25 @@ JSC_DEFINE_CUSTOM_GETTER(functionSourceLocationGetter, (JSC::JSGlobalObject * gl
     JSC::SourceProvider* provider = source.provider();
     WTF::String url = provider ? provider->sourceURL() : WTF::String();
 
+    // Generated position (1-based, in the transpiled output).
+    int line = executable->firstLine();
+    int column = executable->startColumn();
+
+    // Remap to the original source through the module's source map when present.
+    if (!url.isEmpty()) {
+        BunString pathStr = Bun::toString(url);
+        int mappedLine = 0;
+        int mappedColumn = 0;
+        if (Bun__resolveSourceMapPosition(defaultGlobalObject(globalObject)->bunVM(), &pathStr, line - 1, column - 1, &mappedLine, &mappedColumn)) {
+            line = mappedLine + 1;
+            column = mappedColumn + 1;
+        }
+    }
+
     JSC::JSObject* result = JSC::constructEmptyObject(globalObject);
     result->putDirect(vm, JSC::Identifier::fromString(vm, "url"_s), JSC::jsString(vm, url), 0);
-    result->putDirect(vm, JSC::Identifier::fromString(vm, "line"_s), JSC::jsNumber(executable->firstLine()), 0);
-    result->putDirect(vm, JSC::Identifier::fromString(vm, "column"_s), JSC::jsNumber(executable->startColumn()), 0);
+    result->putDirect(vm, JSC::Identifier::fromString(vm, "line"_s), JSC::jsNumber(line), 0);
+    result->putDirect(vm, JSC::Identifier::fromString(vm, "column"_s), JSC::jsNumber(column), 0);
     return JSC::JSValue::encode(result);
 }
 
