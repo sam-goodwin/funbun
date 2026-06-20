@@ -449,10 +449,18 @@ test("preserves a registered-symbol-keyed property", async () => {
   expect(fn()[key]).toBe("value");
 });
 
-test("throws on a unique-symbol-keyed property", () => {
-  let o = { [Symbol("unique")]: 1 };
+test("reconstructs a unique-symbol-keyed property (recreated symbol)", async () => {
+  const key = Symbol("unique");
+  let o = { [key]: 1, plain: 2 };
   void o;
-  expect(() => serialize(() => o)).toThrow("unique symbol property key");
+  const out = (await roundtrip(() => o))();
+  expect(out.plain).toBe(2);
+  // The reconstructed symbol is a fresh unique symbol with the same description;
+  // the property is reachable via the own symbol key.
+  const symKeys = Object.getOwnPropertySymbols(out);
+  expect(symKeys).toHaveLength(1);
+  expect(symKeys[0].description).toBe("unique");
+  expect(out[symKeys[0]]).toBe(1);
 });
 
 test("reconstructs a class instance (prototype, methods, fields)", async () => {
@@ -875,10 +883,23 @@ describe("captured value types", () => {
     const f = await roundtrip(() => s);
     expect(f()).toBe(Symbol.iterator);
   });
-  test("unique symbol value throws", () => {
+  test("unique symbol value round-trips and preserves intra-closure identity", async () => {
     let s = Symbol("unique");
+    // Same symbol captured twice + used as a key — all must be the SAME symbol.
+    let obj: any = { [s]: "v" };
+    void [s, obj];
+    const out = (await roundtrip(() => ({ a: s, b: s, obj })))();
+    expect(typeof out.a).toBe("symbol");
+    expect(out.a).toBe(out.b); // identity preserved
+    expect(out.a.description).toBe("unique");
+    expect(out.obj[out.a]).toBe("v"); // key and value are the same symbol
+  });
+  test("a symbol with no description round-trips", async () => {
+    let s = Symbol();
     void s;
-    expect(() => serialize(() => s)).toThrow("unique symbol value");
+    const out = (await roundtrip(() => s))();
+    expect(typeof out).toBe("symbol");
+    expect(out.description).toBeUndefined();
   });
   test("sparse array preserves holes and length", async () => {
     let arr = [1, , 3];
@@ -3019,10 +3040,21 @@ describe("frontier: collection key identity & guards", () => {
     expect(out.s.has(out.x)).toBe(true);
   });
 
-  test("WeakRef throws a clear error", () => {
-    const r = new WeakRef({ a: 1 });
+  test("a WeakRef round-trips its live referent", async () => {
+    const target = { a: 1 };
+    const r = new WeakRef(target);
     void r;
-    expect(() => serialize(() => r)).toThrow(/WeakRef/i);
+    const out = (await roundtrip(() => r))();
+    expect(out).toBeInstanceOf(WeakRef);
+    expect(out.deref()).toEqual({ a: 1 });
+  });
+
+  test("a WeakRef sharing its referent with another capture keeps identity", async () => {
+    const target = { a: 1 };
+    const r = new WeakRef(target);
+    void [target, r];
+    const out = (await roundtrip(() => ({ target, r })))();
+    expect(out.r.deref()).toBe(out.target); // same object identity
   });
 
   test("FinalizationRegistry throws a clear error", () => {

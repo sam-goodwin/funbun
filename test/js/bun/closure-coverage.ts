@@ -106,8 +106,17 @@ export const CATEGORIES: CoverageCategory[] = [
       S("val.symbol-key", "registered-symbol property key", "preserves a registered-symbol-keyed property"),
       S("val.registered-symbol", "registered symbol value (Symbol.for)", "registered symbol value (Symbol.for)"),
       S("val.wellknown-symbol", "well-known symbol value", "well-known symbol value"),
-      L("val.unique-symbol-val", "unique symbol value (clear error)", "unique symbol value throws"),
-      L("val.unique-symbol-key", "unique symbol key (clear error)", "throws on a unique-symbol-keyed property"),
+      S(
+        "val.unique-symbol-val",
+        "unique symbol value (recreated, identity kept)",
+        "unique symbol value round-trips and preserves intra-closure identity",
+      ),
+      S(
+        "val.unique-symbol-key",
+        "unique symbol property key (recreated)",
+        "reconstructs a unique-symbol-keyed property (recreated symbol)",
+      ),
+      S("val.symbol-no-desc", "symbol with no description", "a symbol with no description round-trips"),
       L("val.weakmap", "WeakMap (clear error)", "WeakMap"),
       L("val.weakset", "WeakSet (clear error)", "WeakSet"),
       S(
@@ -183,7 +192,7 @@ export const CATEGORIES: CoverageCategory[] = [
         "Map/Set with object keys identity-preserved",
         "a Map object key shared with another capture keeps identity",
       ),
-      L("val.weakref", "WeakRef (clear error)", "WeakRef throws a clear error"),
+      S("val.weakref", "WeakRef (live referent snapshot)", "a WeakRef round-trips its live referent"),
       L("val.finalization-registry", "FinalizationRegistry (clear error)", "FinalizationRegistry throws a clear error"),
       S("val.shared-arraybuffer", "SharedArrayBuffer + shared view", "SharedArrayBuffer and a view over it round-trip"),
       S(

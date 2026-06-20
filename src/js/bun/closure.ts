@@ -81,6 +81,10 @@ interface Context {
   // keys actually referenced by the closure (access-path pruning), or "all" /
   // absent to serialize every key. See computeKeepSets.
   keepSets: Map<object, Set<string> | "all">;
+  // Unique (non-registered, non-well-known) symbols -> hoisted variable name, so
+  // the same captured symbol reconstructs to one symbol (identity preserved
+  // within the serialized closure).
+  symbols: Map<symbol, string>;
 }
 
 interface SourceBlock {
@@ -106,6 +110,7 @@ function serialize(fn: Function, replacer?: Replacer): string {
     replacer: typeof replacer === "function" ? replacer : undefined,
     sourceBlocks: [],
     keepSets: computeKeepSets(fn),
+    symbols: new Map(),
   };
 
   // Emit shared cells at module scope (deduped by id) before any function that
@@ -1091,7 +1096,7 @@ function emitValue(value: unknown, ctx: Context): string {
       if ($isProxyObject(value)) return emitProxy(value as object, ctx);
       return emitFunction(value as Function, ctx);
     case "symbol":
-      return emitSymbol(value as symbol);
+      return emitSymbol(value as symbol, ctx);
     default:
       throw new TypeError(`Cannot serialize a free variable of type ${typeof value}`);
   }
@@ -1121,9 +1126,6 @@ function emitObject(value: object, ctx: Context): string {
       "Cannot serialize a pending Promise (its resolution is tied to live I/O or timers). " +
         "Await it first, or serialize the settled value.",
     );
-  }
-  if (value instanceof WeakRef) {
-    throw new TypeError("Cannot serialize a WeakRef (its referent's liveness is not reproducible)");
   }
   if (typeof FinalizationRegistry !== "undefined" && value instanceof FinalizationRegistry) {
     throw new TypeError("Cannot serialize a FinalizationRegistry (its registrations are not reproducible)");
@@ -1287,7 +1289,7 @@ function emitOwnProperties(
     if (keep !== undefined && keep !== "all" && typeof key === "string" && !keep.has(key)) {
       continue;
     }
-    const keyExpr = propertyKeyExpression(key);
+    const keyExpr = propertyKeyExpression(key, ctx);
     const descriptor = Object.getOwnPropertyDescriptor(value, key)!;
 
     if (descriptor.get !== undefined || descriptor.set !== undefined) {
@@ -1333,26 +1335,42 @@ const WELL_KNOWN_SYMBOLS: Array<[symbol, string]> = [
   [Symbol.unscopables, "Symbol.unscopables"],
 ];
 
-// Symbols with a stable global identity (registered via Symbol.for, or the
-// well-known symbols) can be reconstructed; a unique symbol cannot (its identity
-// is not reproducible).
-function emitSymbol(value: symbol): string {
+// Registered (`Symbol.for`) and well-known symbols have a stable global identity
+// and reconstruct directly. A unique `Symbol(desc)` has no reproducible global
+// identity, but for a self-contained closure all that matters is that it stays
+// unique and that the SAME captured symbol maps to one reconstructed symbol — so
+// hoist `const sym = Symbol(desc)` once and reference it (identity preserved
+// within the closure).
+function emitSymbol(value: symbol, ctx: Context): string {
+  const stable = stableSymbolExpression(value);
+  if (stable !== undefined) return stable;
+  return uniqueSymbolRef(value, ctx);
+}
+
+function stableSymbolExpression(value: symbol): string | undefined {
   const registered = Symbol.keyFor(value);
   if (registered !== undefined) return `Symbol.for(${JSON.stringify(registered)})`;
   for (const entry of WELL_KNOWN_SYMBOLS) {
     if (entry[0] === value) return entry[1];
   }
-  throw new TypeError(`Cannot serialize a unique symbol value (${value.toString()})`);
+  return undefined;
 }
 
-function propertyKeyExpression(key: string | symbol): string {
+function uniqueSymbolRef(value: symbol, ctx: Context): string {
+  const existing = ctx.symbols.get(value);
+  if (existing !== undefined) return existing;
+  const name = REF_PREFIX + ctx.counter++;
+  ctx.symbols.set(value, name);
+  const desc = value.description;
+  ctx.module.push(`const ${name} = Symbol(${desc === undefined ? "" : JSON.stringify(desc)});`);
+  return name;
+}
+
+function propertyKeyExpression(key: string | symbol, ctx: Context): string {
   if (typeof key === "string") return JSON.stringify(key);
-  const registered = Symbol.keyFor(key);
-  if (registered !== undefined) return `Symbol.for(${JSON.stringify(registered)})`;
-  for (const entry of WELL_KNOWN_SYMBOLS) {
-    if (entry[0] === key) return entry[1];
-  }
-  throw new TypeError(`Cannot serialize a unique symbol property key (${key.toString()})`);
+  const stable = stableSymbolExpression(key);
+  if (stable !== undefined) return stable;
+  return uniqueSymbolRef(key, ctx);
 }
 
 // Reconstructs common built-in object types. Appends the construction to
@@ -1438,6 +1456,14 @@ function emitBuiltin(value: object, name: string, ctx: Context): object | null {
   if (value instanceof Boolean) {
     ctx.module.push(`const ${name} = new Boolean(${(value as Boolean).valueOf()});`);
     return Boolean.prototype;
+  }
+  // A WeakRef snapshots its live referent. If already collected at serialize
+  // time, emit a WeakRef to a fresh (immediately collectable) object — best
+  // effort, since "already collected" can't be reproduced.
+  if (value instanceof WeakRef) {
+    const target = (value as WeakRef<any>).deref();
+    ctx.module.push(`const ${name} = new WeakRef(${target === undefined ? "{}" : emitValue(target, ctx)});`);
+    return WeakRef.prototype;
   }
   return null;
 }
@@ -1813,6 +1839,7 @@ async function bundle(fn: Function, replacer?: Replacer): Promise<string> {
     replacer: typeof replacer === "function" ? replacer : undefined,
     sourceBlocks: [],
     keepSets: computeKeepSets(fn),
+    symbols: new Map(),
   };
   // 2. Recover the closure module's import bindings: localName → original source.
   type Binding = { source: string; imported?: string; default?: boolean; star?: boolean };
