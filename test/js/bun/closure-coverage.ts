@@ -353,6 +353,11 @@ export const CATEGORIES: CoverageCategory[] = [
         "field-initializer-only capture on direct class value",
         "a var captured only by a field initializer on a direct class value is unbound",
       ),
+      L(
+        "cls.field-init-arrow",
+        "field-initializer arrow capture (unbound)",
+        "a field-initializer-only arrow capture is unbound",
+      ),
       S("cls.decorators", "method decorator round-trips", "a method decorator round-trips"),
       S("cls.private-accessor", "private #getter / #setter accessors", "private getter/setter accessors round-trip"),
       S("cls.static-private-accessor", "static private accessor", "static private accessor round-trips"),
@@ -571,6 +576,36 @@ export const CATEGORIES: CoverageCategory[] = [
         "async fn with await using over a disposable",
         "an async function using `await using` over a captured disposable",
       ),
+      S(
+        "ix.fn-own-props",
+        "function carrying own properties",
+        "a captured function with its own properties keeps them",
+      ),
+      S("ix.date-subclass", "class extends Date", "a class extends Date instance round-trips"),
+      S(
+        "ix.subclass-chain-builtin",
+        "3-level inheritance rooted at a builtin",
+        "a 3-level inheritance chain rooted at a builtin (extends Array)",
+      ),
+      S(
+        "ix.circular-static",
+        "class with a static field referencing itself",
+        "a class with a static field referencing itself (circular static)",
+      ),
+      S("ix.frozen-map-frozen-values", "frozen Map of frozen objects", "a frozen Map containing frozen objects"),
+      S(
+        "ix.array-of-closures",
+        "array of closures sharing one cell",
+        "an array of closures sharing one cell stays shared",
+      ),
+      S(
+        "ix.proxy-handler-cell",
+        "Proxy handler capturing a shared cell",
+        "a Proxy whose handler captures a shared cell",
+      ),
+      S("ix.proxy-map-key", "Proxy used as a Map key", "a Proxy used as a Map key keeps identity"),
+      S("ix.getter-this", "getter returning this (circular)", "a getter that returns `this` (circular via accessor)"),
+      S("ix.map-nan-negzero", "Map with NaN and -0 keys", "Map with NaN and -0 keys preserves lookup semantics"),
     ],
   },
 ];

@@ -1066,7 +1066,13 @@ function objectBaseExpression(value: object, ctx: Context): string {
 // accessor (get/set) properties, non-enumerable/non-writable flags, and
 // symbol keys. Plain enumerable writable data properties use a simple
 // assignment; everything else uses Object.defineProperty.
-function emitOwnProperties(name: string, value: object, ctx: Context, skip?: Set<string>): void {
+function emitOwnProperties(
+  name: string,
+  value: object,
+  ctx: Context,
+  skip?: Set<string>,
+  enumerableOnly = false,
+): void {
   // Access-path pruning: when the closure only reads a known subset of this
   // object's string keys (and never uses it opaquely), `keepSets` holds exactly
   // those keys; emit only them. Symbol keys are never pruned (not statically
@@ -1074,6 +1080,9 @@ function emitOwnProperties(name: string, value: object, ctx: Context, skip?: Set
   const keep = ctx.keepSets.get(value);
   for (const key of Reflect.ownKeys(value)) {
     if (skip !== undefined && typeof key === "string" && skip.has(key)) {
+      continue;
+    }
+    if (enumerableOnly && !Object.getOwnPropertyDescriptor(value, key)!.enumerable) {
       continue;
     }
     if (keep !== undefined && keep !== "all" && typeof key === "string" && !keep.has(key)) {
@@ -1325,6 +1334,11 @@ function emitFunction(fn: Function, ctx: Context): string {
   // the offset within the expression.
   ctx.module.push(`const ${name} = ${reconstructed.expr};`);
   recordSourceBlock(ctx, ctx.module.length - 1, reconstructed);
+  // Functions can carry their own properties (e.g. `fn.version = 2`, or a class's
+  // externally-assigned statics like `C.instance = ...`). Emit the ENUMERABLE
+  // ones — that skips `name`/`length`/`prototype` and non-enumerable static
+  // methods (already reconstructed from the class source).
+  emitOwnProperties(name, fn, ctx, undefined, true);
   return name;
 }
 

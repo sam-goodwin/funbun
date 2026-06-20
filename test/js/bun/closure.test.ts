@@ -3509,3 +3509,149 @@ describe("interactions: builtin subclasses & deep combos", () => {
     await expect(fn()).resolves.toEqual({ v: 1, log: ["closed"] });
   });
 });
+
+describe("interactions: deeper adversarial combos", () => {
+  test("a captured function with its own properties keeps them", async () => {
+    const fn: any = (x: number) => x + 1;
+    fn.version = 2;
+    fn.meta = { author: "x" };
+    void fn;
+    const out = (await roundtrip(() => fn))();
+    expect(out(10)).toBe(11);
+    expect(out.version).toBe(2);
+    expect(out.meta).toEqual({ author: "x" });
+  });
+
+  test("a class extends Date instance round-trips", async () => {
+    class Timestamp extends Date {
+      iso() {
+        return this.toISOString();
+      }
+    }
+    const t = new Timestamp(0);
+    void t;
+    const out = (await roundtrip(() => t))();
+    expect(out.getTime()).toBe(0);
+    expect(out.iso()).toBe("1970-01-01T00:00:00.000Z");
+  });
+
+  test("a 3-level inheritance chain rooted at a builtin (extends Array)", async () => {
+    class A extends Array {
+      a() {
+        return "a";
+      }
+    }
+    class B extends A {
+      b() {
+        return "b";
+      }
+    }
+    const inst = new B();
+    inst.push(1, 2);
+    void inst;
+    const out = (await roundtrip(() => inst))();
+    expect([...out]).toEqual([1, 2]);
+    expect(out.a()).toBe("a");
+    expect(out.b()).toBe("b");
+  });
+
+  test("a class with a static field referencing itself (circular static)", async () => {
+    class Node {
+      static root: Node;
+      label = "n";
+    }
+    Node.root = new Node();
+    void Node;
+    const K = (await roundtrip(() => Node))();
+    expect(K.root).toBeInstanceOf(K);
+    expect(K.root.label).toBe("n");
+  });
+
+  test("a frozen Map containing frozen objects", async () => {
+    const m = Object.freeze(new Map([["k", Object.freeze({ v: 1 })]]));
+    void m;
+    const out = (await roundtrip(() => m))();
+    expect(Object.isFrozen(out)).toBe(true);
+    expect(Object.isFrozen(out.get("k"))).toBe(true);
+    expect(out.get("k").v).toBe(1);
+  });
+
+  test("an array of closures sharing one cell stays shared", async () => {
+    let n = 0;
+    const fns = [() => ++n, () => n];
+    void [n, fns];
+    const out = (await roundtrip(() => fns))();
+    expect(out[0]()).toBe(1);
+    expect(out[0]()).toBe(2);
+    expect(out[1]()).toBe(2); // reader sees the shared increment
+  });
+
+  test("a Proxy whose handler captures a shared cell", async () => {
+    let calls = 0;
+    const p = new Proxy(
+      { a: 1 },
+      {
+        get(t, k) {
+          calls++;
+          return (t as any)[k];
+        },
+      },
+    );
+    const count = () => calls;
+    void [calls, p, count];
+    const out = await roundtrip(() => {
+      const v = (p as any).a;
+      return { v, calls: count() };
+    });
+    expect(out()).toEqual({ v: 1, calls: 1 });
+  });
+
+  test("a Proxy used as a Map key keeps identity", async () => {
+    const key = new Proxy({}, {});
+    const m = new Map([[key, "v"]]);
+    void [key, m];
+    const out = (await roundtrip(() => ({ key, m })))();
+    expect(out.m.get(out.key)).toBe("v");
+  });
+
+  test("a getter that returns `this` (circular via accessor)", async () => {
+    const o = {
+      get self() {
+        return this;
+      },
+      v: 5,
+    };
+    void o;
+    const out = (await roundtrip(() => o))();
+    expect(out.self).toBe(out);
+    expect(out.self.v).toBe(5);
+  });
+
+  // KNOWN LIMITATION: a var referenced ONLY by a class field initializer (no
+  // method, no ctor body) on a directly-captured class value is not recoverable
+  // — field-initializer free variables aren't surfaced by reflection. It fails
+  // cleanly (ReferenceError) rather than silently. Workaround: capture the
+  // factory (`() => make(100)`) or reference the var from a method.
+  test("known limitation: a field-initializer-only arrow capture is unbound", async () => {
+    function make(offset: number) {
+      return class {
+        add = (x: number) => x + offset;
+      };
+    }
+    const C = make(100);
+    void C;
+    const K = (await roundtrip(() => C))();
+    expect(() => new K().add(5)).toThrow(/offset is not defined/);
+  });
+
+  test("Map with NaN and -0 keys preserves lookup semantics", async () => {
+    const m = new Map<number, string>([
+      [NaN, "nan"],
+      [-0, "negzero"],
+    ]);
+    void m;
+    const out = (await roundtrip(() => m))();
+    expect(out.get(NaN)).toBe("nan");
+    expect(out.get(0)).toBe("negzero"); // -0 and 0 are the same Map key
+  });
+});
