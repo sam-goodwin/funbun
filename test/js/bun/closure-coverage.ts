@@ -731,6 +731,77 @@ export const CATEGORIES: CoverageCategory[] = [
         "nested als.run inside a reconstructed closure composes",
       ),
       S("als.context-multi", "two ALS contexts captured + restored", "captures two ALS contexts and restores both"),
+      S(
+        "als.module-scope",
+        "module-scope ALS captured + context",
+        "module-scope ALS, serialized INSIDE a run, captures the context",
+      ),
+      S(
+        "als.nested-innermost",
+        "nested run captures innermost store",
+        "nested run at serialize time captures the INNERMOST store",
+      ),
+      S(
+        "als.async-await",
+        "context survives across awaits",
+        "a reified ASYNC closure keeps the captured context across an await",
+      ),
+      S(
+        "als.async-postaward",
+        "serialize after await captures context",
+        "serialize called AFTER an await inside run still captures that run's context",
+      ),
+      S(
+        "als.async-concurrent",
+        "concurrent runs capture own contexts",
+        "two async operations with DIFFERENT contexts each capture their own",
+      ),
+      S(
+        "als.store-complex",
+        "complex/circular store snapshotted",
+        "the store is a complex nested object (snapshotted by value)",
+      ),
+      S(
+        "als.store-identity",
+        "store === captured free var (one object)",
+        "the SAME object captured as both the store and a closure free variable keeps identity",
+      ),
+      S(
+        "als.store-crosslink",
+        "two ALS, cross-linked stores",
+        "two ALS whose stores reference each other (cross-linked) round-trip",
+      ),
+      S("als.run-undefined", "run(undefined) captures no context", "run(undefined) captures no context (no wrapping)"),
+      S(
+        "als.mutate-after",
+        "store mutation after serialize ignored",
+        "mutating the store object AFTER serialize does not affect the snapshot",
+      ),
+      S(
+        "als.re-serialize",
+        "double round-trip keeps context",
+        "re-serializing a reified closure (serialize → reify → serialize) keeps the context",
+      ),
+      S(
+        "als.nested-als-store",
+        "store containing another ALS instance",
+        "the store itself contains another ALS instance (nested ALS), reconstructed",
+      ),
+      S(
+        "als.concurrent-interleaved",
+        "interleaved reified closures independent",
+        "concurrent reified closures with different captured contexts stay independent",
+      ),
+      S(
+        "als.gen-root-graceful",
+        "generator root reconstructs (no context restore)",
+        "a generator root captured in a context reconstructs (context not restored)",
+      ),
+      S(
+        "als.class-root-graceful",
+        "class root reconstructs constructable (no context restore)",
+        "a class root captured in a context reconstructs constructable (context not restored)",
+      ),
     ],
   },
 ];
