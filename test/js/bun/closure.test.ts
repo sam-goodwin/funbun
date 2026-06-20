@@ -4139,3 +4139,87 @@ describe("ALS rich: nesting", () => {
     expect(reified()).toBe("L2|L1");
   });
 });
+
+describe("ALS rich: promises & async contexts", () => {
+  const tick = () => new Promise<void>(r => setTimeout(r, 0));
+
+  test("a reified ASYNC closure keeps the captured context across an await", async () => {
+    const als = new AsyncLocalStorage<{ id: number }>();
+    const code = als.run({ id: 7 }, () =>
+      serialize(async () => {
+        const before = als.getStore()!.id;
+        await new Promise<void>(r => setTimeout(r, 0));
+        const after = als.getStore()!.id; // context must survive the await
+        return [before, after];
+      }),
+    );
+    const reified = await reify<() => Promise<number[]>>(code);
+    await expect(reified()).resolves.toEqual([7, 7]);
+  });
+
+  test("serialize called AFTER an await inside run still captures that run's context", async () => {
+    const als = new AsyncLocalStorage<string>();
+    const code = await als.run("ctx", async () => {
+      await new Promise<void>(r => setTimeout(r, 0));
+      return serialize(() => als.getStore()); // serialized post-await, still in "ctx"
+    });
+    const reified = await reify<() => string>(code);
+    expect(reified()).toBe("ctx");
+  });
+
+  test("a reified closure returning a promise whose .then reads the store", async () => {
+    const als = new AsyncLocalStorage<number>();
+    const code = als.run(42, () =>
+      serialize(() => Promise.resolve().then(() => als.getStore())), // continuation reads store
+    );
+    const reified = await reify<() => Promise<number>>(code);
+    await expect(reified()).resolves.toBe(42);
+  });
+
+  test("two async operations with DIFFERENT contexts each capture their own", async () => {
+    const als = new AsyncLocalStorage<string>();
+    const [codeA, codeB] = await Promise.all([
+      als.run("A", async () => {
+        await tick();
+        return serialize(() => als.getStore());
+      }),
+      als.run("B", async () => {
+        await tick();
+        return serialize(() => als.getStore());
+      }),
+    ]);
+    const [a, b] = await Promise.all([reify<() => string>(codeA), reify<() => string>(codeB)]);
+    expect([a(), b()]).toEqual(["A", "B"]);
+  });
+
+  test("a reified async closure that awaits a captured async helper keeps context", async () => {
+    const als = new AsyncLocalStorage<string>();
+    const delay = (v: number) => new Promise<number>(r => setTimeout(() => r(v), 0));
+    void delay;
+    const code = als.run("ROLE", () =>
+      serialize(async () => {
+        const n = await delay(5);
+        return `${als.getStore()}:${n}`; // store survives awaiting the captured helper
+      }),
+    );
+    const reified = await reify<() => Promise<string>>(code);
+    await expect(reified()).resolves.toBe("ROLE:5");
+  });
+
+  test("nested awaits each see the captured context", async () => {
+    const als = new AsyncLocalStorage<number>();
+    const code = als.run(100, () =>
+      serialize(async () => {
+        const seen: number[] = [];
+        seen.push(als.getStore()!);
+        await new Promise<void>(r => setTimeout(r, 0));
+        seen.push(als.getStore()!);
+        await new Promise<void>(r => setTimeout(r, 0));
+        seen.push(als.getStore()!);
+        return seen;
+      }),
+    );
+    const reified = await reify<() => Promise<number[]>>(code);
+    await expect(reified()).resolves.toEqual([100, 100, 100]);
+  });
+});
