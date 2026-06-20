@@ -606,6 +606,48 @@ export const CATEGORIES: CoverageCategory[] = [
       S("ix.proxy-map-key", "Proxy used as a Map key", "a Proxy used as a Map key keeps identity"),
       S("ix.getter-this", "getter returning this (circular)", "a getter that returns `this` (circular via accessor)"),
       S("ix.map-nan-negzero", "Map with NaN and -0 keys", "Map with NaN and -0 keys preserves lookup semantics"),
+      S(
+        "ix.mixed-views-shared-buffer",
+        "typed array + DataView over one buffer",
+        "a typed array and a DataView over ONE buffer share it",
+      ),
+      S(
+        "ix.bound-args-complex",
+        "bound args include a Map and an instance",
+        "a bound function whose bound args include a captured Map and instance",
+      ),
+      S(
+        "ix.proxy-all-traps",
+        "Proxy with has/ownKeys/getOwnPropertyDescriptor",
+        "a Proxy with has / deleteProperty / ownKeys traps round-trips",
+      ),
+      S("ix.custom-hasinstance", "custom Symbol.hasInstance", "a class with a custom Symbol.hasInstance round-trips"),
+      S(
+        "ix.proto-getter-freevar",
+        "prototype getter capturing a free var",
+        "a prototype getter capturing a module free var round-trips",
+      ),
+      S(
+        "ix.deep-mixed-graph",
+        "Map→array→instance→private→Date",
+        "a deeply nested mixed graph: Map → array → instance → private → Date",
+      ),
+      S(
+        "ix.frozen-async-gen-method",
+        "frozen instance with async generator method",
+        "a frozen class instance with an async generator method",
+      ),
+      S(
+        "ix.fn-shared-map-direct",
+        "function shared between Map value and direct capture",
+        "a function shared between a Map value and a direct capture keeps identity",
+      ),
+      S("ix.reentrant-getters", "re-entrant getters", "re-entrant getters (one getter reads another)"),
+      S(
+        "ix.nan-negzero-values",
+        "NaN / -0 as values (not keys)",
+        "an object with NaN and -0 values (not keys) round-trips exactly",
+      ),
     ],
   },
 ];

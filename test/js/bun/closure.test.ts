@@ -3655,3 +3655,138 @@ describe("interactions: deeper adversarial combos", () => {
     expect(out.get(0)).toBe("negzero"); // -0 and 0 are the same Map key
   });
 });
+
+describe("interactions: exotic corners", () => {
+  test("a typed array and a DataView over ONE buffer share it", async () => {
+    const buf = new ArrayBuffer(8);
+    const u8 = new Uint8Array(buf);
+    const dv = new DataView(buf);
+    u8.set([1, 2, 3, 4, 5, 6, 7, 8]);
+    void [buf, u8, dv];
+    const out = (await roundtrip(() => ({ u8, dv })))();
+    expect(out.u8.buffer).toBe(out.dv.buffer);
+    out.u8[0] = 9;
+    expect(out.dv.getUint8(0)).toBe(9); // write via typed array visible via DataView
+  });
+
+  test("a bound function whose bound args include a captured Map and instance", async () => {
+    class P {
+      constructor(public x: number) {}
+    }
+    function combine(m: Map<string, number>, p: P, extra: number) {
+      return m.get("a")! + p.x + extra;
+    }
+    const m = new Map([["a", 10]]);
+    const bound = combine.bind(null, m, new P(20));
+    void bound;
+    const out = await roundtrip(() => bound(5));
+    expect(out()).toBe(35);
+  });
+
+  test("a Proxy with has / deleteProperty / ownKeys traps round-trips", async () => {
+    const p = new Proxy(
+      { a: 1, b: 2 } as Record<string, number>,
+      {
+        has: (t, k) => k in t || k === "virtual",
+        ownKeys: t => Reflect.ownKeys(t),
+        getOwnPropertyDescriptor: (t, k) => Object.getOwnPropertyDescriptor(t, k),
+      },
+    );
+    void p;
+    const out = (await roundtrip(() => p))();
+    expect("virtual" in out).toBe(true);
+    expect("a" in out).toBe(true);
+    expect(Object.keys(out).sort()).toEqual(["a", "b"]);
+  });
+
+  test("a class with a custom Symbol.hasInstance round-trips", async () => {
+    class Even {
+      static [Symbol.hasInstance](n: unknown) {
+        return typeof n === "number" && n % 2 === 0;
+      }
+    }
+    void Even;
+    const K = (await roundtrip(() => Even))();
+    expect(4 as any instanceof K).toBe(true);
+    expect(3 as any instanceof K).toBe(false);
+  });
+
+  test("a prototype getter capturing a module free var round-trips", async () => {
+    function makeClass(scale: number) {
+      return class {
+        base = 10;
+        get scaled() {
+          return this.base * scale;
+        }
+      };
+    }
+    const C = makeClass(3);
+    void C;
+    const K = (await roundtrip(() => C))();
+    expect(new K().scaled).toBe(30);
+  });
+
+  test("a deeply nested mixed graph: Map → array → instance → private → Date", async () => {
+    class Leaf {
+      #when = new Date(7000);
+      stamp() {
+        return this.#when.getTime();
+      }
+    }
+    const graph = new Map<string, unknown[]>([["items", [new Leaf(), { tag: "x" }]]]);
+    void graph;
+    const out = (await roundtrip(() => graph))();
+    const items = out.get("items")!;
+    expect((items[0] as Leaf).stamp()).toBe(7000);
+    expect((items[1] as any).tag).toBe("x");
+  });
+
+  test("a frozen class instance with an async generator method", async () => {
+    class Source {
+      base = 100;
+      async *take(n: number) {
+        for (let i = 0; i < n; i++) yield this.base + i;
+      }
+    }
+    const s = Object.freeze(new Source());
+    void s;
+    const out = (await roundtrip(() => s))();
+    expect(Object.isFrozen(out)).toBe(true);
+    expect(await Array.fromAsync(out.take(3))).toEqual([100, 101, 102]);
+  });
+
+  test("a function shared between a Map value and a direct capture keeps identity", async () => {
+    const f = (x: number) => x * 2;
+    const m = new Map<string, unknown>([["fn", f]]);
+    void [f, m];
+    const out = (await roundtrip(() => ({ f, m })))();
+    expect(out.m.get("fn")).toBe(out.f); // same function identity
+    expect((out.f as any)(21)).toBe(42);
+  });
+
+  test("re-entrant getters (one getter reads another)", async () => {
+    const o = {
+      _x: 5,
+      get a() {
+        return this._x + 1;
+      },
+      get b() {
+        return this.a * 10;
+      },
+    };
+    void o;
+    const out = (await roundtrip(() => o))();
+    expect(out.b).toBe(60);
+  });
+
+  test("an object with NaN and -0 values (not keys) round-trips exactly", async () => {
+    const o = { nan: NaN, negZero: -0, arr: [NaN, -0, Infinity] };
+    void o;
+    const out = (await roundtrip(() => o))();
+    expect(Number.isNaN(out.nan)).toBe(true);
+    expect(1 / out.negZero).toBe(-Infinity);
+    expect(Number.isNaN(out.arr[0])).toBe(true);
+    expect(1 / out.arr[1]).toBe(-Infinity);
+    expect(out.arr[2]).toBe(Infinity);
+  });
+});
