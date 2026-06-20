@@ -347,7 +347,17 @@ export const CATEGORIES: CoverageCategory[] = [
         "instanceof holds across reconstruction for subclass and superclass",
       ),
       S("cls.integrity", "unused methods kept (no class-body pruning)", "unused methods of a captured class are kept"),
-      L("cls.extends-call", "extends <call-expression> (unbound)", "extends <call-expression> heritage is unbound"),
+      S(
+        "cls.extends-call",
+        "extends <call-expression> (computed heritage)",
+        "extends <call-expression> heritage round-trips (computed superclass)",
+      ),
+      S("cls.extends-member", "extends <member-expression>", "extends <member-expression> heritage round-trips"),
+      S(
+        "cls.extends-brace-args",
+        "extends call with object-literal args",
+        "extends a call with object-literal args (brace inside heritage)",
+      ),
       L(
         "cls.field-init-only",
         "field-initializer-only capture on direct class value",
@@ -399,7 +409,11 @@ export const CATEGORIES: CoverageCategory[] = [
     items: [
       S("px.object", "Proxy (object target)", "reconstructs a captured Proxy (object target)"),
       S("px.function", "Proxy (function target)", "reconstructs a captured Proxy whose target is a function"),
-      L("px.revoked", "revoked Proxy (clear error)", "throws on a revoked Proxy"),
+      S(
+        "px.revoked",
+        "revoked Proxy (reconstructed as revoked)",
+        "round-trips a revoked Proxy (reconstructs as a revoked proxy)",
+      ),
       S("bind.args", "bound function (bound args)", "reconstructs a bound function (bound args)"),
       S("bind.this", "bound method preserves bound this", "reconstructs a bound method preserving bound this"),
       S("px.nested", "Proxy wrapping a Proxy", "nested Proxy (proxy wrapping a proxy) round-trips"),

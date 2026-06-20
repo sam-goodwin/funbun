@@ -312,12 +312,14 @@ test("reconstructs a captured Proxy whose target is a function", async () => {
   expect(fn()(5)).toBe(10); // apply trap doubles
 });
 
-test("throws on a revoked Proxy", () => {
+test("round-trips a revoked Proxy (reconstructs as a revoked proxy)", async () => {
   const { proxy, revoke } = Proxy.revocable({ a: 1 }, {});
   revoke();
   let p = proxy;
   void p;
-  expect(() => serialize(() => p)).toThrow("revoked Proxy");
+  const out = (await roundtrip(() => p))();
+  // Every revoked proxy is observationally identical: any operation throws.
+  expect(() => (out as any).a).toThrow(/revoked/);
 });
 
 test("reconstructs a captured object with a method (shorthand)", async () => {
@@ -2242,7 +2244,7 @@ describe("classes (radical)", () => {
 
   // GAP-PROBE: heritage that is a call expression (`extends computeBase()`) is not
   // a simple identifier, so the serializer can't bind it. Documents the boundary.
-  test("known limitation: extends <call-expression> heritage is unbound", async () => {
+  test("extends <call-expression> heritage round-trips (computed superclass)", async () => {
     function computeBase() {
       return class {
         tag() {
@@ -2257,14 +2259,50 @@ describe("classes (radical)", () => {
       }
     };
     void Sub;
-    let threw = false;
-    try {
-      const K = (await roundtrip(() => Sub))();
-      new K();
-    } catch {
-      threw = true;
+    const K = (await roundtrip(() => Sub))();
+    const inst = new K();
+    expect(inst.own()).toBe("own");
+    expect((inst as any).tag()).toBe("base"); // inherited from the computed base
+  });
+
+  test("extends <member-expression> heritage round-trips", async () => {
+    const ns = {
+      Base: class {
+        hi() {
+          return "hi";
+        }
+      },
+    };
+    void ns;
+    const Sub = class extends ns.Base {
+      bye() {
+        return "bye";
+      }
+    };
+    void Sub;
+    const K = (await roundtrip(() => Sub))();
+    const inst = new K();
+    expect([inst.bye(), (inst as any).hi()]).toEqual(["bye", "hi"]);
+  });
+
+  test("extends a call with object-literal args (brace inside heritage)", async () => {
+    function mix(opts: { tag: string }) {
+      return class {
+        tag() {
+          return opts.tag;
+        }
+      };
     }
-    expect(threw).toBe(true);
+    void mix;
+    const Sub = class extends mix({ tag: "T" }) {
+      own() {
+        return "own";
+      }
+    };
+    void Sub;
+    const K = (await roundtrip(() => Sub))();
+    const inst = new K();
+    expect([inst.own(), (inst as any).tag()]).toEqual(["own", "T"]);
   });
 
   test("instanceof holds across reconstruction for subclass and superclass", async () => {
@@ -3684,14 +3722,11 @@ describe("interactions: exotic corners", () => {
   });
 
   test("a Proxy with has / deleteProperty / ownKeys traps round-trips", async () => {
-    const p = new Proxy(
-      { a: 1, b: 2 } as Record<string, number>,
-      {
-        has: (t, k) => k in t || k === "virtual",
-        ownKeys: t => Reflect.ownKeys(t),
-        getOwnPropertyDescriptor: (t, k) => Object.getOwnPropertyDescriptor(t, k),
-      },
-    );
+    const p = new Proxy({ a: 1, b: 2 } as Record<string, number>, {
+      has: (t, k) => k in t || k === "virtual",
+      ownKeys: t => Reflect.ownKeys(t),
+      getOwnPropertyDescriptor: (t, k) => Object.getOwnPropertyDescriptor(t, k),
+    });
     void p;
     const out = (await roundtrip(() => p))();
     expect("virtual" in out).toBe(true);
@@ -3707,8 +3742,8 @@ describe("interactions: exotic corners", () => {
     }
     void Even;
     const K = (await roundtrip(() => Even))();
-    expect(4 as any instanceof K).toBe(true);
-    expect(3 as any instanceof K).toBe(false);
+    expect((4 as any) instanceof K).toBe(true);
+    expect((3 as any) instanceof K).toBe(false);
   });
 
   test("a prototype getter capturing a module free var round-trips", async () => {

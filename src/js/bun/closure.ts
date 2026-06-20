@@ -767,11 +767,10 @@ function reconstructFunctionExpr(fn: Function, ctx: Context): ReconstructedFunct
   // reconstructed — for classes AND for methods extracted from a class (whose
   // `this.#x` would otherwise be invalid standalone syntax). No-op when the
   // source has no `#`. Same-line replacement, so source maps stay correct.
-  const source = rewritePrivateMembers(original);
+  let source = rewritePrivateMembers(original);
 
   const freeVariables = allFreeVariables(fn, source);
   const location = (fn as any)[Symbol.sourceLocation] as ReconstructedFunction["location"];
-  const sourceLineCount = source.split("\n").length;
 
   const bindings: string[] = [];
   for (const variable of freeVariables) {
@@ -788,11 +787,17 @@ function reconstructFunctionExpr(fn: Function, ctx: Context): ReconstructedFunct
     bindings.push(`${variable.kind} ${variable.name} = ${emitValue(value, ctx)};`);
   }
 
-  // A class's `extends <Identifier>` superclass is referenced by the source but
-  // is not a free variable, so bind it explicitly (its identity is the class's
-  // own prototype). Only simple-identifier heritage is handled.
-  const superclassBinding = classHeritageBinding(fn, source, ctx);
-  if (superclassBinding !== undefined) bindings.push(superclassBinding);
+  // A class's `extends <heritage>` superclass is referenced by the source but is
+  // not a free variable, so bind it explicitly (its identity is the class's own
+  // prototype). A simple identifier is bound in place; a computed heritage
+  // (`extends mixin(Base)`) is rewritten to a synthetic identifier — line count
+  // preserved so source maps stay correct.
+  const heritage = classHeritage(fn, source, ctx);
+  if (heritage !== undefined) {
+    source = heritage.source;
+    bindings.push(heritage.binding);
+  }
+  const sourceLineCount = source.split("\n").length;
 
   // functionSourceToExpression always places the original source on its own
   // first line, so the only vertical offset comes from the IIFE wrapper.
@@ -854,18 +859,99 @@ function collectMemberFreeVariables(holder: object, classFn: Function, byId: Map
   }
 }
 
-// If `fn` is a class declared as `class X extends <Identifier> { ... }`, returns
-// a binding that brings the superclass into scope under that identifier. The
-// superclass is the class's own prototype (set by `extends`), which is reliable
-// even though it is not reported as a free variable.
-function classHeritageBinding(fn: Function, source: string, ctx: Context): string | undefined {
+// If `fn` is a class with a superclass, returns the (possibly rewritten) source
+// plus a binding bringing the superclass into scope. A simple identifier
+// (`extends Base`) is bound as-is; a computed heritage (`extends mixin(Base)`,
+// `extends ns.Base`) has its heritage expression replaced by a synthetic
+// identifier bound to the captured superclass value. The superclass identity is
+// the class's own prototype, reliable even though it isn't a free variable.
+function classHeritage(fn: Function, source: string, ctx: Context): { source: string; binding: string } | undefined {
   const trimmed = source.trimStart();
   if (!trimmed.startsWith("class")) return undefined;
   const superclass = Object.getPrototypeOf(fn);
   if (typeof superclass !== "function" || superclass === Function.prototype) return undefined;
-  const match = trimmed.match(/^class\s+(?:[A-Za-z_$][\w$]*\s+)?extends\s+([A-Za-z_$][\w$]*)\s*\{/);
-  if (match === null) return undefined;
-  return `const ${match[1]} = ${emitValue(superclass, ctx)};`;
+
+  const simple = trimmed.match(/^class\s+(?:[A-Za-z_$][\w$]*\s+)?extends\s+([A-Za-z_$][\w$]*)\s*\{/);
+  if (simple !== null) {
+    return { source, binding: `const ${simple[1]} = ${emitValue(superclass, ctx)};` };
+  }
+
+  const span = findHeritageSpan(source);
+  if (span === undefined) return undefined; // no extends clause we can locate
+  const superName = `__bunSuper$${ctx.counter++}`;
+  // Preserve the heritage's line span so generated line numbers (and thus the
+  // source map) don't shift.
+  const newlines = source.slice(span.start, span.end).split("\n").length - 1;
+  const replacement = superName + "\n".repeat(newlines);
+  return {
+    source: source.slice(0, span.start) + replacement + source.slice(span.end),
+    binding: `const ${superName} = ${emitValue(superclass, ctx)};`,
+  };
+}
+
+// Locates the heritage expression in a class header — the span between `extends`
+// and the class body `{` — handling call/member/parenthesized expressions by
+// tracking ()/[] depth and skipping strings and comments.
+function findHeritageSpan(source: string): { start: number; end: number } | undefined {
+  const n = source.length;
+  let depth = 0;
+  let heritageStart = -1;
+  for (let i = 0; i < n; ) {
+    const c = source[i];
+    if (c === "/" && source[i + 1] === "/") {
+      i += 2;
+      while (i < n && source[i] !== "\n") i++;
+      continue;
+    }
+    if (c === "/" && source[i + 1] === "*") {
+      i += 2;
+      while (i < n && !(source[i] === "*" && source[i + 1] === "/")) i++;
+      i += 2;
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      i++;
+      while (i < n && source[i] !== c) i += source[i] === "\\" ? 2 : 1;
+      i++;
+      continue;
+    }
+    if (c === "`") {
+      i++;
+      while (i < n && source[i] !== "`") i += source[i] === "\\" ? 2 : 1;
+      i++;
+      continue;
+    }
+    if (c === "(" || c === "[") {
+      depth++;
+      i++;
+      continue;
+    }
+    if (c === ")" || c === "]") {
+      depth--;
+      i++;
+      continue;
+    }
+    if (c === "{" && depth === 0) {
+      if (heritageStart === -1) return undefined;
+      let end = i;
+      while (end > heritageStart && /\s/.test(source[end - 1]!)) end--;
+      return { start: heritageStart, end };
+    }
+    if (
+      depth === 0 &&
+      heritageStart === -1 &&
+      source.startsWith("extends", i) &&
+      !/[\w$]/.test(source[i - 1] ?? "") &&
+      !/[\w$]/.test(source[i + 7] ?? "")
+    ) {
+      i += 7;
+      while (i < n && /\s/.test(source[i]!)) i++;
+      heritageStart = i;
+      continue;
+    }
+    i++;
+  }
+  return undefined;
 }
 
 // Applies the replacer (if any) to a value before it is serialized. `holder` is
@@ -1285,7 +1371,11 @@ function emitProxy(value: object, ctx: Context): string {
 
   const handler = $getProxyInternalField(value, $proxyFieldHandler);
   if (handler === null) {
-    throw new TypeError("Cannot serialize a revoked Proxy");
+    // A revoked proxy has no target/handler left to capture, but every revoked
+    // proxy is observationally identical (throws on every operation), so emit a
+    // fresh one — behavior is preserved exactly.
+    ctx.module.push(`const ${name} = (() => { const r = Proxy.revocable({}, {}); r.revoke(); return r.proxy; })();`);
+    return name;
   }
   const target = $getProxyInternalField(value, $proxyFieldTarget);
 
