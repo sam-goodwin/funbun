@@ -492,6 +492,52 @@ export const CATEGORIES: CoverageCategory[] = [
       ),
     ],
   },
+  {
+    name: "Feature interactions (combinations)",
+    items: [
+      S("ix.frozen-map", "frozen Map / Set / Date", "a frozen Map round-trips frozen"),
+      S(
+        "ix.frozen-typedarray-obj",
+        "frozen object holding a typed array",
+        "a frozen object holding a typed array round-trips",
+      ),
+      S("ix.cycle-map", "a Map that contains itself", "a Map that contains itself round-trips"),
+      S(
+        "ix.cycle-set",
+        "a Set containing an object that refs the Set",
+        "a Set that contains an object referencing the Set",
+      ),
+      S("ix.map-date-key", "Map keyed by a captured Date", "a Map keyed by a captured Date"),
+      S(
+        "ix.proxy-map",
+        "Proxy over a Map (method-binding)",
+        "a Proxy over a Map (method-binding handler) forwards through the target",
+      ),
+      S("ix.proxy-array", "Proxy over an array", "a Proxy over an array round-trips"),
+      S(
+        "ix.private-builtin-value",
+        "private field holding a Date/Map",
+        "a private field holding a Date/Map round-trips",
+      ),
+      S(
+        "ix.frozen-private",
+        "frozen class instance with a private field",
+        "a frozen class instance with a private field round-trips",
+      ),
+      S("ix.bound-private", "bound method capturing private state", "a bound method capturing private state via this"),
+      S("ix.guard-nested-weakmap", "nested WeakMap still throws", "a WeakMap nested in a captured object still throws"),
+      S(
+        "ix.guard-nested-generator",
+        "nested generator object still throws",
+        "a generator object nested in a Map still throws",
+      ),
+      S(
+        "ix.shared-cell-gen",
+        "shared cell across generator + function",
+        "a shared cell mutated by both a generator and a plain function",
+      ),
+    ],
+  },
 ];
 
 // ---------------------------------------------------------------------------

@@ -763,10 +763,11 @@ function reconstructFunctionExpr(fn: Function, ctx: Context): ReconstructedFunct
   if (isNativeFunctionSource(original)) {
     throw new TypeError("Cannot serialize a native function (no JavaScript source is available)");
   }
-  // Transform `#private` class members into mangled public members so instances
-  // can be reconstructed. Same-line replacement, so line counts are preserved
-  // (source maps stay correct).
-  const source = original.trimStart().startsWith("class") ? rewritePrivateMembers(original) : original;
+  // Transform `#private` members into mangled public members so they can be
+  // reconstructed — for classes AND for methods extracted from a class (whose
+  // `this.#x` would otherwise be invalid standalone syntax). No-op when the
+  // source has no `#`. Same-line replacement, so source maps stay correct.
+  const source = rewritePrivateMembers(original);
 
   const freeVariables = allFreeVariables(fn, source);
   const location = (fn as any)[Symbol.sourceLocation] as ReconstructedFunction["location"];
@@ -816,7 +817,12 @@ function reconstructFunctionExpr(fn: Function, ctx: Context): ReconstructedFunct
 // cell.
 function allFreeVariables(fn: Function, source: string): FreeVariable[] {
   const own = ((fn as any)[Symbol.freeVariables] as FreeVariable[] | undefined) ?? [];
-  if (!source.trimStart().startsWith("class")) return own;
+  if (!source.trimStart().startsWith("class")) {
+    // `#name` private brands are recreated by the mangling rewrite (the receiver
+    // carries the mangled field), never captured as an external free variable —
+    // applies to a method extracted from a class just as to the class itself.
+    return own.filter(v => !v.name.startsWith("#"));
+  }
 
   const byId = new Map<number, FreeVariable>();
   for (const variable of own) {
@@ -941,10 +947,23 @@ function emitObject(value: object, ctx: Context): string {
   // Record BEFORE recursing so a self-reference resolves to `name`.
   ctx.refs.set(value, name);
 
-  if (emitBuiltin(value, name, ctx)) {
-    return name;
+  if (!emitBuiltin(value, name, ctx)) {
+    emitObjectBody(value, name, ctx);
   }
 
+  // Preserve a non-extensible/sealed/frozen state — applied LAST, after every
+  // property (and any cycle) is wired, since a frozen object rejects mutation.
+  // Covers built-ins (a frozen Map/Set/Date) as well as plain objects.
+  if (!Object.isExtensible(value)) {
+    if (Object.isFrozen(value)) ctx.module.push(`Object.freeze(${name});`);
+    else if (Object.isSealed(value)) ctx.module.push(`Object.seal(${name});`);
+    else ctx.module.push(`Object.preventExtensions(${name});`);
+  }
+
+  return name;
+}
+
+function emitObjectBody(value: object, name: string, ctx: Context): void {
   if (Array.isArray(value)) {
     ctx.module.push(`const ${name} = [];`);
     const array = value as unknown[];
@@ -978,16 +997,6 @@ function emitObject(value: object, ctx: Context): string {
     emitOwnProperties(name, value, ctx);
     emitPrivateFields(name, value, ctx);
   }
-
-  // Preserve a non-extensible/sealed/frozen state — applied LAST, after every
-  // property (and any cycle) is wired, since a frozen object rejects mutation.
-  if (!Object.isExtensible(value)) {
-    if (Object.isFrozen(value)) ctx.module.push(`Object.freeze(${name});`);
-    else if (Object.isSealed(value)) ctx.module.push(`Object.seal(${name});`);
-    else ctx.module.push(`Object.preventExtensions(${name});`);
-  }
-
-  return name;
 }
 
 // Emits an instance's private (#name) field values (read natively) as the

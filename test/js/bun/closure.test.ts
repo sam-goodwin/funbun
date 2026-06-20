@@ -3173,3 +3173,171 @@ describe("frontier: top-level await context", () => {
     expect({ line: line ?? `<none> ${stderr}`, exitCode }).toEqual({ line: "RESULT:42", exitCode: 0 });
   });
 });
+
+// ===========================================================================
+// INTERACTION MATRIX — combinations of features that tend to expose gaps.
+// ===========================================================================
+describe("interactions: frozen + builtins", () => {
+  test("a frozen Map round-trips frozen", async () => {
+    const m = Object.freeze(new Map([["a", 1]]));
+    void m;
+    const out = (await roundtrip(() => m))();
+    expect(Object.isFrozen(out)).toBe(true);
+    expect(out.get("a")).toBe(1);
+  });
+  test("a frozen Set round-trips frozen", async () => {
+    const s = Object.freeze(new Set([1, 2]));
+    void s;
+    const out = (await roundtrip(() => s))();
+    expect(Object.isFrozen(out)).toBe(true);
+    expect([...out]).toEqual([1, 2]);
+  });
+  test("a frozen Date round-trips frozen", async () => {
+    const d = Object.freeze(new Date(0));
+    void d;
+    const out = (await roundtrip(() => d))();
+    expect(Object.isFrozen(out)).toBe(true);
+    expect(out.getTime()).toBe(0);
+  });
+  test("a frozen object holding a typed array round-trips", async () => {
+    const o = Object.freeze({ bytes: new Uint8Array([1, 2, 3]) });
+    void o;
+    const out = (await roundtrip(() => o))();
+    expect(Object.isFrozen(out)).toBe(true);
+    expect([...out.bytes]).toEqual([1, 2, 3]);
+  });
+});
+
+describe("interactions: cycles through collections", () => {
+  test("a Map that contains itself round-trips", async () => {
+    const m = new Map<string, unknown>();
+    m.set("self", m);
+    m.set("v", 1);
+    void m;
+    const out = (await roundtrip(() => m))();
+    expect(out.get("self")).toBe(out);
+    expect(out.get("v")).toBe(1);
+  });
+  test("a Set that contains an object referencing the Set", async () => {
+    const s = new Set<any>();
+    const o: any = { peer: s };
+    s.add(o);
+    void s;
+    const out = (await roundtrip(() => s))();
+    const first = [...out][0];
+    expect(first.peer).toBe(out);
+  });
+  test("a Map keyed by a captured Date", async () => {
+    const key = new Date(1000);
+    const m = new Map([[key, "v"]]);
+    void [key, m];
+    const out = (await roundtrip(() => ({ key, m })))();
+    expect(out.m.get(out.key)).toBe("v");
+  });
+});
+
+describe("interactions: proxies over builtins", () => {
+  test("a Proxy over a Map (method-binding handler) forwards through the target", async () => {
+    // Plain `new Proxy(map, {}).get(k)` throws even without serialization (Map
+    // methods need the internal slot), so use a handler that binds methods.
+    const target = new Map([["a", 1]]);
+    const p = new Proxy(target, {
+      get(t, k) {
+        const v = (t as any)[k];
+        return typeof v === "function" ? v.bind(t) : v;
+      },
+    });
+    void p;
+    const out = (await roundtrip(() => p))();
+    expect((out as any).get("a")).toBe(1);
+  });
+  test("a Proxy over an array round-trips", async () => {
+    const p = new Proxy([10, 20, 30], { get: (t, k) => (k === "1" ? 999 : (t as any)[k]) });
+    void p;
+    const out = (await roundtrip(() => p))();
+    expect((out as any)[0]).toBe(10);
+    expect((out as any)[1]).toBe(999);
+  });
+});
+
+describe("interactions: private fields + other features", () => {
+  test("a private field holding a Date/Map round-trips", async () => {
+    class Holder {
+      #when = new Date(500);
+      #cache = new Map([["k", "v"]]);
+      when() {
+        return this.#when.getTime();
+      }
+      cached() {
+        return this.#cache.get("k");
+      }
+    }
+    const h = new Holder();
+    void h;
+    const out = (await roundtrip(() => h))();
+    expect(out.when()).toBe(500);
+    expect(out.cached()).toBe("v");
+  });
+  test("a frozen class instance with a private field round-trips", async () => {
+    class Sealed {
+      #secret = 42;
+      reveal() {
+        return this.#secret;
+      }
+    }
+    const s = Object.freeze(new Sealed());
+    void s;
+    const out = (await roundtrip(() => s))();
+    expect(Object.isFrozen(out)).toBe(true);
+    expect(out.reveal()).toBe(42);
+  });
+  test("a bound method capturing private state via this", async () => {
+    class Counter {
+      #n = 10;
+      step() {
+        return ++this.#n;
+      }
+    }
+    const c = new Counter();
+    const bound = c.step.bind(c);
+    void bound;
+    const out = await roundtrip(() => bound());
+    expect(out()).toBe(11);
+    expect(out()).toBe(12);
+  });
+});
+
+describe("interactions: guards fire when nested", () => {
+  test("a WeakMap nested in a captured object still throws", () => {
+    const o = { inner: new WeakMap() };
+    void o;
+    expect(() => serialize(() => o)).toThrow(/WeakMap/i);
+  });
+  test("a generator object nested in a Map still throws", () => {
+    function* g() {
+      yield 1;
+    }
+    const m = new Map([["gen", g()]]);
+    void m;
+    expect(() => serialize(() => m)).toThrow(/suspended execution state/i);
+  });
+});
+
+describe("interactions: shared cells across function kinds", () => {
+  test("a shared cell mutated by both a generator and a plain function", async () => {
+    let total = 0;
+    function* accumulate(xs: number[]) {
+      for (const x of xs) {
+        total += x;
+        yield total;
+      }
+    }
+    const read = () => total;
+    void [accumulate, read, total];
+    const fn = await roundtrip(() => {
+      const seen = [...accumulate([1, 2, 3])];
+      return { seen, total: read() };
+    });
+    expect(fn()).toEqual({ seen: [1, 3, 6], total: 6 });
+  });
+});
