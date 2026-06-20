@@ -1356,19 +1356,9 @@ async function bundle(fn: Function): Promise<string> {
     sourceBlocks: [],
     keepSets: computeKeepSets(fn),
   };
-  const freeVariables = allFreeVariables(fn, source);
-  const stateExports: string[] = [];
-  const stateNames = new Set<string>();
-  for (const variable of freeVariables) {
-    if (stateNames.has(variable.name)) continue;
-    stateNames.add(variable.name);
-    const value = transform(undefined, variable.name, variable.value, ctx);
-    stateExports.push(`export const ${variable.name} = ${emitValue(value, ctx)};`);
-  }
-  const stateModule = (ctx.module.length ? ctx.module.join("\n") + "\n" : "") + stateExports.join("\n");
-
   // 2. Recover the closure module's import bindings: localName → original source.
-  const bindings = new Map<string, { source: string; imported?: string; default?: boolean; star?: boolean }>();
+  type Binding = { source: string; imported?: string; default?: boolean; star?: boolean };
+  const bindings = new Map<string, Binding>();
   if (url && fs.existsSync(url)) {
     const moduleAst = transpiler.ast(fs.readFileSync(url, "utf8"));
     for (const stmt of moduleAst.body) {
@@ -1382,15 +1372,10 @@ async function bundle(fn: Function): Promise<string> {
     }
   }
 
-  // 3. Re-import each referenced module-level dependency from its original source.
   const importLines: string[] = [];
   const emitted = new Set<string>();
-  for (const name of collectReferencedNames(transpiler, source)) {
-    if (stateNames.has(name) || name in (globalThis as any) || emitted.has(name)) {
-      continue;
-    }
-    const b = bindings.get(name);
-    if (!b) continue;
+  const emitImport = (name: string, b: Binding): void => {
+    if (emitted.has(name)) return;
     emitted.add(name);
     if (b.default) importLines.push(`import ${name} from ${JSON.stringify(b.source)};`);
     else if (b.star) importLines.push(`import * as ${name} from ${JSON.stringify(b.source)};`);
@@ -1398,6 +1383,35 @@ async function bundle(fn: Function): Promise<string> {
       importLines.push(
         `import { ${b.imported === name ? name : `${b.imported} as ${name}`} } from ${JSON.stringify(b.source)};`,
       );
+  };
+
+  // 3. Captured state → a virtual module exporting each free variable — EXCEPT
+  //    free variables that are themselves import bindings (e.g. `import * as ns`,
+  //    which JSC captures as a namespace object). Those are re-imported from
+  //    their original source so the bundler resolves and tree-shakes them,
+  //    rather than us value-walking the whole namespace object.
+  const freeVariables = allFreeVariables(fn, source);
+  const stateExports: string[] = [];
+  const stateNames = new Set<string>();
+  for (const variable of freeVariables) {
+    if (stateNames.has(variable.name) || emitted.has(variable.name)) continue;
+    const binding = bindings.get(variable.name);
+    if (binding) {
+      emitImport(variable.name, binding);
+      continue;
+    }
+    stateNames.add(variable.name);
+    const value = transform(undefined, variable.name, variable.value, ctx);
+    stateExports.push(`export const ${variable.name} = ${emitValue(value, ctx)};`);
+  }
+  const stateModule = (ctx.module.length ? ctx.module.join("\n") + "\n" : "") + stateExports.join("\n");
+
+  // 4. Re-import the remaining referenced module-level dependencies (named imports
+  //    that JSC does not surface as free variables) from their original sources.
+  for (const name of collectReferencedNames(transpiler, source)) {
+    if (stateNames.has(name) || emitted.has(name) || name in (globalThis as any)) continue;
+    const binding = bindings.get(name);
+    if (binding) emitImport(name, binding);
   }
 
   // 4. Synthetic entry wiring imports + state to the reconstructed closure.

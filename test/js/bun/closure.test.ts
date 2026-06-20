@@ -1118,4 +1118,39 @@ describe("bundle (bundler-backed)", () => {
     expect(lines.find(l => l.startsWith("RESULT:"))).toBe("RESULT:ALPHA:5:PICK");
     expect({ stderr, exitCode }).toEqual({ stderr: expect.any(String), exitCode: 0 });
   });
+
+  // A `import * as ns` namespace is captured as a free variable; it must be
+  // re-imported (so the bundler tree-shakes it), not value-walked as state.
+  test("re-imports namespace imports and tree-shakes their unused members", async () => {
+    using dir = tempDir(`closure-bundle-ns-${counter++}`, {
+      "m.mjs": `
+        export function used() { return "USED"; }
+        export function unused() { return "UNUSED_SHOULD_TREESHAKE"; }
+      `,
+      "main.mjs": `
+        import * as ns from "./m.mjs";
+        import { bundle } from "bun:closure";
+        import { writeFileSync } from "node:fs";
+        const fn = () => ns.used();
+        const out = await bundle(fn);
+        writeFileSync(new URL("./out.mjs", import.meta.url), out);
+        console.log(JSON.stringify({ treeShaken: !out.includes("UNUSED_SHOULD_TREESHAKE") }));
+        const m = await import(new URL("./out.mjs", import.meta.url).href);
+        console.log("RESULT:" + m.default());
+      `,
+    });
+
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), String(dir) + "/main.mjs"],
+      env: { ...bunEnv, BUN_DEBUG_QUIET_LOGS: "1" },
+      stderr: "pipe",
+      stdout: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    const lines = stdout.trim().split("\n");
+
+    expect(JSON.parse(lines[0])).toEqual({ treeShaken: true });
+    expect(lines.find(l => l.startsWith("RESULT:"))).toBe("RESULT:USED");
+    expect({ stderr, exitCode }).toEqual({ stderr: expect.any(String), exitCode: 0 });
+  });
 });
