@@ -1507,3 +1507,1237 @@ describe("ESM import spec", () => {
     });
   });
 });
+
+// ===========================================================================
+// RADICAL CORRECTNESS & OPTIMALITY — deep nesting, recursion topologies,
+// class shapes, generators, and tree-shaking limits. Designed to stress the
+// ES spec corners of the serializer.
+// ===========================================================================
+
+describe("deeply nested scope capture", () => {
+  test("inner closure captures cells from non-adjacent ancestor scopes", async () => {
+    function level1() {
+      let a = 100;
+      function level2() {
+        let b = 7;
+        void b;
+        function level3() {
+          let c = 20;
+          return () => a + c; // a is 3 scopes up, c is 1 scope up; b skipped
+        }
+        return level3();
+      }
+      return level2();
+    }
+    void level1;
+    const fn = await roundtrip(level1());
+    expect(fn()).toBe(120);
+  });
+
+  test("five-level closure summing one cell from every ancestor", async () => {
+    function L1() {
+      let a = 1;
+      return (function L2() {
+        let b = 2;
+        return (function L3() {
+          let c = 3;
+          return (function L4() {
+            let d = 4;
+            return (function L5() {
+              let e = 5;
+              return () => a + b + c + d + e;
+            })();
+          })();
+        })();
+      })();
+    }
+    void L1;
+    const fn = await roundtrip(L1());
+    expect(fn()).toBe(15);
+  });
+
+  test("curry chain serialized at the leaf captures all earlier args", async () => {
+    const curry = (a: number) => (b: number) => (c: number) => (d: number) => a + b + c + d;
+    const leaf = curry(1)(2)(3);
+    void leaf;
+    const fn = await roundtrip(leaf);
+    expect(fn(4)).toBe(10);
+    expect(fn(40)).toBe(46);
+  });
+
+  test("curry chain serialized mid-way still produces working sub-closures", async () => {
+    const curry = (a: number) => (b: number) => (c: number) => a * 100 + b * 10 + c;
+    const partial = curry(7);
+    void partial;
+    const fn = await roundtrip(partial);
+    expect(fn(2)(3)).toBe(723);
+  });
+
+  test("IIFE module pattern — captured M's api reads private state", async () => {
+    const M = (() => {
+      let _private = 41;
+      return { get: () => _private, bump: () => ++_private };
+    })();
+    void M;
+    const fn = await roundtrip(() => {
+      M.bump();
+      return M.get();
+    });
+    expect(fn()).toBe(42);
+  });
+
+  test("shadowing: innermost x wins", async () => {
+    function outer() {
+      let x = 1;
+      void x;
+      function mid() {
+        let x = 2;
+        void x;
+        function inner() {
+          let x = 3;
+          return () => x;
+        }
+        return inner();
+      }
+      return mid();
+    }
+    void outer;
+    const fn = await roundtrip(outer());
+    expect(fn()).toBe(3);
+  });
+
+  test("shadowing: closure binds to the correct middle-scope x", async () => {
+    function outer() {
+      let x = "outer";
+      void x;
+      function mid() {
+        let x = "mid";
+        const read = () => x;
+        function inner() {
+          let x = "inner";
+          void x;
+          return read;
+        }
+        return inner();
+      }
+      return mid();
+    }
+    void outer;
+    const fn = await roundtrip(outer());
+    expect(fn()).toBe("mid");
+  });
+
+  test("let loop: a single per-iteration closure captures its own i", async () => {
+    const fns: Array<() => number> = [];
+    for (let i = 0; i < 5; i++) fns.push(() => i);
+    const third = fns[3];
+    void third;
+    const fn = await roundtrip(third);
+    expect(fn()).toBe(3);
+  });
+
+  test("let loop: all per-iteration closures keep distinct i", async () => {
+    function build() {
+      const fns: Array<() => number> = [];
+      for (let i = 0; i < 4; i++) fns.push(() => i);
+      return () => fns.map(f => f());
+    }
+    void build;
+    const fn = await roundtrip(build());
+    expect(fn()).toEqual([0, 1, 2, 3]);
+  });
+
+  test("block-scoped let is captured", async () => {
+    function make() {
+      let result: (() => number) | undefined;
+      {
+        let secret = 99;
+        result = () => secret;
+      }
+      return result!;
+    }
+    void make;
+    const fn = await roundtrip(make());
+    expect(fn()).toBe(99);
+  });
+
+  test("sibling closures share one ancestor cell post-reconstruction", async () => {
+    function make() {
+      let count = 0;
+      return { inc: () => ++count, get: () => count };
+    }
+    const { inc, get } = make();
+    void [inc, get];
+    const fn = await roundtrip(() => {
+      inc();
+      inc();
+      inc();
+      return get();
+    });
+    expect(fn()).toBe(3);
+  });
+
+  test("shared cell across object methods stays shared", async () => {
+    function makeBank() {
+      let balance = 100;
+      return {
+        deposit(n: number) {
+          balance += n;
+          return balance;
+        },
+        withdraw(n: number) {
+          balance -= n;
+          return balance;
+        },
+        balance: () => balance,
+      };
+    }
+    const bank = makeBank();
+    void bank;
+    const fn = await roundtrip(() => {
+      bank.deposit(50);
+      bank.withdraw(30);
+      return bank.balance();
+    });
+    expect(fn()).toBe(120);
+  });
+
+  test("co-recursive local helpers captured by an outer closure", async () => {
+    function make() {
+      const isEven = (n: number): boolean => (n === 0 ? true : isOdd(n - 1));
+      const isOdd = (n: number): boolean => (n === 0 ? false : isEven(n - 1));
+      return (n: number) => isEven(n);
+    }
+    void make;
+    const fn = await roundtrip(make());
+    expect(fn(10)).toBe(true);
+    expect(fn(7)).toBe(false);
+  });
+
+  test("two distinct NON-shared cells with the same name coexist", async () => {
+    function make1() {
+      let x = 1;
+      return () => x;
+    }
+    function make2() {
+      let x = 2;
+      return () => x;
+    }
+    const f1 = make1();
+    const f2 = make2();
+    void [f1, f2];
+    const fn = await roundtrip(() => [f1(), f2()]);
+    expect(fn()).toEqual([1, 2]);
+  });
+
+  test("deep ancestor cell shared by closures at different depths", async () => {
+    function d1() {
+      let acc = 0;
+      function d2() {
+        function d3() {
+          const add = (n: number) => {
+            acc += n;
+            return acc;
+          };
+          function d4() {
+            const read = () => acc;
+            return { add, read };
+          }
+          return d4();
+        }
+        return d3();
+      }
+      return d2();
+    }
+    const { add, read } = d1();
+    void [add, read];
+    const fn = await roundtrip(() => {
+      add(10);
+      add(5);
+      return read();
+    });
+    expect(fn()).toBe(15);
+  });
+
+  // GAP-PROBE: two lexically-distinct shared cells that happen to share a name.
+  // Documented limitation — the serializer hoists shared cells by their original
+  // name and throws on a collision. If a future change mangles colliding names,
+  // flip this to assert [2, 1001].
+  test("known limitation: two distinct shared cells with the same name throw", () => {
+    function groupA() {
+      let x = 1;
+      return { inc: () => ++x, get: () => x };
+    }
+    function groupB() {
+      let x = 1000;
+      return { inc: () => ++x, get: () => x };
+    }
+    const a = groupA();
+    const b = groupB();
+    void [a, b];
+    const root = () => {
+      a.inc();
+      b.inc();
+      return [a.get(), b.get()];
+    };
+    expect(() => serialize(root)).toThrow('two distinct shared variables are both named "x"');
+  });
+});
+
+describe("recursion topologies (radical)", () => {
+  test("three-way mutual recursion", async () => {
+    function f(n: number): number {
+      return n <= 0 ? 0 : 1 + g(n - 1);
+    }
+    function g(n: number): number {
+      return n <= 0 ? 0 : 1 + h(n - 1);
+    }
+    function h(n: number): number {
+      return n <= 0 ? 0 : 1 + f(n - 1);
+    }
+    void [f, g, h];
+    const fn = await roundtrip(f);
+    expect(fn(9)).toBe(9);
+  });
+
+  test("four-way mutual recursion ring", async () => {
+    function a(n: number): number {
+      return n <= 0 ? 0 : 1 + b(n - 1);
+    }
+    function b(n: number): number {
+      return n <= 0 ? 0 : 1 + c(n - 1);
+    }
+    function c(n: number): number {
+      return n <= 0 ? 0 : 1 + d(n - 1);
+    }
+    function d(n: number): number {
+      return n <= 0 ? 0 : 1 + a(n - 1);
+    }
+    void [a, b, c, d];
+    const fn = await roundtrip(a);
+    expect(fn(12)).toBe(12);
+  });
+
+  test("cycle where the entry function is outside the inner loop", async () => {
+    function loopA(n: number): string {
+      return n <= 0 ? "A" : loopB(n - 1);
+    }
+    function loopB(n: number): string {
+      return n <= 0 ? "B" : loopA(n - 1);
+    }
+    function entry(n: number): string {
+      return "start:" + loopA(n);
+    }
+    void [loopA, loopB, entry];
+    const fn = await roundtrip(entry);
+    expect(fn(4)).toBe("start:A");
+    expect(fn(5)).toBe("start:B");
+  });
+
+  test("recursion through a captured object's own method (o.fact)", async () => {
+    const o = {
+      fact(n: number): number {
+        return n <= 1 ? 1 : n * o.fact(n - 1);
+      },
+    };
+    void o;
+    const fn = await roundtrip(() => o.fact(5));
+    expect(fn()).toBe(120);
+  });
+
+  test("recursion through a captured dispatch table", async () => {
+    const table: Record<string, (n: number) => number> = {
+      even(n) {
+        return n === 0 ? 1 : table.odd(n - 1);
+      },
+      odd(n) {
+        return n === 0 ? 0 : table.even(n - 1);
+      },
+    };
+    void table;
+    const fn = await roundtrip(() => table.even(10));
+    expect(fn()).toBe(1);
+  });
+
+  test("recursion through a captured Map of functions", async () => {
+    const dispatch = new Map<string, (n: number) => number>();
+    dispatch.set("even", n => (n === 0 ? 1 : dispatch.get("odd")!(n - 1)));
+    dispatch.set("odd", n => (n === 0 ? 0 : dispatch.get("even")!(n - 1)));
+    void dispatch;
+    const fn = await roundtrip(() => dispatch.get("even")!(6));
+    expect(fn()).toBe(1);
+  });
+
+  test("recursion through a captured array of functions", async () => {
+    const fns: Array<(n: number) => number> = [];
+    fns.push(n => (n <= 0 ? 0 : 1 + fns[1](n - 1)));
+    fns.push(n => (n <= 0 ? 0 : 1 + fns[0](n - 1)));
+    void fns;
+    const fn = await roundtrip(() => fns[0](8));
+    expect(fn()).toBe(8);
+  });
+
+  test("Y-combinator builds factorial without named self-reference", async () => {
+    const Y = (f: any): any => ((x: any) => f((v: any) => x(x)(v)))((x: any) => f((v: any) => x(x)(v)));
+    const fact = Y((self: (n: number) => number) => (n: number) => (n <= 1 ? 1 : n * self(n - 1)));
+    void fact;
+    const fn = await roundtrip(fact);
+    expect(fn(5)).toBe(120);
+  });
+
+  test("trampolined recursion via a captured trampoline helper", async () => {
+    const trampoline = (start: () => any): number => {
+      let result = start();
+      while (typeof result === "function") result = result();
+      return result;
+    };
+    const sumTo = (n: number, acc = 0): any => (n === 0 ? acc : () => sumTo(n - 1, acc + n));
+    void [trampoline, sumTo];
+    const fn = await roundtrip(() => trampoline(() => sumTo(100, 0)));
+    expect(fn()).toBe(5050);
+  });
+
+  test("indirect recursion where the cycle passes through a captured HOF", async () => {
+    const apply = (f: (n: number) => number, n: number): number => f(n);
+    const countdown = (n: number): number => (n <= 0 ? 0 : 1 + apply(countdown, n - 1));
+    void [apply, countdown];
+    const fn = await roundtrip(countdown);
+    expect(fn(7)).toBe(7);
+  });
+
+  test("a self-delegating recursive generator round-trips", async () => {
+    function* walk(n: number): Generator<number> {
+      if (n < 0) return;
+      yield n;
+      yield* walk(n - 1);
+    }
+    void walk;
+    const gen = await roundtrip(walk);
+    expect([...gen(3)]).toEqual([3, 2, 1, 0]);
+  });
+
+  test("mutually-recursive generators (ping/pong) round-trip", async () => {
+    function* ping(n: number): Generator<string> {
+      if (n <= 0) return;
+      yield "ping";
+      yield* pong(n - 1);
+    }
+    function* pong(n: number): Generator<string> {
+      if (n <= 0) return;
+      yield "pong";
+      yield* ping(n - 1);
+    }
+    void [ping, pong];
+    const gen = await roundtrip(ping);
+    expect([...gen(4)]).toEqual(["ping", "pong", "ping", "pong"]);
+  });
+
+  test("crown jewel: mutual recursion across a circular ESM import graph", async () => {
+    using dir = tempDir(`closure-xmod-circular-${counter++}`, {
+      "a.mjs": `
+        import { isOdd } from "./b.mjs";
+        export function isEven(n) { return n === 0 ? true : isOdd(n - 1); }
+      `,
+      "b.mjs": `
+        import { isEven } from "./a.mjs";
+        export function isOdd(n) { return n === 0 ? false : isEven(n - 1); }
+      `,
+      "runner.mjs": `
+        import { serialize } from "bun:closure";
+        import { writeFileSync } from "node:fs";
+        import { isEven } from "./a.mjs";
+        const code = serialize(isEven);
+        const url = new URL("./out.mjs", import.meta.url);
+        writeFileSync(url, code);
+        const ns = await import(url.href);
+        process.stdout.write("RESULT:" + JSON.stringify({
+          even10: ns.default(10),
+          odd7: ns.default(7),
+          noUserImport: !/from\\s*["'][^"']*\\/(a|b)\\.mjs["']/.test(code),
+        }) + "\\n");
+      `,
+    });
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), String(dir) + "/runner.mjs"],
+      env: { ...bunEnv, BUN_DEBUG_QUIET_LOGS: "1" },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    const line = stdout.split("\n").find(l => l.startsWith("RESULT:"));
+    expect({ line: line ?? `<none> stderr=${stderr}`, exitCode }).toEqual({
+      line: expect.stringContaining("RESULT:"),
+      exitCode: 0,
+    });
+    expect(JSON.parse(line!.slice("RESULT:".length))).toEqual({ even10: true, odd7: false, noUserImport: true });
+  });
+
+  test("cross-module mutual recursion with renamed (aliased) imports", async () => {
+    using dir = tempDir(`closure-xmod-alias-${counter++}`, {
+      "a.mjs": `
+        import { isOdd as odd } from "./b.mjs";
+        export function isEven(n) { return n === 0 ? true : odd(n - 1); }
+      `,
+      "b.mjs": `
+        import { isEven as even } from "./a.mjs";
+        export function isOdd(n) { return n === 0 ? false : even(n - 1); }
+      `,
+      "runner.mjs": `
+        import { serialize } from "bun:closure";
+        import { writeFileSync } from "node:fs";
+        import { isEven } from "./a.mjs";
+        const code = serialize(isEven);
+        const url = new URL("./out.mjs", import.meta.url);
+        writeFileSync(url, code);
+        const ns = await import(url.href);
+        process.stdout.write("RESULT:" + JSON.stringify({ even10: ns.default(10), odd7: ns.default(7) }) + "\\n");
+      `,
+    });
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), String(dir) + "/runner.mjs"],
+      env: { ...bunEnv, BUN_DEBUG_QUIET_LOGS: "1" },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    const line = stdout.split("\n").find(l => l.startsWith("RESULT:"));
+    expect({ line: line ?? `<none> stderr=${stderr}`, exitCode }).toEqual({
+      line: expect.stringContaining("RESULT:"),
+      exitCode: 0,
+    });
+    expect(JSON.parse(line!.slice("RESULT:".length))).toEqual({ even10: true, odd7: false });
+  });
+});
+
+describe("classes (radical)", () => {
+  test("named class expression round-trips and self-name resolves internally", async () => {
+    const C = class Named {
+      self() {
+        return Named;
+      }
+      tag() {
+        return "named";
+      }
+    };
+    void C;
+    const K = (await roundtrip(() => C))();
+    const inst = new K();
+    expect(inst.tag()).toBe("named");
+    expect(inst.self()).toBe(K);
+  });
+
+  test("3-level nested class expressions reconstruct, capturing an outer free var", async () => {
+    const tag = "deep";
+    void tag;
+    const Outer = class {
+      makeMid() {
+        return class {
+          makeInner() {
+            return class {
+              read() {
+                return tag;
+              }
+            };
+          }
+        };
+      }
+    };
+    void Outer;
+    const KOuter = (await roundtrip(() => Outer))();
+    const Mid = new KOuter().makeMid();
+    const Inner = new Mid().makeInner();
+    expect(new Inner().read()).toBe("deep");
+  });
+
+  test("a class built by applying one mixin round-trips (inherited method works)", async () => {
+    class Base {
+      base() {
+        return "base";
+      }
+    }
+    const Mixin = (B: typeof Base) =>
+      class extends B {
+        extra() {
+          return "extra";
+        }
+      };
+    const Combined = Mixin(Base);
+    void Combined;
+    const K = (await roundtrip(() => Combined))();
+    const inst = new K();
+    expect(inst.extra()).toBe("extra");
+    expect(inst.base()).toBe("base");
+    expect(inst instanceof K).toBe(true);
+  });
+
+  test("a class composed from three mixins reconstructs the full chain", async () => {
+    class Base {
+      fromBase() {
+        return "B";
+      }
+    }
+    const A = (S: any) =>
+      class extends S {
+        fromA() {
+          return "A";
+        }
+      };
+    const Mb = (S: any) =>
+      class extends S {
+        fromMb() {
+          return "Mb";
+        }
+      };
+    const C = (S: any) =>
+      class extends S {
+        fromC() {
+          return "C";
+        }
+      };
+    const Composed = A(Mb(C(Base)));
+    void Composed;
+    const K = (await roundtrip(() => Composed))();
+    const inst = new K();
+    expect([inst.fromA(), inst.fromMb(), inst.fromC(), inst.fromBase()]).toEqual(["A", "Mb", "C", "B"]);
+    expect(inst instanceof K).toBe(true);
+  });
+
+  test("a mixin that captures a free var in its class's method round-trips", async () => {
+    class Base {
+      kind() {
+        return "base";
+      }
+    }
+    const prefix = ">>";
+    void prefix;
+    const Tagged = ((B: typeof Base) =>
+      class extends B {
+        label() {
+          return prefix + this.kind();
+        }
+      })(Base);
+    void Tagged;
+    const K = (await roundtrip(() => Tagged))();
+    expect(new K().label()).toBe(">>base");
+  });
+
+  test("3-level super.method() chain is intact after reconstruction", async () => {
+    class A {
+      who() {
+        return "A";
+      }
+    }
+    class B extends A {
+      who() {
+        return super.who() + "B";
+      }
+    }
+    class C extends B {
+      who() {
+        return super.who() + "C";
+      }
+    }
+    void C;
+    const K = (await roundtrip(() => C))();
+    expect(new K().who()).toBe("ABC");
+  });
+
+  test("super(args) constructor forwarding round-trips (as a class value)", async () => {
+    class Base {
+      x: number;
+      constructor(x: number) {
+        this.x = x;
+      }
+    }
+    class Derived extends Base {
+      constructor(n: number) {
+        super(n * 2);
+      }
+    }
+    void Derived;
+    const K = (await roundtrip(() => Derived))();
+    expect(new K(5).x).toBe(10);
+  });
+
+  test("private static field and method (class value) round-trip via mangling", async () => {
+    class Reg {
+      static #count = 0;
+      static #bump() {
+        return ++Reg.#count;
+      }
+      static next() {
+        return Reg.#bump();
+      }
+    }
+    void Reg;
+    const K = (await roundtrip(() => Reg))();
+    expect(K.next()).toBe(1);
+    expect(K.next()).toBe(2);
+  });
+
+  test("private brand check (#x in obj) survives via mangled membership", async () => {
+    class Box {
+      #x = 1;
+      static has(o: any) {
+        return #x in o;
+      }
+    }
+    void Box;
+    const K = (await roundtrip(() => Box))();
+    const inst = new K();
+    expect(K.has(inst)).toBe(true);
+    expect(K.has({})).toBe(false);
+  });
+
+  test("computed method name (captured key) and [Symbol.iterator] round-trip", async () => {
+    const key = "dynamic";
+    void key;
+    const C = class {
+      [key]() {
+        return "computed";
+      }
+      *[Symbol.iterator]() {
+        yield 1;
+        yield 2;
+      }
+    };
+    void C;
+    const K = (await roundtrip(() => C))();
+    const inst = new K();
+    expect((inst as any).dynamic()).toBe("computed");
+    expect([...inst]).toEqual([1, 2]);
+  });
+
+  test("static block executes on reconstruction and can use a captured var", async () => {
+    const seed = 7;
+    void seed;
+    const C = class {
+      static total = 0;
+      static {
+        (this as any).total = seed * 3;
+      }
+    };
+    void C;
+    const K = (await roundtrip(() => C))();
+    expect((K as any).total).toBe(21);
+  });
+
+  test("a captured superclass identifier in the extends clause round-trips", async () => {
+    class CapturedBase {
+      hello() {
+        return "hi";
+      }
+    }
+    void CapturedBase;
+    const Sub = class extends CapturedBase {
+      bye() {
+        return "bye";
+      }
+    };
+    void Sub;
+    const K = (await roundtrip(() => Sub))();
+    const inst = new K();
+    expect([inst.hello(), inst.bye()]).toEqual(["hi", "bye"]);
+  });
+
+  // GAP-PROBE: heritage that is a call expression (`extends computeBase()`) is not
+  // a simple identifier, so the serializer can't bind it. Documents the boundary.
+  test("known limitation: extends <call-expression> heritage is unbound", async () => {
+    function computeBase() {
+      return class {
+        tag() {
+          return "base";
+        }
+      };
+    }
+    void computeBase;
+    const Sub = class extends computeBase() {
+      own() {
+        return "own";
+      }
+    };
+    void Sub;
+    let threw = false;
+    try {
+      const K = (await roundtrip(() => Sub))();
+      new K();
+    } catch {
+      threw = true;
+    }
+    expect(threw).toBe(true);
+  });
+
+  test("instanceof holds across reconstruction for subclass and superclass", async () => {
+    class Base {}
+    class Derived extends Base {}
+    void Derived;
+    const KD = (await roundtrip(() => Derived))();
+    const inst = new KD();
+    expect(inst instanceof KD).toBe(true);
+    const KB = Object.getPrototypeOf(KD);
+    expect(inst instanceof KB).toBe(true);
+  });
+
+  test("unused methods of a captured class are kept (class integrity over pruning)", async () => {
+    const C = class {
+      used() {
+        return "used";
+      }
+      UNUSED_BUT_KEPT() {
+        return "kept";
+      }
+    };
+    void C;
+    const code = serialize(() => new C().used());
+    expect(code).toContain("UNUSED_BUT_KEPT");
+    const fn = await roundtrip(() => new C());
+    const inst = fn();
+    expect(inst.used()).toBe("used");
+    expect((inst as any).UNUSED_BUT_KEPT()).toBe("kept");
+  });
+
+  test("abstract-ish base with a subclass overriding one method round-trips", async () => {
+    class Shape {
+      area(): number {
+        throw new Error("abstract");
+      }
+      describe() {
+        return "area=" + this.area();
+      }
+    }
+    class Square extends Shape {
+      side: number;
+      constructor(s: number) {
+        super();
+        this.side = s;
+      }
+      area() {
+        return this.side * this.side;
+      }
+    }
+    void Square;
+    const K = (await roundtrip(() => Square))();
+    const inst = new K(4);
+    expect(inst.area()).toBe(16);
+    expect(inst.describe()).toBe("area=16");
+  });
+});
+
+describe("generators, iterators, and the live-generator hazard", () => {
+  test("generator with a return value", async () => {
+    function* g() {
+      yield 1;
+      yield 2;
+      return "done";
+    }
+    void g;
+    const make = (await roundtrip(() => g))();
+    const it = make();
+    expect(it.next()).toEqual({ value: 1, done: false });
+    expect(it.next()).toEqual({ value: 2, done: false });
+    expect(it.next()).toEqual({ value: "done", done: true });
+  });
+
+  test("two-way generator: yield receives sent values via .next(v)", async () => {
+    function* adder() {
+      let total = 0;
+      while (true) {
+        const x: number = yield total;
+        total += x;
+      }
+    }
+    void adder;
+    const make = (await roundtrip(() => adder))();
+    const it = make();
+    expect(it.next().value).toBe(0);
+    expect(it.next(5).value).toBe(5);
+    expect(it.next(10).value).toBe(15);
+  });
+
+  test("async generator function with return value", async () => {
+    async function* ag() {
+      yield 1;
+      yield 2;
+      return 99;
+    }
+    void ag;
+    const make = (await roundtrip(() => ag))();
+    const it = make();
+    expect(await it.next()).toEqual({ value: 1, done: false });
+    expect(await it.next()).toEqual({ value: 2, done: false });
+    expect(await it.next()).toEqual({ value: 99, done: true });
+  });
+
+  test("generator capturing a mutable cell mutated across yields", async () => {
+    let seen: number[] = [];
+    function* recorder() {
+      let i = 0;
+      while (i < 3) {
+        seen.push(i);
+        yield i++;
+      }
+    }
+    void [seen, recorder];
+    const out = await roundtrip(() => {
+      const vals = [...recorder()];
+      return { vals, seen };
+    });
+    expect(out()).toEqual({ vals: [0, 1, 2], seen: [0, 1, 2] });
+  });
+
+  test("three-level generator delegation ending in an array iterator", async () => {
+    function* leaf() {
+      yield* [3, 4];
+    }
+    function* mid() {
+      yield 2;
+      yield* leaf();
+    }
+    function* top() {
+      yield 1;
+      yield* mid();
+      yield 5;
+    }
+    void [leaf, mid, top];
+    const g = await roundtrip(top);
+    expect([...g()]).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  test("yield* forwards return value of the delegate", async () => {
+    function* inner() {
+      yield 1;
+      return "inner-return";
+    }
+    function* outer() {
+      const r = yield* inner();
+      yield r;
+    }
+    void [inner, outer];
+    const g = await roundtrip(outer);
+    expect([...g()]).toEqual([1, "inner-return"]);
+  });
+
+  test("infinite generator consumed partially (take N) after reconstruction", async () => {
+    function* nats() {
+      let i = 0;
+      while (true) yield i++;
+    }
+    void nats;
+    const take = await roundtrip((n: number) => {
+      const it = nats();
+      const out: number[] = [];
+      for (let k = 0; k < n; k++) out.push(it.next().value as number);
+      return out;
+    });
+    expect(take(4)).toEqual([0, 1, 2, 3]);
+  });
+
+  test("custom iterable object captured and re-iterated", async () => {
+    const range = {
+      from: 1,
+      to: 3,
+      [Symbol.iterator]() {
+        let cur = this.from;
+        const end = this.to;
+        return {
+          next() {
+            return cur <= end ? { value: cur++, done: false } : { value: undefined, done: true };
+          },
+        };
+      },
+    };
+    void range;
+    const out = await roundtrip(() => [...(range as any)]);
+    expect(out()).toEqual([1, 2, 3]);
+  });
+
+  test("class with a generator method and an async generator method", async () => {
+    class Stream {
+      base: number;
+      constructor(b: number) {
+        this.base = b;
+      }
+      *take(n: number) {
+        for (let i = 0; i < n; i++) yield this.base + i;
+      }
+      async *takeAsync(n: number) {
+        for (let i = 0; i < n; i++) yield this.base + i;
+      }
+    }
+    let inst = new Stream(10);
+    void inst;
+    const out = (await roundtrip(() => inst))();
+    expect([...out.take(3)]).toEqual([10, 11, 12]);
+    expect(await Array.fromAsync(out.takeAsync(2))).toEqual([10, 11]);
+    expect(out.constructor.name).toBe("Stream");
+  });
+
+  // The hazard: a generator OBJECT holds suspended engine state not expressible
+  // as source. Each of these must throw a CLEAR error (not silently corrupt).
+  test("partially-executed generator object throws a clear error", () => {
+    function* g() {
+      yield 1;
+      yield 2;
+      yield 3;
+    }
+    const live = g();
+    expect(live.next()).toEqual({ value: 1, done: false });
+    let captured = live;
+    void captured;
+    expect(() => serialize(() => captured)).toThrow(/suspended execution state/i);
+  });
+
+  test("freshly-created generator object throws a clear error", () => {
+    function* g() {
+      yield 1;
+    }
+    let captured = g();
+    void captured;
+    expect(() => serialize(() => captured)).toThrow(/suspended execution state/i);
+  });
+
+  test("async generator object throws a clear error", async () => {
+    async function* ag() {
+      yield 1;
+      yield 2;
+    }
+    const live = ag();
+    expect(await live.next()).toEqual({ value: 1, done: false });
+    let captured = live;
+    void captured;
+    expect(() => serialize(() => captured)).toThrow(/suspended execution state/i);
+  });
+
+  test("a native array iterator object throws a clear error", () => {
+    const it = [1, 2, 3][Symbol.iterator]();
+    it.next();
+    let captured = it;
+    void captured;
+    expect(() => serialize(() => captured)).toThrow(/suspended execution state/i);
+  });
+
+  test("a live generator nested inside a captured object throws a clear error", () => {
+    function* g() {
+      yield 1;
+    }
+    const live = g();
+    live.next();
+    const wrapper = { label: "box", it: live };
+    void wrapper;
+    expect(() => serialize(() => wrapper)).toThrow(/suspended execution state/i);
+  });
+});
+
+describe("optimality (radical)", () => {
+  test("deep access path keeps only the spine, drops siblings at every level", async () => {
+    const foo = {
+      a: {
+        sibA: "UNUSED_MARKER_A",
+        b: { sibB: "UNUSED_MARKER_B", c: { sibC: "UNUSED_MARKER_C", d: 42, dSib: "UNUSED_MARKER_D" } },
+      },
+      rootSib: { huge: "UNUSED_MARKER_ROOT" },
+    };
+    const code = serialize(() => foo.a.b.c.d);
+    for (const m of ["A", "B", "C", "D", "ROOT"]) expect(code).not.toContain(`UNUSED_MARKER_${m}`);
+    const fn = await roundtrip(() => foo.a.b.c.d);
+    expect(fn()).toBe(42);
+  });
+
+  test("two disjoint spines off one root keep both, prune the rest", async () => {
+    const foo = { a: { b: 1, bSib: "UNUSED_MARKER_AB" }, x: { y: 2, ySib: "UNUSED_MARKER_XY" }, z: "UNUSED_MARKER_Z" };
+    const code = serialize(() => foo.a.b + foo.x.y);
+    for (const m of ["AB", "XY", "Z"]) expect(code).not.toContain(`UNUSED_MARKER_${m}`);
+    const fn = await roundtrip(() => foo.a.b + foo.x.y);
+    expect(fn()).toBe(3);
+  });
+
+  test("union of members across multiple reachable closures; global-unused dropped", async () => {
+    const shared = { x: 1, y: 2, z: "UNUSED_MARKER_Z" };
+    const read = () => shared.x;
+    const peek = () => shared.y;
+    void [read, peek];
+    const root = () => read() + peek();
+    const code = serialize(root);
+    expect(code).not.toContain("UNUSED_MARKER_Z");
+    expect(await (await roundtrip(root))()).toBe(3);
+  });
+
+  test("this-following unions fields across invoked methods; unreached field pruned", async () => {
+    const obj = {
+      a: 10,
+      b: 20,
+      c: "UNUSED_MARKER_C",
+      m1() {
+        return this.a;
+      },
+      m2() {
+        return this.b;
+      },
+      mUnused() {
+        return this.c;
+      },
+    };
+    const code = serialize(() => obj.m1() + obj.m2());
+    expect(code).not.toContain("UNUSED_MARKER_C");
+    expect(await (await roundtrip(() => obj.m1() + obj.m2()))()).toBe(30);
+  });
+
+  test("only-reached method's this-reads kept; unread sibling field pruned", async () => {
+    const obj = {
+      a: 7,
+      b: "UNUSED_MARKER_B",
+      used() {
+        return this.a;
+      },
+    };
+    const code = serialize(() => obj.used());
+    expect(code).not.toContain("UNUSED_MARKER_B");
+    expect(await (await roundtrip(() => obj.used()))()).toBe(7);
+  });
+
+  test("transitive pruning: captured fn reads one field of its own big capture", async () => {
+    const big = { keep: 99, huge: "UNUSED_MARKER_HUGE", other: { deep: "UNUSED_MARKER_DEEP" } };
+    const pick = () => big.keep;
+    void pick;
+    const root = () => pick();
+    const code = serialize(root);
+    expect(code).not.toContain("UNUSED_MARKER_HUGE");
+    expect(code).not.toContain("UNUSED_MARKER_DEEP");
+    expect(await (await roundtrip(root))()).toBe(99);
+  });
+
+  test("method call this-follows receiver; result of the call is opaque (boundary)", async () => {
+    const svc = {
+      config: { host: "h" },
+      unused: "UNUSED_MARKER_SVC_UNUSED",
+      connect() {
+        return { ok: this.config.host };
+      },
+    };
+    const code = serialize(() => svc.connect().ok);
+    expect(code).not.toContain("UNUSED_MARKER_SVC_UNUSED");
+    expect(await (await roundtrip(() => svc.connect().ok))()).toBe("h");
+  });
+
+  test("escape via sink keeps everything (correct)", async () => {
+    const foo = { a: 1, b: 2, c: { d: 3 } };
+    const sink = (o: object) => JSON.stringify(o);
+    void sink;
+    expect(await (await roundtrip(() => sink(foo)))()).toBe(`{"a":1,"b":2,"c":{"d":3}}`);
+  });
+
+  test("static read + opaque escape across closures → keep-all dominates", async () => {
+    const foo = { a: 1, b: 2, c: 3 };
+    const reader = () => foo.a;
+    const escaper = () => foo;
+    void [reader, escaper];
+    const root = () => reader() + (escaper() ? 0 : 0);
+    const code = serialize(root);
+    expect(code).toContain("2");
+    expect(code).toContain("3");
+    expect(await (await roundtrip(root))()).toBe(1);
+  });
+
+  // GAP-PROBE: a getter reached by member access (not a call) is not this-followed,
+  // so fields its body reads via `this.*` may be pruned. This asserts the CORRECT
+  // runtime result; if the serializer under-serializes, it fails — exposing the gap.
+  test("getter read deeply still produces the correct value", async () => {
+    const foo = {
+      backing: 5,
+      other: "tag",
+      get live() {
+        return { x: this.backing, tag: this.other };
+      },
+    };
+    void foo;
+    const fn = await roundtrip(() => foo.live.x);
+    expect(fn()).toBe(5);
+  });
+
+  test("class instance: prototype methods kept verbatim; correctness preserved", async () => {
+    class Widget {
+      used = 1;
+      ownUnused = "UNUSED_MARKER_OWNFIELD";
+      reach() {
+        return this.used;
+      }
+      neverCalled() {
+        return "PROTO_METHOD_KEPT";
+      }
+    }
+    const inst = new Widget();
+    void inst;
+    const code = serialize(() => inst.reach());
+    expect(code).toContain("neverCalled");
+    expect(await (await roundtrip(() => inst.reach()))()).toBe(1);
+  });
+
+  test("deep namespace member access prunes to the used sub-path", async () => {
+    using dir = tempDir(`closure-ns-deep-${counter++}`, {
+      "m.mjs": `
+        export const sub = { method() { return this.val; }, val: 5, subUnused: "UNUSED_MARKER_SUBFIELD" };
+        export const otherExport = { big: "UNUSED_MARKER_OTHEREXPORT" };
+        export function unusedFn() { return "UNUSED_MARKER_FN"; }
+      `,
+      "main.mjs": `
+        import { serialize } from "bun:closure";
+        import { writeFileSync } from "node:fs";
+        import * as m from "./m.mjs";
+        const out = serialize(() => m.sub.method());
+        writeFileSync(new URL("./out.mjs", import.meta.url), out);
+        console.log(JSON.stringify({
+          subFieldPruned: !out.includes("UNUSED_MARKER_SUBFIELD"),
+          otherExportPruned: !out.includes("UNUSED_MARKER_OTHEREXPORT"),
+          fnPruned: !out.includes("UNUSED_MARKER_FN"),
+        }));
+        console.log("RESULT:" + (await import(new URL("./out.mjs", import.meta.url).href)).default());
+      `,
+    });
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), String(dir) + "/main.mjs"],
+      env: { ...bunEnv, BUN_DEBUG_QUIET_LOGS: "1" },
+      stderr: "pipe",
+      stdout: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    const lines = stdout.trim().split("\n");
+    expect(JSON.parse(lines[0])).toEqual({ subFieldPruned: true, otherExportPruned: true, fnPruned: true });
+    expect(lines.find(l => l.startsWith("RESULT:"))).toBe("RESULT:5");
+    expect({ stderr, exitCode }).toEqual({ stderr: expect.any(String), exitCode: 0 });
+  });
+
+  test("3-level re-export chain keeps only the used terminal binding", async () => {
+    using dir = tempDir(`closure-chain3-${counter++}`, {
+      "c.mjs": `
+        export function leaf() { return "LEAF_VALUE"; }
+        export function leafUnused() { return "UNUSED_MARKER_LEAF"; }
+      `,
+      "b.mjs": `export { leaf, leafUnused } from "./c.mjs"; export function bExtra() { return "UNUSED_MARKER_B"; }`,
+      "a.mjs": `export { leaf, leafUnused } from "./b.mjs"; export function aExtra() { return "UNUSED_MARKER_A"; }`,
+      "main.mjs": `
+        import { serialize } from "bun:closure";
+        import { writeFileSync } from "node:fs";
+        import { leaf } from "./a.mjs";
+        const out = serialize(() => leaf());
+        writeFileSync(new URL("./out.mjs", import.meta.url), out);
+        console.log(JSON.stringify({
+          leafSiblingShaken: !out.includes("UNUSED_MARKER_LEAF"),
+          bShaken: !out.includes("UNUSED_MARKER_B"),
+          aShaken: !out.includes("UNUSED_MARKER_A"),
+        }));
+        console.log("RESULT:" + (await import(new URL("./out.mjs", import.meta.url).href)).default());
+      `,
+    });
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), String(dir) + "/main.mjs"],
+      env: { ...bunEnv, BUN_DEBUG_QUIET_LOGS: "1" },
+      stderr: "pipe",
+      stdout: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    const lines = stdout.trim().split("\n");
+    expect(JSON.parse(lines[0])).toEqual({ leafSiblingShaken: true, bShaken: true, aShaken: true });
+    expect(lines.find(l => l.startsWith("RESULT:"))).toBe("RESULT:LEAF_VALUE");
+    expect({ stderr, exitCode }).toEqual({ stderr: expect.any(String), exitCode: 0 });
+  });
+});

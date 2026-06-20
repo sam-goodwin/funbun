@@ -539,6 +539,7 @@ function computeKeepSets(root: Function): Map<object, Set<string> | "all"> {
   const seenFns = new Set<Function>();
   const seenObjs = new Set<object>();
   const followed = new Map<object, Set<string>>(); // receiver → methods already this-followed
+  const followedFns = new Map<object, Set<Function>>(); // receiver → getter/method fns already this-followed
 
   // Mark a value — and everything reachable through its object graph — as
   // serialized whole. Keep-all must propagate: if an object escapes, every
@@ -586,8 +587,15 @@ function computeKeepSets(root: Function): Map<object, Set<string> | "all"> {
     for (const [prop, childNode] of node.children) {
       cur.add(prop);
       const d = lookupDescriptor(obj, prop);
-      if (d !== undefined && "value" in d) apply(d.value, childNode);
-      // accessor/missing props: kept (added above) but not recursed into.
+      if (d !== undefined && "value" in d) {
+        apply(d.value, childNode);
+      } else if (d !== undefined && typeof d.get === "function") {
+        // Reading `obj.prop` invokes the getter with `this === obj`; fold its
+        // `this.X` reads into obj's keep-set. The getter's result is a fresh
+        // value, so the child path past it is opaque (handled conservatively).
+        thisFollowFn(obj, d.get);
+      }
+      // missing props: kept (added above), nothing to recurse.
     }
     for (const method of node.calledMethods) thisFollow(obj, method);
   }
@@ -610,11 +618,25 @@ function computeKeepSets(root: Function): Map<object, Set<string> | "all"> {
       keepAll(obj);
       return;
     }
-    const fn = d.value;
+    thisFollowFn(obj, d.value);
+  }
+
+  // Fold a function's `this.X` reads into `obj`'s keep-set, given that it runs
+  // with `this === obj` (an invoked method, or a getter read off `obj`).
+  function thisFollowFn(obj: object, fn: unknown): void {
     if (typeof fn !== "function") return;
+    let done = followedFns.get(obj);
+    if (done === undefined) {
+      done = new Set();
+      followedFns.set(obj, done);
+    }
+    if (done.has(fn as Function)) return;
+    done.add(fn as Function);
+
+    if (keepSets.get(obj) === "all") return;
     let source: string;
     try {
-      source = fn.toString();
+      source = (fn as Function).toString();
     } catch {
       keepAll(obj);
       return;
@@ -625,7 +647,7 @@ function computeKeepSets(root: Function): Map<object, Set<string> | "all"> {
       return;
     }
     const thisNode = analyzeAccess(fnNode, new Set(["this"])).get("this");
-    if (thisNode === undefined) return; // method doesn't touch `this`
+    if (thisNode === undefined) return; // doesn't touch `this`
     apply(obj, thisNode); // its `this.X` reads are reads on `obj`
   }
 
@@ -894,6 +916,19 @@ function emitObject(value: object, ctx: Context): string {
   }
   if (value instanceof Promise) {
     throw new TypeError("Cannot serialize a Promise");
+  }
+  // Generator / async-generator objects and built-in iterator objects hold
+  // suspended execution state (the yield point and local frame) in engine slots
+  // that aren't reachable via reflection and can't be expressed as source.
+  // Reject clearly instead of walking their native prototype chain (which would
+  // throw an opaque "native function" error or silently emit a dead object).
+  const tag = objectToString.$call(value);
+  if (tag === "[object Generator]" || tag === "[object AsyncGenerator]" || tag.endsWith(" Iterator]")) {
+    throw new TypeError(
+      `Cannot serialize a ${tag.slice("[object ".length, -1)} object ` +
+        `(its suspended execution state is not expressible as source). ` +
+        `Serialize the generator function instead and re-create the iterator after reconstruction.`,
+    );
   }
 
   const name = REF_PREFIX + ctx.counter++;
@@ -1338,7 +1373,17 @@ function rewritePrivateMembers(source: string): string {
       if (c === "#" && isIdentStart(source[i + 1])) {
         let j = i + 1;
         while (j < n && isIdentPart(source[j])) j++;
-        out += PRIVATE_PREFIX + source.slice(i + 1, j);
+        const mangled = PRIVATE_PREFIX + source.slice(i + 1, j);
+        // `#name in obj` is a brand check: the left operand must be the property
+        // KEY as a string, not a (now-undefined) bare identifier reference. A
+        // bare `#name` not preceded by `.` is otherwise a member declaration.
+        let k = j;
+        while (k < n && /\s/.test(source[k]!)) k++;
+        if (source[k] === "i" && source[k + 1] === "n" && !isIdentPart(source[k + 2])) {
+          out += JSON.stringify(mangled);
+        } else {
+          out += mangled;
+        }
         i = j;
         continue;
       }

@@ -2983,7 +2983,15 @@ static void collectReferencedIdentifiers(JSC::VM& vm, JSC::UnlinkedFunctionExecu
     for (size_t i = 0; i < identifierCount; ++i) {
         const JSC::Identifier& identifier = codeBlock->identifier(i);
         WTF::UniquedStringImpl* uid = identifier.impl();
-        if (!uid || identifier.isSymbol())
+        if (!uid || identifier.isSymbol() || uid->length() == 0)
+            continue;
+        // The identifier table can hold entries that are not variable names —
+        // notably numeric keys (e.g. `obj[4]`, array-index property accesses)
+        // interned as identifiers. A JS binding name never starts with a digit,
+        // so these can never be a captured free variable; skip them rather than
+        // resolve a phantom slot and emit an invalid `let 4 = ...`.
+        char16_t firstChar = uid->is8Bit() ? uid->span8()[0] : uid->span16()[0];
+        if (WTF::isASCIIDigit(firstChar))
             continue;
         if (seen.add(RefPtr { uid }).isNewEntry)
             ordered.append(uid);
