@@ -6,12 +6,12 @@
 //   Step 1: functions with no free variables.
 //   Step 2: reconstruct captured PRIMITIVE free variables.
 //   Step 3: reference graph — objects/arrays, hoisted + deduplicated, cycles.
-//   Step 4a (this): nested functions. A captured value that is itself a
-//   function is reconstructed recursively. Each function's captured variables
-//   are reconstructed inside an IIFE so its scope is isolated — two functions
-//   that capture different variables of the same name don't collide. Shared
-//   OBJECTS are still deduplicated by identity (so mutating shared object state
-//   works); shared mutable PRIMITIVE cells across functions come in step 4b.
+//   Step 4a: nested functions, each reconstructed inside an isolated IIFE.
+//   Step 4b (this): shared mutable cells. A captured cell (identified by its
+//   Symbol.freeVariables `id`) referenced by two or more functions is hoisted
+//   once at module scope under its original name, so every reconstructed
+//   function closes over the same binding — mutations stay shared. Cells used by
+//   a single function remain private to its IIFE.
 
 type Replacer = (key: string, value: unknown) => unknown;
 
@@ -28,11 +28,14 @@ interface FreeVariable {
 const REF_PREFIX = "__bunClosure$";
 
 interface Context {
-  // Module-level hoisted declarations (object refs, nested function refs).
+  // Module-level hoisted declarations (shared cells, object refs, function refs).
   module: string[];
   // Identity -> hoisted variable name, for objects and functions.
   refs: Map<object, string>;
   counter: number;
+  // Cell ids (Symbol.freeVariables id) shared by 2+ functions: hoisted to module
+  // scope under their original name, skipped in per-function IIFEs.
+  sharedIds: Set<number>;
 }
 
 function serialize(fn: Function, _replacer?: Replacer): string {
@@ -40,11 +43,72 @@ function serialize(fn: Function, _replacer?: Replacer): string {
     throw new TypeError("serialize() expects a function");
   }
 
-  const ctx: Context = { module: [], refs: new Map(), counter: 0 };
-  const exportExpr = reconstructFunctionExpr(fn, ctx);
+  const { sharedIds, cellInfo } = analyzeSharedCells(fn);
+  const ctx: Context = { module: [], refs: new Map(), counter: 0, sharedIds };
 
+  // Emit shared cells at module scope (deduped by id) before any function that
+  // closes over them. Distinct shared cells with the same name can't coexist.
+  const namesById = new Map<string, number>();
+  for (const id of sharedIds) {
+    const cell = cellInfo.get(id)!;
+    const claimed = namesById.get(cell.name);
+    if (claimed !== undefined && claimed !== id) {
+      throw new TypeError(`Cannot serialize: two distinct shared variables are both named "${cell.name}"`);
+    }
+    namesById.set(cell.name, id);
+    ctx.module.push(`${cell.kind} ${cell.name} = ${emitValue(cell.value, ctx)};`);
+  }
+
+  const exportExpr = reconstructFunctionExpr(fn, ctx);
   const prelude = ctx.module.length ? ctx.module.join("\n") + "\n" : "";
   return `${prelude}export default ${exportExpr};\n`;
+}
+
+// Walks the function graph reachable from `root` and finds cells referenced by
+// more than one function — those must share a single binding.
+function analyzeSharedCells(root: Function): { sharedIds: Set<number>; cellInfo: Map<number, FreeVariable> } {
+  const cellFunctions = new Map<number, Set<Function>>();
+  const cellInfo = new Map<number, FreeVariable>();
+  const seenFns = new Set<Function>();
+  const seenObjs = new Set<object>();
+
+  function visitValue(value: unknown): void {
+    if (typeof value === "function") visitFn(value as Function);
+    else if (value !== null && typeof value === "object") visitObj(value as object);
+  }
+  function visitObj(o: object): void {
+    if (seenObjs.has(o)) return;
+    seenObjs.add(o);
+    if (Array.isArray(o)) {
+      for (const el of o) visitValue(el);
+    } else {
+      for (const key of Object.keys(o)) visitValue((o as any)[key]);
+    }
+  }
+  function visitFn(fn: Function): void {
+    if (seenFns.has(fn)) return;
+    seenFns.add(fn);
+    const freeVariables = (fn as any)[Symbol.freeVariables] as FreeVariable[] | undefined;
+    if (!freeVariables) return;
+    for (const variable of freeVariables) {
+      let set = cellFunctions.get(variable.id);
+      if (set === undefined) {
+        set = new Set();
+        cellFunctions.set(variable.id, set);
+        cellInfo.set(variable.id, variable);
+      }
+      set.add(fn);
+      visitValue(variable.value);
+    }
+  }
+
+  visitFn(root);
+
+  const sharedIds = new Set<number>();
+  for (const [id, fns] of cellFunctions) {
+    if (fns.size >= 2) sharedIds.add(id);
+  }
+  return { sharedIds, cellInfo };
 }
 
 // Returns an expression that evaluates to a reconstruction of `fn`, wrapping its
@@ -56,13 +120,17 @@ function reconstructFunctionExpr(fn: Function, ctx: Context): string {
   }
 
   const freeVariables = (fn as any)[Symbol.freeVariables] as FreeVariable[];
-  if (freeVariables.length === 0) {
-    return `(${source})`;
-  }
 
   const bindings: string[] = [];
   for (const variable of freeVariables) {
+    // Shared cells are declared once at module scope; the source resolves to
+    // them by name, so don't shadow them with a private binding here.
+    if (ctx.sharedIds.has(variable.id)) continue;
     bindings.push(`${variable.kind} ${variable.name} = ${emitValue(variable.value, ctx)};`);
+  }
+
+  if (bindings.length === 0) {
+    return `(${source})`;
   }
   return `(function () {\n${bindings.join("\n")}\nreturn (${source});\n})()`;
 }

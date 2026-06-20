@@ -161,6 +161,32 @@ test("nested functions keep isolated scopes (same-named captures don't collide)"
   expect(fn()).toEqual([1, 2]);
 });
 
+test("a shared mutable primitive cell stays shared across reconstructed functions", async () => {
+  let i = 0;
+  let inc = () => ++i;
+  let read = () => i;
+  void [i, inc, read];
+  const fn = await roundtrip(() => {
+    inc();
+    inc();
+    return read();
+  });
+  expect(fn()).toBe(2);
+});
+
+test("shared cell mutations are visible across calls into different closures", async () => {
+  let log: number[] = [];
+  let push = (n: number) => log.push(n);
+  let dump = () => log.slice();
+  void [log, push, dump];
+  const fn = await roundtrip(() => {
+    push(1);
+    push(2);
+    return dump();
+  });
+  expect(fn()).toEqual([1, 2]);
+});
+
 test("a captured function that itself captures an object shares that object", async () => {
   let shared = { hits: 0 };
   let bump = () => ++shared.hits;
