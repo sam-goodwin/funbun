@@ -616,3 +616,47 @@ test("reconstructs generator and async generator functions", async () => {
   const out = (await roundtrip(() => g))();
   expect([...out()]).toEqual([1, 2]);
 });
+
+test("a class captured via its factory round-trips fully (field + method captures)", async () => {
+  function makeClass(base: number) {
+    return class {
+      val = base + 1;
+      double() {
+        return base * 2;
+      }
+    };
+  }
+  void makeClass;
+  const C = (await roundtrip(() => makeClass(41)))();
+  const inst = new C();
+  expect(inst.val).toBe(42);
+  expect(inst.double()).toBe(82);
+});
+
+test("a directly-captured class works when its field var is also used by a method", async () => {
+  let C = ((base: number) =>
+    class {
+      val = base + 1;
+      get() {
+        return base;
+      }
+    })(41);
+  void C;
+  const Klass = (await roundtrip(() => C))();
+  expect(new Klass().val).toBe(42);
+  expect(new Klass().get()).toBe(41);
+});
+
+test("known limitation: a var captured only by a field initializer on a direct class value is unbound", async () => {
+  // `base` is referenced only by the field initializer (no method references it),
+  // and the class is captured as a value rather than via its factory. The class's
+  // member executables aren't reachable from the class constructor, so `base`
+  // can't be recovered. Workaround: capture the factory, or use the var in a method.
+  let C = ((base: number) =>
+    class {
+      val = base + 1;
+    })(41);
+  void C;
+  const Klass = (await roundtrip(() => C))();
+  expect(() => new Klass()).toThrow(); // base is not defined
+});

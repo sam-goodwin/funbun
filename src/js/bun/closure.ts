@@ -13,11 +13,15 @@
 // values incl. statics, method-level captures, and `extends` inheritance. An
 // inline source map points stack traces back at the original source.
 //
-// Known limitations: `#private` fields/methods are invisible to reflection and
-// are not captured (and the constructor is not re-run on a reconstructed
-// instance); decorators are not part of `Function.prototype.toString()` and so
-// are not preserved; unique (non-registered) symbol values/keys and native
-// functions throw a clear error.
+// Known limitations: `#private` instance field VALUES are not captured (they're
+// invisible to reflection, and the constructor is not re-run on a reconstructed
+// instance); a variable captured ONLY by a class field initializer (referenced
+// by no method) and captured as a direct class value can't be recovered, since
+// class member executables aren't reachable from the class constructor — the
+// workaround is to capture the class's factory, or reference the variable in a
+// method; decorators are not part of `Function.prototype.toString()` and so are
+// not preserved; unique (non-registered) symbol values/keys and native functions
+// throw a clear error.
 
 type Replacer = (key: string, value: unknown) => unknown;
 
