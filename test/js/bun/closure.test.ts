@@ -41,3 +41,65 @@ test("throws on non-functions", () => {
 test("throws on native functions", () => {
   expect(() => serialize(Math.max)).toThrow("Cannot serialize a native function");
 });
+
+test("reconstructs a captured primitive (number)", async () => {
+  let i = 41;
+  void i;
+  const fn = await roundtrip(() => i + 1);
+  expect(fn()).toBe(42);
+});
+
+test("reconstructs a mutable captured counter", async () => {
+  let n = 0;
+  const fn = await roundtrip(() => ++n);
+  expect(fn()).toBe(1);
+  expect(fn()).toBe(2);
+});
+
+test("reconstructs captured primitives of every kind", async () => {
+  let str = 'hi\n"x"';
+  let bool = true;
+  let nul = null;
+  let undef = undefined;
+  let big = 123n;
+  let neg0 = -0;
+  let inf = Infinity;
+  let nan = NaN;
+  void [str, bool, nul, undef, big, neg0, inf, nan];
+  const fn = await roundtrip(() => ({ str, bool, nul, undef, big, neg0, inf, nan }));
+  const out = fn();
+  expect(out).toEqual({
+    str: 'hi\n"x"',
+    bool: true,
+    nul: null,
+    undef: undefined,
+    big: 123n,
+    neg0: -0,
+    inf: Infinity,
+    nan: NaN,
+  });
+  expect(1 / out.neg0).toBe(-Infinity);
+});
+
+test("respects const vs let binding kind", () => {
+  // Computed initializer so it's a real captured cell, not a folded constant.
+  const k = Math.min(7, 9);
+  void k;
+  const code = serialize(() => k);
+  expect(code).toContain("const k = 7;");
+});
+
+test("a closure over a compile-time-constant const round-trips (value inlined in source)", async () => {
+  function make() {
+    const k = 7;
+    return () => k * 2;
+  }
+  const fn = await roundtrip(make());
+  expect(fn()).toBe(14);
+});
+
+test("throws (for now) on object free variables", () => {
+  const obj = { a: 1 };
+  void obj;
+  expect(() => serialize(() => obj)).toThrow("Cannot serialize object free variables yet");
+});
