@@ -171,6 +171,31 @@ test("native functions have no free variables", () => {
   expect((Math.max as any)[freeVariables]).toEqual([]);
 });
 
+// Characterization test for a known limitation (NOT desired behavior): the
+// identifier-table approach can't tell a variable reference from a same-named
+// property access, so a captured variable whose name only appears as a property
+// access is still reported. Over-inclusion is the safe direction for
+// serialization. If this is ever made precise, update this test.
+test("over-includes a captured name used only as a property access (documented limitation)", () => {
+  function make() {
+    let value = 1;
+    const reader = () => value; // forces `value` to be heap-allocated (captured)
+    void reader;
+    return (obj: any) => obj.value; // references "value" only as a property name
+  }
+  const propUser = make() as any;
+  expect(byName(propUser).value?.value).toBe(1);
+
+  // Control: with no name collision, nothing is captured.
+  function control() {
+    let value = 2;
+    const reader = () => value;
+    void reader;
+    return (obj: any) => obj.other;
+  }
+  expect((control() as any)[freeVariables]).toEqual([]);
+});
+
 test("module-level captured variables are included; imports and globals are excluded", async () => {
   using dir = tempDir("free-vars-module", {
     "dep.js": `export const imported = "IMPORTED";`,
