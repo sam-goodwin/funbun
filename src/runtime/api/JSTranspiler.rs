@@ -2226,6 +2226,46 @@ impl<'a> AstJsConverter<'a> {
             }
             D::SFunction(s) => self.function_node("FunctionDeclaration", &s.func, start),
             D::SClass(s) => self.class_node("ClassDeclaration", &s.class, start),
+            D::SImport(s) => {
+                let node = self.node("ImportDeclaration", start)?;
+                let records = self.ast.import_records.as_slice();
+                match records.get(s.import_record_index as usize) {
+                    Some(rec) => {
+                        let src = self.str(rec.path.text)?;
+                        node.put(self.global, "source", src);
+                    }
+                    None => node.put(self.global, "source", JSValue::NULL),
+                }
+                let specs = JSValue::create_empty_array(self.global, 0)?;
+                let mut i: u32 = 0;
+                if let Some(def) = s.default_name {
+                    let spec = self.node("ImportDefaultSpecifier", def.loc.start)?;
+                    let nm = self.name_of(def.ref_)?;
+                    spec.put(self.global, "local", nm);
+                    specs.put_index(self.global, i, spec)?;
+                    i += 1;
+                }
+                if s.star_name_loc.start >= 0 {
+                    let spec = self.node("ImportNamespaceSpecifier", s.star_name_loc.start)?;
+                    let nm = self.name_of(s.namespace_ref)?;
+                    spec.put(self.global, "local", nm);
+                    specs.put_index(self.global, i, spec)?;
+                    i += 1;
+                }
+                for item in s.items.slice() {
+                    // `import { <alias> as <local-binding> }`: the binding is the
+                    // symbol of `item.name`; `item.alias` is the exported name.
+                    let spec = self.node("ImportSpecifier", item.alias_loc.start)?;
+                    let local = self.name_of(item.name.ref_)?;
+                    let imported = self.str(item.alias.slice())?;
+                    spec.put(self.global, "local", local);
+                    spec.put(self.global, "imported", imported);
+                    specs.put_index(self.global, i, spec)?;
+                    i += 1;
+                }
+                node.put(self.global, "specifiers", specs);
+                Ok(node)
+            }
             D::SBreak(_) => self.node("BreakStatement", start),
             D::SContinue(_) => self.node("ContinueStatement", start),
             D::SEmpty(_) => self.node("EmptyStatement", start),

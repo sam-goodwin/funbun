@@ -154,6 +154,24 @@ describe("Transpiler.ast", () => {
     });
   });
 
+  test("import declarations expose source + specifiers (local vs imported)", () => {
+    const body = ast(`import def, { a, b as c } from "./dep"; import * as ns from "./y";`).body;
+    expect(stripStart(body[0])).toEqual({
+      type: "ImportDeclaration",
+      source: "./dep",
+      specifiers: [
+        { type: "ImportDefaultSpecifier", local: "def" },
+        { type: "ImportSpecifier", local: "a", imported: "a" },
+        { type: "ImportSpecifier", local: "c", imported: "b" },
+      ],
+    });
+    expect(stripStart(body[1])).toEqual({
+      type: "ImportDeclaration",
+      source: "./y",
+      specifiers: [{ type: "ImportNamespaceSpecifier", local: "ns" }],
+    });
+  });
+
   test("unmapped node kinds surface as Unsupported, never throw", () => {
     const a = ast("`tpl ${x}`").body[0].expression;
     expect(a.type).toBe("Unsupported");
