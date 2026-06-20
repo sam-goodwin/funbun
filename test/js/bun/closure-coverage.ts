@@ -74,7 +74,16 @@ export const CATEGORIES: CoverageCategory[] = [
       S("root.class-decl", "class declaration as a value", "reconstructs a subclass value (extends superclass)"),
       S("root.class-expr", "class expression as a value", "named class expression round-trips"),
       S("root.bound", "bound function as the root", "serializes a bound function as the root"),
-      L("root.native", "native function (clear error)", "throws on native functions"),
+      S(
+        "root.native",
+        "native function referenced by global path",
+        "a native function captured as the root is referenced by its global path",
+      ),
+      S(
+        "val.native-fn-captured",
+        "captured native functions (Math.max, ...)",
+        "captured native functions round-trip by reference",
+      ),
     ],
   },
   {
@@ -706,11 +715,22 @@ export const CATEGORIES: CoverageCategory[] = [
     name: "AsyncLocalStorage",
     items: [
       S("als.store-value", "store value captured inside run()", "captures a store value (inside run)"),
-      L(
+      S(
         "als.instance",
-        "ALS instance capture (Proxy over native internals)",
-        "known limitation: capturing the ALS instance throws",
+        "ALS instance reconstructs (opaque, fresh)",
+        "an ALS instance reconstructs as a fresh, working store",
       ),
+      S(
+        "als.context",
+        "active ALS context captured + restored on reify",
+        "captures the active ALS context and restores it on reify",
+      ),
+      S(
+        "als.context-nested",
+        "nested run() composes after round-trip",
+        "nested als.run inside a reconstructed closure composes",
+      ),
+      S("als.context-multi", "two ALS contexts captured + restored", "captures two ALS contexts and restores both"),
     ],
   },
 ];

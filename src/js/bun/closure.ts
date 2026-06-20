@@ -85,6 +85,11 @@ interface Context {
   // the same captured symbol reconstructs to one symbol (identity preserved
   // within the serialized closure).
   symbols: Map<symbol, string>;
+  // For each captured AsyncLocalStorage with an active store at serialize time:
+  // the fresh instance's variable name + an expression for the snapshotted store.
+  // The reified root function is wrapped so it runs inside `name.run(store, ...)`,
+  // re-establishing the async context so `als.getStore()` returns the same store.
+  alsContexts: Array<{ name: string; storeExpr: string }>;
 }
 
 interface SourceBlock {
@@ -111,6 +116,7 @@ function serialize(fn: Function, replacer?: Replacer): string {
     sourceBlocks: [],
     keepSets: computeKeepSets(fn),
     symbols: new Map(),
+    alsContexts: [],
   };
 
   // Emit shared cells at module scope (deduped by id) before any function that
@@ -132,15 +138,23 @@ function serialize(fn: Function, replacer?: Replacer): string {
     ctx.module.push(`${cell.kind} ${cell.name} = ${emitValue(value, ctx)};`);
   }
 
-  // A bound (or already-hoisted) root is emitted via the value path and
-  // exported by reference; otherwise reconstruct it inline.
+  // A bound or native root is emitted via the value path (bound → .bind(...),
+  // native → its global path) and exported by reference; otherwise reconstruct
+  // it inline.
   let exportExpr: string;
   let exportReconstructed: ReconstructedFunction | undefined;
-  if ((fn as any)[Symbol.boundFunction] !== undefined) {
+  if ((fn as any)[Symbol.boundFunction] !== undefined || isNativeFunctionSource(fn.toString())) {
     exportExpr = emitFunction(fn, ctx);
   } else {
     exportReconstructed = reconstructFunctionExpr(fn, ctx);
     exportExpr = exportReconstructed.expr;
+  }
+
+  // Re-establish the captured AsyncLocalStorage context(s): wrap the root so each
+  // call runs inside `als.run(store, ...)`, restoring `als.getStore()`. The
+  // wrapper is single-line, so the function body's source-map lines are unchanged.
+  for (const { name, storeExpr } of ctx.alsContexts) {
+    exportExpr = `(...__alsArgs) => ${name}.run(${storeExpr}, () => (${exportExpr})(...__alsArgs))`;
   }
 
   const prelude = ctx.module.length ? ctx.module.join("\n") + "\n" : "";
@@ -274,6 +288,9 @@ function analyzeSharedCells(root: Function): { sharedIds: Set<number>; cellInfo:
     if (value === null) return;
     const type = typeof value;
     if (type !== "function" && type !== "object") return;
+    // An AsyncLocalStorage instance is reconstructed wholesale (fresh instance);
+    // never walk its native internals (they reach unserializable functions).
+    if (isAsyncLocalStorage(value as object)) return;
     if ($isProxyObject(value)) {
       // Don't trap through the proxy; analyze its real target and handler.
       const handler = $getProxyInternalField(value, $proxyFieldHandler);
@@ -559,6 +576,7 @@ function computeKeepSets(root: Function): Map<object, Set<string> | "all"> {
       if (o === null || typeof o !== "object") continue;
       if (keepSets.get(o) === "all") continue;
       keepSets.set(o, "all");
+      if (isAsyncLocalStorage(o)) continue; // reconstructed wholesale; don't walk internals
       if ($isProxyObject(o)) continue; // emitted via emitProxy, not keep-sets
       if ($isJSArray(o)) {
         for (const el of o as unknown[]) {
@@ -660,6 +678,7 @@ function computeKeepSets(root: Function): Map<object, Set<string> | "all"> {
     if (value === null) return;
     const type = typeof value;
     if (type !== "function" && type !== "object") return;
+    if (isAsyncLocalStorage(value as object)) return; // reconstructed wholesale; opaque
     if ($isProxyObject(value)) {
       const handler = $getProxyInternalField(value, $proxyFieldHandler);
       if (handler === null) return;
@@ -1089,10 +1108,12 @@ function emitValue(value: unknown, ctx: Context): string {
       return serializeNumber(value as number);
     case "object":
       if (value === null) return "null";
+      if (isAsyncLocalStorage(value as object)) return emitAsyncLocalStorage(value as object, ctx);
       if ($isProxyObject(value)) return emitProxy(value as object, ctx);
       return emitObject(value as object, ctx);
     case "function":
       // A Proxy whose target is callable has typeof "function".
+      if (isAsyncLocalStorage(value as object)) return emitAsyncLocalStorage(value as object, ctx);
       if ($isProxyObject(value)) return emitProxy(value as object, ctx);
       return emitFunction(value as Function, ctx);
     case "symbol":
@@ -1593,13 +1614,16 @@ function emitFunction(fn: Function, ctx: Context): string {
     return name;
   }
 
-  // A global built-in (Error, Map, Array, EventTarget, ...) has no JS source but
-  // a stable global identity — reference it by name rather than trying (and
-  // failing) to reconstruct it. This is what lets `class X extends Error` and
-  // captured built-in constructors work.
-  if (isNativeFunctionSource(fn.toString()) && fn.name && (globalThis as any)[fn.name] === fn) {
-    ctx.module.push(`const ${name} = ${fn.name};`);
-    return name;
+  // A native built-in (Math.max, Array.prototype.slice, console.log, Error, ...)
+  // has no JS source but a stable identity reachable from globalThis — reference
+  // it by its path rather than trying to reconstruct it. This is what lets a
+  // captured native function round-trip, and `class X extends Error` work.
+  if (isNativeFunctionSource(fn.toString())) {
+    const path = nativeFunctionPath(fn);
+    if (path !== undefined) {
+      ctx.module.push(`const ${name} = ${path};`);
+      return name;
+    }
   }
 
   const reconstructed = reconstructFunctionExpr(fn, ctx);
@@ -1625,6 +1649,96 @@ function recordSourceBlock(ctx: Context, moduleIndex: number, reconstructed: Rec
     line: location.line,
     lineCount: reconstructed.sourceLineCount,
   });
+}
+
+// AsyncLocalStorage (a Proxy over native internals in Bun) reconstructs as a
+// FRESH instance — getStore() is undefined until run()/enterWith(); the active
+// store is ambient async-context state, not part of the closure.
+function isAsyncLocalStorage(value: object): boolean {
+  // Never touch a Proxy's properties here — that would fire its traps (observable
+  // side effects) or throw on a revoked proxy. AsyncLocalStorage is not a Proxy.
+  if ($isProxyObject(value)) return false;
+  try {
+    if ((value as any)?.constructor?.name !== "AsyncLocalStorage") return false;
+    return typeof (value as any).run === "function" && typeof (value as any).getStore === "function";
+  } catch {
+    return false;
+  }
+}
+function emitAsyncLocalStorage(value: object, ctx: Context): string {
+  const existing = ctx.refs.get(value);
+  if (existing !== undefined) return existing;
+  const name = REF_PREFIX + ctx.counter++;
+  ctx.refs.set(value, name);
+  // The source is built via JSON.stringify so the builtin-module preprocessor
+  // doesn't treat this template literal as a real import and strip it.
+  ctx.imports.add(`import { AsyncLocalStorage } from ${JSON.stringify("node:async_hooks")};`);
+  ctx.module.push(`const ${name} = new AsyncLocalStorage();`);
+  // Snapshot the store active in this ALS at serialize time (e.g. set by an
+  // enclosing `als.run(store, () => serialize(fn))`). The root is wrapped to
+  // re-enter this context so `als.getStore()` returns the same store on reify.
+  let store: unknown;
+  try {
+    store = (value as any).getStore();
+  } catch {
+    store = undefined;
+  }
+  if (store !== undefined) ctx.alsContexts.push({ name, storeExpr: emitValue(store, ctx) });
+  return name;
+}
+
+// Reverse map from a native built-in function to its canonical globalThis path
+// (e.g. Math.max -> "Math.max", Array.prototype.slice -> "Array.prototype.slice")
+// so captured native functions can be referenced instead of (impossibly)
+// serialized. Built once, lazily, on first native capture.
+let nativePathMap: Map<Function, string> | undefined;
+function nativeFunctionPath(fn: Function): string | undefined {
+  if (nativePathMap === undefined) nativePathMap = buildNativePathMap();
+  return nativePathMap.get(fn);
+}
+function buildNativePathMap(): Map<Function, string> {
+  const map = new Map<Function, string>();
+  const g = globalThis as any;
+  const record = (f: unknown, path: string): void => {
+    if (typeof f === "function" && !map.has(f)) map.set(f, path);
+  };
+  // Record the own function-valued properties of `obj` as `<base>.<key>` (data
+  // properties only — accessors may throw or be context-sensitive).
+  const walkMembers = (obj: any, base: string): void => {
+    let keys: string[];
+    try {
+      keys = Object.getOwnPropertyNames(obj);
+    } catch {
+      return;
+    }
+    for (const key of keys) {
+      if (key === "caller" || key === "arguments" || key === "callee") continue;
+      let d: PropertyDescriptor | undefined;
+      try {
+        d = Object.getOwnPropertyDescriptor(obj, key);
+      } catch {
+        continue;
+      }
+      if (d !== undefined && typeof d.value === "function") record(d.value, `${base}.${key}`);
+    }
+  };
+  for (const name of Object.getOwnPropertyNames(g)) {
+    if (name === "globalThis" || name === "global" || name === "window" || name === "self") continue;
+    let v: any;
+    try {
+      v = g[name];
+    } catch {
+      continue;
+    }
+    if (typeof v === "function") {
+      record(v, name); // the constructor / global function itself
+      walkMembers(v, name); // static methods (Object.keys, Array.from, ...)
+      if (v.prototype) walkMembers(v.prototype, `${name}.prototype`); // instance methods
+    } else if (typeof v === "object" && v !== null) {
+      walkMembers(v, name); // namespace methods (Math.max, JSON.parse, console.log, ...)
+    }
+  }
+  return map;
 }
 
 function serializeNumber(value: number): string {
@@ -1868,6 +1982,7 @@ async function bundle(fn: Function, replacer?: Replacer): Promise<string> {
     sourceBlocks: [],
     keepSets: computeKeepSets(fn),
     symbols: new Map(),
+    alsContexts: [],
   };
   // 2. Recover the closure module's import bindings: localName → original source.
   type Binding = { source: string; imported?: string; default?: boolean; star?: boolean };

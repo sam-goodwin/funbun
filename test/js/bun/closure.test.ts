@@ -39,8 +39,29 @@ test("throws on non-functions", () => {
   expect(() => serialize(42 as any)).toThrow(TypeError);
 });
 
-test("throws on native functions", () => {
-  expect(() => serialize(Math.max)).toThrow("Cannot serialize a native function");
+test("a native function captured as the root is referenced by its global path", async () => {
+  const fn = await roundtrip(Math.max as any);
+  expect(fn(3, 7, 5)).toBe(7);
+});
+
+test("captured native functions round-trip by reference", async () => {
+  const fns = { max: Math.max, parse: JSON.parse, slice: Array.prototype.slice, log: console.log };
+  void fns;
+  const out = (await roundtrip(() => fns))();
+  expect(out.max).toBe(Math.max);
+  expect(out.parse).toBe(JSON.parse);
+  expect(out.slice).toBe(Array.prototype.slice);
+  expect(out.log).toBe(console.log);
+  // and they still work
+  expect(out.max(1, 9, 2)).toBe(9);
+  expect(out.parse('{"a":1}')).toEqual({ a: 1 });
+});
+
+test("a closure calling a captured native function round-trips", async () => {
+  const round = Math.round;
+  void round;
+  const fn = await roundtrip((x: number) => round(x));
+  expect(fn(3.6)).toBe(4);
 });
 
 test("reconstructs a captured primitive (number)", async () => {
@@ -3978,14 +3999,50 @@ describe("AsyncLocalStorage", () => {
     expect(out).toEqual({ user: "alice" });
   });
 
-  // KNOWN LIMITATION: capturing the ALS INSTANCE itself fails — Bun implements
-  // AsyncLocalStorage as a Proxy over native cleanup internals (jsCleanupLater),
-  // which have no serializable source. Its active store is also ambient async-
-  // context state, not part of the closure. Workaround: capture the store VALUE
-  // (above), or re-create the ALS in the reconstructed module.
-  test("known limitation: capturing the ALS instance throws", () => {
+  // An ALS instance reconstructs as a fresh instance (treated opaquely — its
+  // native internals are never walked). Outside any run(), getStore() is undefined.
+  test("an ALS instance reconstructs as a fresh, working store", async () => {
     const als = new AsyncLocalStorage<{ v: number }>();
     void als;
-    expect(() => serialize(() => als)).toThrow(/native function/);
+    const out = (await roundtrip(() => als))();
+    expect(out).toBeInstanceOf(AsyncLocalStorage);
+    expect(out.getStore()).toBeUndefined();
+    expect(out.run({ v: 1 }, () => out.getStore())).toEqual({ v: 1 });
+  });
+
+  // THE KEY CASE: serializing a closure INSIDE als.run captures the active store
+  // and re-establishes it on reify, so als.getStore() returns the same store.
+  test("captures the active ALS context and restores it on reify", async () => {
+    const als = new AsyncLocalStorage<{ user: string }>();
+    const code = await als.run({ user: "alice" }, async () => {
+      return serialize(() => als.getStore()!.user); // serialized inside run()
+    });
+    using dir = tempDir(`closure-als-ctx-${Math.random().toString(36).slice(2)}`, { "mod.mjs": code });
+    const fn = (await import(`${String(dir)}/mod.mjs`)).default as () => string;
+    expect(fn()).toBe("alice"); // context restored on reification
+  });
+
+  // INTERACTION: nested run() inside the reconstructed closure still composes.
+  test("nested als.run inside a reconstructed closure composes", async () => {
+    const als = new AsyncLocalStorage<number>();
+    void als;
+    const fn = await roundtrip(() =>
+      als.run(1, () => {
+        const outer = als.getStore();
+        const inner = als.run(2, () => als.getStore());
+        return [outer, inner, als.getStore()];
+      }),
+    );
+    expect(fn()).toEqual([1, 2, 1]);
+  });
+
+  // INTERACTION: two ALS contexts captured together; both restored.
+  test("captures two ALS contexts and restores both", async () => {
+    const a = new AsyncLocalStorage<string>();
+    const b = new AsyncLocalStorage<string>();
+    const code = a.run("A", () => b.run("B", () => serialize(() => [a.getStore(), b.getStore()])));
+    using dir = tempDir(`closure-als-2-${Math.random().toString(36).slice(2)}`, { "mod.mjs": code });
+    const fn = (await import(`${String(dir)}/mod.mjs`)).default as () => string[];
+    expect(fn()).toEqual(["A", "B"]);
   });
 });
