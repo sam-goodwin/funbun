@@ -957,17 +957,42 @@ test("captures a function and a value imported from another module", async () =>
   expect(exitCode).toBe(0);
 });
 
+describe("weak collections snapshot their live entries", () => {
+  test("a WeakMap round-trips entries whose keys are shared with other captures", async () => {
+    const k1 = { id: 1 };
+    const k2 = { id: 2 };
+    const wm = new WeakMap<object, unknown>([
+      [k1, "one"],
+      [k2, { nested: true }],
+    ]);
+    void [k1, k2, wm];
+    const out = (await roundtrip(() => ({ k1, k2, wm })))();
+    expect(out.wm).toBeInstanceOf(WeakMap);
+    expect(out.wm.get(out.k1)).toBe("one"); // key identity preserved
+    expect(out.wm.get(out.k2)).toEqual({ nested: true });
+  });
+
+  test("a WeakSet round-trips membership for shared captures", async () => {
+    const a = { id: "a" };
+    const b = { id: "b" };
+    const ws = new WeakSet([a, b]);
+    void [a, b, ws];
+    const out = (await roundtrip(() => ({ a, b, ws })))();
+    expect(out.ws).toBeInstanceOf(WeakSet);
+    expect(out.ws.has(out.a)).toBe(true);
+    expect(out.ws.has(out.b)).toBe(true);
+    expect(out.ws.has({ id: "a" })).toBe(false); // different identity
+  });
+
+  test("an empty WeakMap round-trips", async () => {
+    const wm = new WeakMap();
+    void wm;
+    const out = (await roundtrip(() => wm))();
+    expect(out).toBeInstanceOf(WeakMap);
+  });
+});
+
 describe("unserializable values throw clearly (no silent loss)", () => {
-  test("WeakMap", () => {
-    let w = new WeakMap();
-    void w;
-    expect(() => serialize(() => w)).toThrow("WeakMap");
-  });
-  test("WeakSet", () => {
-    let w = new WeakSet();
-    void w;
-    expect(() => serialize(() => w)).toThrow("WeakSet");
-  });
   test("a pending Promise throws a clear error", () => {
     let p = new Promise(() => {}); // never settles
     void p;
@@ -3413,10 +3438,13 @@ describe("interactions: private fields + other features", () => {
 });
 
 describe("interactions: guards fire when nested", () => {
-  test("a WeakMap nested in a captured object still throws", () => {
-    const o = { inner: new WeakMap() };
+  test("a WeakMap nested in a captured object round-trips", async () => {
+    const key = { id: 1 };
+    const o = { inner: new WeakMap([[key, "v"]]), key };
     void o;
-    expect(() => serialize(() => o)).toThrow(/WeakMap/i);
+    const out = (await roundtrip(() => o))();
+    expect(out.inner).toBeInstanceOf(WeakMap);
+    expect(out.inner.get(out.key)).toBe("v");
   });
   test("a generator object nested in a Map still throws", () => {
     function* g() {

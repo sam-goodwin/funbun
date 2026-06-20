@@ -49,6 +49,9 @@
 #include "JavaScriptCore/JSSourceCode.h"
 #include "JavaScriptCore/JSString.h"
 #include "JavaScriptCore/JSWeakMap.h"
+#include "JavaScriptCore/JSWeakSet.h"
+#include "JavaScriptCore/WeakMapImpl.h"
+#include "JavaScriptCore/WeakMapImplInlines.h"
 #include "JavaScriptCore/LazyClassStructure.h"
 #include "JavaScriptCore/LazyClassStructureInlines.h"
 #include "JavaScriptCore/ObjectConstructor.h"
@@ -3069,6 +3072,30 @@ JSC_DEFINE_HOST_FUNCTION(functionResolveClosureBinding, (JSC::JSGlobalObject * g
     return JSC::JSValue::encode(result);
 }
 
+// Snapshots a WeakMap / WeakSet's live entries (which aren't JS-enumerable) into
+// a flat array: a WeakMap yields [k, v, k, v, ...], a WeakSet [k, k, ...]. Used
+// by the closure serializer to reconstruct them as a snapshot.
+JSC_DEFINE_HOST_FUNCTION(functionWeakCollectionSnapshot, (JSC::JSGlobalObject * globalObject, JSC::CallFrame* callFrame))
+{
+    JSC::VM& vm = JSC::getVM(globalObject);
+    auto scope = DECLARE_THROW_SCOPE(vm);
+
+    JSC::JSValue arg = callFrame->argument(0);
+    JSC::MarkedArgumentBuffer snapshot;
+    if (auto* weakMap = dynamicDowncast<JSC::JSWeakMap>(arg))
+        weakMap->takeSnapshot(snapshot);
+    else if (auto* weakSet = dynamicDowncast<JSC::JSWeakSet>(arg))
+        weakSet->takeSnapshot(snapshot);
+
+    JSC::JSArray* result = JSC::constructEmptyArray(globalObject, nullptr, snapshot.size());
+    RETURN_IF_EXCEPTION(scope, {});
+    for (unsigned i = 0; i < snapshot.size(); ++i) {
+        result->putDirectIndex(globalObject, i, snapshot.at(i));
+        RETURN_IF_EXCEPTION(scope, {});
+    }
+    return JSC::JSValue::encode(result);
+}
+
 JSC_DEFINE_CUSTOM_GETTER(functionFreeVariablesGetter, (JSC::JSGlobalObject * globalObject, JSC::EncodedJSValue thisValue, JSC::PropertyName))
 {
     JSC::VM& vm = JSC::getVM(globalObject);
@@ -3461,6 +3488,7 @@ void GlobalObject::addBuiltinGlobals(JSC::VM& vm)
         GlobalPropertyInfo(builtinNames.peekPromiseSettledValuePrivateName(), JSFunction::create(vm, this, 1, String(), jsBunPeekPromiseSettledValue, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
         GlobalPropertyInfo(builtinNames.pokePromiseAsHandledPrivateName(), JSFunction::create(vm, this, 1, String(), jsBunPokePromiseAsHandled, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
         GlobalPropertyInfo(builtinNames.resolveClosureBindingPrivateName(), JSFunction::create(vm, this, 2, String(), functionResolveClosureBinding, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
+        GlobalPropertyInfo(builtinNames.weakCollectionSnapshotPrivateName(), JSFunction::create(vm, this, 1, String(), functionWeakCollectionSnapshot, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
         GlobalPropertyInfo(builtinNames.getInternalWritableStreamPrivateName(), JSFunction::create(vm, this, 1, String(), getInternalWritableStream, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
         GlobalPropertyInfo(builtinNames.createWritableStreamFromInternalPrivateName(), JSFunction::create(vm, this, 1, String(), createWritableStreamFromInternal, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
         GlobalPropertyInfo(builtinNames.fulfillModuleSyncPrivateName(), JSFunction::create(vm, this, 1, String(), functionFulfillModuleSync, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),

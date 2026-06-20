@@ -158,6 +158,7 @@ using namespace JSC;
     macro(pokePromiseAsHandled) \
     macro(port) \
     macro(resolveClosureBinding) \
+    macro(weakCollectionSnapshot) \
     macro(post) \
     macro(processBindingConstants) \
     macro(pull) \

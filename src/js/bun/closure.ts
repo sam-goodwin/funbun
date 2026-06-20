@@ -1115,9 +1115,6 @@ function emitObject(value: object, ctx: Context): string {
 
   // Built-ins whose contents can't be enumerated or whose state can't be
   // captured: reject loudly rather than silently emitting an empty object.
-  if (value instanceof WeakMap || value instanceof WeakSet) {
-    throw new TypeError("Cannot serialize a WeakMap/WeakSet (its entries are not enumerable)");
-  }
   if (value instanceof Promise && $peekPromiseStatus(value) === 0) {
     // A pending promise's resolution is tied to live I/O / timers / a suspended
     // async frame in the event loop — not expressible as source. (Settled
@@ -1464,6 +1461,24 @@ function emitBuiltin(value: object, name: string, ctx: Context): object | null {
     const target = (value as WeakRef<any>).deref();
     ctx.module.push(`const ${name} = new WeakRef(${target === undefined ? "{}" : emitValue(target, ctx)});`);
     return WeakRef.prototype;
+  }
+  // WeakMap / WeakSet entries aren't JS-enumerable, but their live entries can be
+  // snapshotted natively. Reconstruct as a fresh weak collection with those
+  // entries (keys keep their identity with other captures). Snapshot semantics:
+  // the keys alive at serialize time.
+  if (value instanceof WeakMap) {
+    const snap = $weakCollectionSnapshot(value); // [k, v, k, v, ...]
+    ctx.module.push(`const ${name} = new WeakMap();`);
+    for (let i = 0; i + 1 < snap.length; i += 2) {
+      ctx.module.push(`${name}.set(${emitValue(snap[i], ctx)}, ${emitValue(snap[i + 1], ctx)});`);
+    }
+    return WeakMap.prototype;
+  }
+  if (value instanceof WeakSet) {
+    const snap = $weakCollectionSnapshot(value); // [k, k, ...]
+    ctx.module.push(`const ${name} = new WeakSet();`);
+    for (const element of snap) ctx.module.push(`${name}.add(${emitValue(element, ctx)});`);
+    return WeakSet.prototype;
   }
   return null;
 }

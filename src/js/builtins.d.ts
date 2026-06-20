@@ -146,6 +146,12 @@ declare function $peekPromiseSettledValue<V>(promise: Promise<V>): V | undefined
  */
 declare function $resolveClosureBinding(fn: Function, name: string): { found: boolean; value: unknown };
 /**
+ * Snapshots a WeakMap / WeakSet's live entries into a flat array: a WeakMap
+ * yields `[k, v, k, v, ...]`, a WeakSet `[k, k, ...]`. Used by the closure
+ * serializer to reconstruct them as a snapshot.
+ */
+declare function $weakCollectionSnapshot(value: object): unknown[];
+/**
  * Marks a promise as handled so it doesn't fire the unhandled-rejection
  * tracker. Equivalent to JSC's `JSPromise::markAsHandled()`.
  */

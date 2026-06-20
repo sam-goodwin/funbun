@@ -117,8 +117,12 @@ export const CATEGORIES: CoverageCategory[] = [
         "reconstructs a unique-symbol-keyed property (recreated symbol)",
       ),
       S("val.symbol-no-desc", "symbol with no description", "a symbol with no description round-trips"),
-      L("val.weakmap", "WeakMap (clear error)", "WeakMap"),
-      L("val.weakset", "WeakSet (clear error)", "WeakSet"),
+      S(
+        "val.weakmap",
+        "WeakMap (native entry snapshot)",
+        "a WeakMap round-trips entries whose keys are shared with other captures",
+      ),
+      S("val.weakset", "WeakSet (native entry snapshot)", "a WeakSet round-trips membership for shared captures"),
       S(
         "val.promise-fulfilled",
         "fulfilled promise (value reconstructed)",
@@ -574,7 +578,7 @@ export const CATEGORIES: CoverageCategory[] = [
         "a frozen class instance with a private field round-trips",
       ),
       S("ix.bound-private", "bound method capturing private state", "a bound method capturing private state via this"),
-      S("ix.guard-nested-weakmap", "nested WeakMap still throws", "a WeakMap nested in a captured object still throws"),
+      S("ix.nested-weakmap", "nested WeakMap round-trips", "a WeakMap nested in a captured object round-trips"),
       S(
         "ix.guard-nested-generator",
         "nested generator object still throws",
