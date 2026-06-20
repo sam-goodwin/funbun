@@ -98,8 +98,43 @@ test("a closure over a compile-time-constant const round-trips (value inlined in
   expect(fn()).toBe(14);
 });
 
-test("throws (for now) on object free variables", () => {
-  const obj = { a: 1 };
-  void obj;
-  expect(() => serialize(() => obj)).toThrow("Cannot serialize object free variables yet");
+test("reconstructs a captured object", async () => {
+  let o = { a: 1, b: "x", nested: { c: true } };
+  void o;
+  const fn = await roundtrip(() => o);
+  expect(fn()).toEqual({ a: 1, b: "x", nested: { c: true } });
+});
+
+test("reconstructs a captured array", async () => {
+  let arr = [1, "two", [3, 4]];
+  void arr;
+  const fn = await roundtrip(() => arr);
+  expect(fn()).toEqual([1, "two", [3, 4]]);
+});
+
+test("round-trips a circular object", async () => {
+  let o: any = { v: 1 };
+  o.self = o;
+  void o;
+  const fn = await roundtrip(() => o);
+  const result = fn();
+  expect(result.v).toBe(1);
+  expect(result.self).toBe(result);
+});
+
+test("shared object reference is emitted once (identity preserved)", async () => {
+  let a = { v: 1 };
+  let b = a;
+  void [a, b];
+  const fn = await roundtrip(() => [a, b]);
+  const [x, y] = fn();
+  expect(x).toBe(y);
+  expect(x.v).toBe(1);
+});
+
+test("still throws on function free variables (next step)", () => {
+  const captured = () => 1;
+  const inner = { captured };
+  void inner;
+  expect(() => serialize(() => inner)).toThrow("Cannot serialize function free variables yet");
 });

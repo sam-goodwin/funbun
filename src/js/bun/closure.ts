@@ -3,11 +3,12 @@
 // `serialize(fn)` returns the source of an ES module whose `export default` is a
 // reconstruction of `fn`. Built incrementally:
 //
-//   Step 1: functions with no free variables — `export default <source>`.
-//   Step 2 (this): reconstruct captured PRIMITIVE free variables as
-//   module-level bindings, so the function closes over them by name. Shared
-//   cells, rich values, Proxy, bound functions, built-ins, and source maps land
-//   in later steps.
+//   Step 1: functions with no free variables.
+//   Step 2: reconstruct captured PRIMITIVE free variables as module bindings.
+//   Step 3 (this): reference graph — captured objects/arrays are hoisted as
+//   `const` declarations, deduplicated by identity (shared references emitted
+//   once) with cycles handled by declare-then-fill. Functions/Proxies/bound
+//   functions/built-ins and source maps come in later steps.
 
 type Replacer = (key: string, value: unknown) => unknown;
 
@@ -17,6 +18,16 @@ interface FreeVariable {
   scopeId: number;
   value: unknown;
   kind: "const" | "let";
+}
+
+// Prefix for hoisted reference variables. Must not collide with a captured
+// variable name; chosen to be extremely unlikely in user code.
+const REF_PREFIX = "__bunClosure$";
+
+interface Context {
+  statements: string[];
+  refs: Map<object, string>;
+  counter: number;
 }
 
 function serialize(fn: Function, _replacer?: Replacer): string {
@@ -29,20 +40,22 @@ function serialize(fn: Function, _replacer?: Replacer): string {
     throw new TypeError("Cannot serialize a native function (no JavaScript source is available)");
   }
 
+  const ctx: Context = { statements: [], refs: new Map(), counter: 0 };
   const freeVariables = (fn as any)[Symbol.freeVariables] as FreeVariable[];
 
-  let bindings = "";
   for (const variable of freeVariables) {
-    bindings += `${variable.kind} ${variable.name} = ${serializeValue(variable.value)};\n`;
+    const expr = emitValue(variable.value, ctx);
+    ctx.statements.push(`${variable.kind} ${variable.name} = ${expr};`);
   }
 
-  // Parenthesize so the source is always an expression position, whether it is
-  // an arrow, a function expression/declaration, or a class.
-  return `${bindings}export default (${source});\n`;
+  const prelude = ctx.statements.length ? ctx.statements.join("\n") + "\n" : "";
+  // Parenthesize so the source is always an expression position.
+  return `${prelude}export default (${source});\n`;
 }
 
-// Step 2: only primitives. Objects, functions, Proxies, etc. come in later steps.
-function serializeValue(value: unknown): string {
+// Returns a JS expression for `value`, appending any hoisted construction
+// statements (for objects) to `ctx`.
+function emitValue(value: unknown, ctx: Context): string {
   switch (typeof value) {
     case "string":
       return JSON.stringify(value);
@@ -56,10 +69,37 @@ function serializeValue(value: unknown): string {
       return serializeNumber(value as number);
     case "object":
       if (value === null) return "null";
-      throw new TypeError("Cannot serialize object free variables yet");
+      return emitObject(value as object, ctx);
+    case "function":
+      throw new TypeError("Cannot serialize function free variables yet");
     default:
       throw new TypeError(`Cannot serialize a free variable of type ${typeof value}`);
   }
+}
+
+function emitObject(value: object, ctx: Context): string {
+  const existing = ctx.refs.get(value);
+  if (existing !== undefined) return existing;
+
+  const name = REF_PREFIX + ctx.counter++;
+  // Record BEFORE recursing so a self-reference resolves to `name`.
+  ctx.refs.set(value, name);
+
+  if (Array.isArray(value)) {
+    ctx.statements.push(`const ${name} = [];`);
+    for (let i = 0; i < value.length; i++) {
+      if (i in value) {
+        ctx.statements.push(`${name}[${i}] = ${emitValue(value[i], ctx)};`);
+      }
+    }
+  } else {
+    ctx.statements.push(`const ${name} = {};`);
+    for (const key of Object.keys(value)) {
+      ctx.statements.push(`${name}[${JSON.stringify(key)}] = ${emitValue((value as any)[key], ctx)};`);
+    }
+  }
+
+  return name;
 }
 
 function serializeNumber(value: number): string {
