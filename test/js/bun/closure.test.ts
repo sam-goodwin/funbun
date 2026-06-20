@@ -4046,3 +4046,46 @@ describe("AsyncLocalStorage", () => {
     expect(fn()).toEqual(["A", "B"]);
   });
 });
+
+// ===========================================================================
+// AsyncLocalStorage — rich interactions: module-scope capture, nesting,
+// promises, and intermixed contexts. Behavior model:
+//  - An ALS instance reconstructs as a fresh instance (opaque).
+//  - The store ACTIVE at serialize time is snapshotted; the reified root is
+//    wrapped so each call re-enters `als.run(store, ...)`.
+// ===========================================================================
+
+// Module-scope ALS instances — captured as free variables from module scope.
+const moduleALS = new AsyncLocalStorage<{ tag: string }>();
+const moduleALS_B = new AsyncLocalStorage<number>();
+
+// Serialize `fn` (optionally inside a context the caller establishes), reify the
+// resulting module, and return its default export.
+async function reify<T = any>(code: string): Promise<T> {
+  using dir = tempDir(`als-rich-${Math.random().toString(36).slice(2)}`, { "mod.mjs": code });
+  return (await import(`${String(dir)}/mod.mjs`)).default as T;
+}
+
+describe("ALS rich: module-scope capture", () => {
+  test("module-scope ALS, serialized OUTSIDE any run, reconstructs fresh (no context)", async () => {
+    const fn = () => moduleALS.getStore() ?? "none";
+    const code = serialize(fn); // no active context here
+    const reified = await reify<() => string>(code);
+    expect(reified()).toBe("none");
+    // the consumer can establish their own context on the fresh instance
+  });
+
+  test("module-scope ALS, serialized INSIDE a run, captures the context", async () => {
+    const code = moduleALS.run({ tag: "module-ctx" }, () => serialize(() => moduleALS.getStore()!.tag));
+    const reified = await reify<() => string>(code);
+    expect(reified()).toBe("module-ctx");
+  });
+
+  test("module-scope ALS captured alongside a function free variable", async () => {
+    const decorate = (s: string) => `[${s}]`;
+    void decorate;
+    const code = moduleALS.run({ tag: "X" }, () => serialize(() => decorate(moduleALS.getStore()!.tag)));
+    const reified = await reify<() => string>(code);
+    expect(reified()).toBe("[X]");
+  });
+});
