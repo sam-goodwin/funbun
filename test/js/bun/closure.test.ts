@@ -585,3 +585,34 @@ test("reconstructs a class whose method captures a free variable", async () => {
   const Klass = (await roundtrip(() => Adder))();
   expect(new Klass().add(5)).toBe(15);
 });
+
+test("reconstructs symbol-keyed, generator, and async methods", async () => {
+  let obj = {
+    [Symbol.iterator]() {
+      return [10, 20][Symbol.iterator]();
+    },
+    *count() {
+      yield 1;
+      yield 2;
+    },
+    async ping() {
+      return "pong";
+    },
+  };
+  void obj;
+  const out = await roundtrip(() => obj);
+  const o = out();
+  expect([...o]).toEqual([10, 20]);
+  expect([...o.count()]).toEqual([1, 2]);
+  await expect(o.ping()).resolves.toBe("pong");
+});
+
+test("reconstructs generator and async generator functions", async () => {
+  function* g() {
+    yield 1;
+    yield 2;
+  }
+  void g;
+  const out = (await roundtrip(() => g))();
+  expect([...out()]).toEqual([1, 2]);
+});

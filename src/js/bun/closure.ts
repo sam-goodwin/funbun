@@ -703,6 +703,19 @@ function functionSourceToExpression(source: string, name: string): string {
   if (/^(get|set)\s/.test(trimmed)) {
     return `(${trimmed.replace(/^(get|set)\s+[^(]*/, "function ")})`;
   }
+  // Method shorthand of any name shape — `foo(){}`, `async foo(){}`, `*gen(){}`,
+  // `async *g(){}`, `[Symbol.iterator](){}`, `"str-key"(){}`, `123(){}`. The
+  // property name is irrelevant to the function value, so drop it and emit a
+  // plain (async/generator) function expression.
+  const method = trimmed.match(
+    /^(async\s+)?(\*\s*)?(?:[A-Za-z_$][\w$]*|\[[\s\S]*?\]|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\d[\w.]*)\s*(\([\s\S]*)$/,
+  );
+  if (method !== null) {
+    const asyncPart = method[1] ? "async " : "";
+    const star = method[2] ? "*" : "";
+    return `(${asyncPart}function${star} ${method[3]})`;
+  }
+  // Fallback: wrap and extract by name (should be unreachable for valid sources).
   return `({ ${source} })[${JSON.stringify(name)}]`;
 }
 
