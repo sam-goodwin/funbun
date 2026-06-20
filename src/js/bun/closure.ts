@@ -81,8 +81,19 @@ function analyzeSharedCells(root: Function): { sharedIds: Set<number>; cellInfo:
   const seenObjs = new Set<object>();
 
   function visitValue(value: unknown): void {
-    if (typeof value === "function") visitFn(value as Function);
-    else if (value !== null && typeof value === "object") visitObj(value as object);
+    if (value === null) return;
+    const type = typeof value;
+    if (type !== "function" && type !== "object") return;
+    if ($isProxyObject(value)) {
+      // Don't trap through the proxy; analyze its real target and handler.
+      const handler = $getProxyInternalField(value, $proxyFieldHandler);
+      if (handler === null) return; // revoked: emit will throw later
+      visitValue($getProxyInternalField(value, $proxyFieldTarget));
+      visitValue(handler);
+      return;
+    }
+    if (type === "function") visitFn(value as Function);
+    else visitObj(value as object);
   }
   function visitObj(o: object): void {
     if (seenObjs.has(o)) return;
@@ -138,10 +149,11 @@ function reconstructFunctionExpr(fn: Function, ctx: Context): string {
     bindings.push(`${variable.kind} ${variable.name} = ${emitValue(value, ctx)};`);
   }
 
+  const fnExpr = functionSourceToExpression(source, (fn as any).name);
   if (bindings.length === 0) {
-    return `(${source})`;
+    return fnExpr;
   }
-  return `(function () {\n${bindings.join("\n")}\nreturn (${source});\n})()`;
+  return `(function () {\n${bindings.join("\n")}\nreturn ${fnExpr};\n})()`;
 }
 
 // Applies the replacer (if any) to a value before it is serialized. `holder` is
@@ -167,8 +179,11 @@ function emitValue(value: unknown, ctx: Context): string {
       return serializeNumber(value as number);
     case "object":
       if (value === null) return "null";
+      if ($isProxyObject(value)) return emitProxy(value as object, ctx);
       return emitObject(value as object, ctx);
     case "function":
+      // A Proxy whose target is callable has typeof "function".
+      if ($isProxyObject(value)) return emitProxy(value as object, ctx);
       return emitFunction(value as Function, ctx);
     default:
       throw new TypeError(`Cannot serialize a free variable of type ${typeof value}`);
@@ -269,6 +284,28 @@ function emitBuiltin(value: object, name: string, ctx: Context): boolean {
   return false;
 }
 
+// Reconstructs a Proxy as `new Proxy(target, handler)`. Both the target and the
+// handler (whose traps are themselves serialized functions) recurse through the
+// normal value path. Uses JSC intrinsics to see inside the Proxy.
+function emitProxy(value: object, ctx: Context): string {
+  const existing = ctx.refs.get(value);
+  if (existing !== undefined) return existing;
+
+  const name = REF_PREFIX + ctx.counter++;
+  ctx.refs.set(value, name);
+
+  const handler = $getProxyInternalField(value, $proxyFieldHandler);
+  if (handler === null) {
+    throw new TypeError("Cannot serialize a revoked Proxy");
+  }
+  const target = $getProxyInternalField(value, $proxyFieldTarget);
+
+  const targetExpr = emitValue(target, ctx);
+  const handlerExpr = emitValue(handler, ctx);
+  ctx.module.push(`const ${name} = new Proxy(${targetExpr}, ${handlerExpr});`);
+  return name;
+}
+
 function emitFunction(fn: Function, ctx: Context): string {
   const existing = ctx.refs.get(fn);
   if (existing !== undefined) return existing;
@@ -287,6 +324,23 @@ function serializeNumber(value: number): string {
   // Preserve negative zero, which `String(-0)` collapses to "0".
   if (value === 0 && 1 / value === -Infinity) return "-0";
   return String(value);
+}
+
+// `fn.toString()` yields different syntaxes depending on how the function was
+// defined. Arrow / `function` / `class` sources are already valid expressions;
+// method-shorthand sources (`foo() {}`, `async foo() {}`, `*foo() {}`, object
+// or proxy-trap methods) are not, so wrap them in an object literal and pull the
+// method back out by name.
+function functionSourceToExpression(source: string, name: string): string {
+  const trimmed = source.trimStart();
+  if (/^(async\s+)?function\b/.test(trimmed) || /^class\b/.test(trimmed)) {
+    return `(${source})`;
+  }
+  // Arrow: `(...) =>`, `x =>`, optionally async.
+  if (/^(async\s+)?(\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>/.test(trimmed)) {
+    return `(${source})`;
+  }
+  return `({ ${source} })[${JSON.stringify(name)}]`;
 }
 
 function isNativeFunctionSource(source: string): boolean {

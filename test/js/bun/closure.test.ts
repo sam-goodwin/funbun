@@ -287,3 +287,47 @@ test("reconstructs a captured Error with its type and message", async () => {
   expect(out).toBeInstanceOf(TypeError);
   expect(out.message).toBe("boom");
 });
+
+test("reconstructs a captured Proxy (object target)", async () => {
+  let target = { a: 1 };
+  let p = new Proxy(target, {
+    get(t, key) {
+      return key === "a" ? (t as any).a + 100 : (t as any)[key];
+    },
+  });
+  void p;
+  const fn = await roundtrip(() => p);
+  const out = fn();
+  expect(out.a).toBe(101); // trap applied
+});
+
+test("reconstructs a captured Proxy whose target is a function", async () => {
+  let p = new Proxy((x: number) => x, {
+    apply(t, _this, args) {
+      return (t as any)(...args) * 2;
+    },
+  });
+  void p;
+  const fn = await roundtrip(() => p);
+  expect(fn()(5)).toBe(10); // apply trap doubles
+});
+
+test("throws on a revoked Proxy", () => {
+  const { proxy, revoke } = Proxy.revocable({ a: 1 }, {});
+  revoke();
+  let p = proxy;
+  void p;
+  expect(() => serialize(() => p)).toThrow("revoked Proxy");
+});
+
+test("reconstructs a captured object with a method (shorthand)", async () => {
+  let o = {
+    base: 10,
+    add(x: number) {
+      return this.base + x;
+    },
+  };
+  void o;
+  const fn = await roundtrip(() => o.add(5));
+  expect(fn()).toBe(15);
+});
