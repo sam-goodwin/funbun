@@ -139,6 +139,13 @@ declare function $peekPromiseStatus(promise: Promise<any>): number;
  */
 declare function $peekPromiseSettledValue<V>(promise: Promise<V>): V | undefined;
 /**
+ * Resolves a single identifier against a function's lexical scope chain.
+ * Returns `{ found, value }` — used by the closure serializer to capture
+ * variables referenced only by a class field initializer (names the bytecode
+ * free-variable scan can't see, but which still live in the defining scope).
+ */
+declare function $resolveClosureBinding(fn: Function, name: string): { found: boolean; value: unknown };
+/**
  * Marks a promise as handled so it doesn't fire the unhandled-rejection
  * tracker. Equivalent to JSC's `JSPromise::markAsHandled()`.
  */

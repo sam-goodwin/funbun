@@ -3022,6 +3022,53 @@ static JSC::JSValue readEnvironmentVariable(JSC::JSCell* environment, JSC::Scope
     return {};
 }
 
+// Resolves a single identifier against a function's lexical scope chain and
+// returns { found, value }. Used by the closure serializer to capture variables
+// referenced only by a class field initializer — names the bytecode free-var
+// scan can't see (the initializer is a separate executable), but which the AST
+// surfaces and which still live in the class's defining scope.
+JSC_DEFINE_HOST_FUNCTION(functionResolveClosureBinding, (JSC::JSGlobalObject * globalObject, JSC::CallFrame* callFrame))
+{
+    JSC::VM& vm = JSC::getVM(globalObject);
+    auto scope = DECLARE_THROW_SCOPE(vm);
+
+    JSC::JSObject* result = JSC::constructEmptyObject(globalObject);
+    result->putDirect(vm, JSC::Identifier::fromString(vm, "found"_s), JSC::jsBoolean(false), 0);
+    result->putDirect(vm, JSC::Identifier::fromString(vm, "value"_s), JSC::jsUndefined(), 0);
+
+    auto* function = dynamicDowncast<JSC::JSFunction>(callFrame->argument(0));
+    if (!function)
+        return JSC::JSValue::encode(result);
+    JSC::Identifier nameId = JSC::Identifier::fromString(vm, callFrame->argument(1).toWTFString(globalObject));
+    RETURN_IF_EXCEPTION(scope, {});
+    WTF::UniquedStringImpl* nameImpl = nameId.impl();
+    if (!nameImpl)
+        return JSC::JSValue::encode(result);
+
+    for (JSC::JSScope* current = function->scope(); current; current = current->next()) {
+        if (current->inherits<JSC::JSGlobalObject>() || current->inherits<JSC::JSGlobalLexicalEnvironment>())
+            break;
+        auto* symbolTableObject = dynamicDowncast<JSC::JSSymbolTableObject>(current);
+        if (!symbolTableObject)
+            continue;
+        JSC::SymbolTable* symbolTable = symbolTableObject->symbolTable();
+        JSC::ConcurrentJSLocker locker(symbolTable->m_lock);
+        auto iter = symbolTable->find(locker, nameImpl);
+        if (iter == symbolTable->end(locker))
+            continue; // not in this scope — keep walking outward
+        const JSC::SymbolTableEntry& entry = iter->value;
+        if (!entry.isNull() && entry.varOffset().isScope()) {
+            JSC::JSValue value = readEnvironmentVariable(current, entry.scopeOffset());
+            if (value && !value.isEmpty()) {
+                result->putDirect(vm, JSC::Identifier::fromString(vm, "found"_s), JSC::jsBoolean(true), 0);
+                result->putDirect(vm, JSC::Identifier::fromString(vm, "value"_s), value, 0);
+            }
+        }
+        break; // nearest declaring scope wins (shadowing)
+    }
+    return JSC::JSValue::encode(result);
+}
+
 JSC_DEFINE_CUSTOM_GETTER(functionFreeVariablesGetter, (JSC::JSGlobalObject * globalObject, JSC::EncodedJSValue thisValue, JSC::PropertyName))
 {
     JSC::VM& vm = JSC::getVM(globalObject);
@@ -3413,6 +3460,7 @@ void GlobalObject::addBuiltinGlobals(JSC::VM& vm)
         GlobalPropertyInfo(builtinNames.peekPromiseStatusPrivateName(), JSFunction::create(vm, this, 1, String(), jsBunPeekPromiseStatus, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
         GlobalPropertyInfo(builtinNames.peekPromiseSettledValuePrivateName(), JSFunction::create(vm, this, 1, String(), jsBunPeekPromiseSettledValue, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
         GlobalPropertyInfo(builtinNames.pokePromiseAsHandledPrivateName(), JSFunction::create(vm, this, 1, String(), jsBunPokePromiseAsHandled, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
+        GlobalPropertyInfo(builtinNames.resolveClosureBindingPrivateName(), JSFunction::create(vm, this, 2, String(), functionResolveClosureBinding, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
         GlobalPropertyInfo(builtinNames.getInternalWritableStreamPrivateName(), JSFunction::create(vm, this, 1, String(), getInternalWritableStream, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
         GlobalPropertyInfo(builtinNames.createWritableStreamFromInternalPrivateName(), JSFunction::create(vm, this, 1, String(), createWritableStreamFromInternal, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
         GlobalPropertyInfo(builtinNames.fulfillModuleSyncPrivateName(), JSFunction::create(vm, this, 1, String(), functionFulfillModuleSync, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),

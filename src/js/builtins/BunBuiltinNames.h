@@ -157,6 +157,7 @@ using namespace JSC;
     macro(pendingPullIntos) \
     macro(pokePromiseAsHandled) \
     macro(port) \
+    macro(resolveClosureBinding) \
     macro(post) \
     macro(processBindingConstants) \
     macro(pull) \

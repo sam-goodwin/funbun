@@ -369,15 +369,25 @@ export const CATEGORIES: CoverageCategory[] = [
         "extends call with object-literal args",
         "extends a call with object-literal args (brace inside heritage)",
       ),
-      L(
+      S(
         "cls.field-init-only",
-        "field-initializer-only capture on direct class value",
-        "a var captured only by a field initializer on a direct class value is unbound",
+        "field-initializer-only capture (AST + native scope resolve)",
+        "a var captured only by a field initializer on a direct class value round-trips",
       ),
-      L(
+      S(
         "cls.field-init-arrow",
-        "field-initializer arrow capture (unbound)",
-        "a field-initializer-only arrow capture is unbound",
+        "field-initializer arrow capture",
+        "a field-initializer-only arrow capture round-trips (AST + native scope resolve)",
+      ),
+      S(
+        "cls.field-init-multi",
+        "multiple instance + static field-value captures",
+        "field-init capture: multiple instance + static field values",
+      ),
+      S(
+        "cls.field-init-call",
+        "field initializer calling a captured function",
+        "field-init capture: initializer calls a captured function",
       ),
       S("cls.decorators", "method decorator round-trips", "a method decorator round-trips"),
       S("cls.private-accessor", "private #getter / #setter accessors", "private getter/setter accessors round-trip"),

@@ -683,18 +683,17 @@ test("a directly-captured class works when its field var is also used by a metho
   expect(new Klass().get()).toBe(41);
 });
 
-test("known limitation: a var captured only by a field initializer on a direct class value is unbound", async () => {
+test("a var captured only by a field initializer on a direct class value round-trips", async () => {
   // `base` is referenced only by the field initializer (no method references it),
-  // and the class is captured as a value rather than via its factory. The class's
-  // member executables aren't reachable from the class constructor, so `base`
-  // can't be recovered. Workaround: capture the factory, or use the var in a method.
+  // and the class is captured as a value. Recovered via AST field-init analysis +
+  // native scope resolution.
   let C = ((base: number) =>
     class {
       val = base + 1;
     })(41);
   void C;
   const Klass = (await roundtrip(() => C))();
-  expect(() => new Klass()).toThrow(); // base is not defined
+  expect(new Klass().val).toBe(42);
 });
 
 describe("round-tripping a reference to a method (not the containing object)", () => {
@@ -3701,12 +3700,7 @@ describe("interactions: deeper adversarial combos", () => {
     expect(out.self.v).toBe(5);
   });
 
-  // KNOWN LIMITATION: a var referenced ONLY by a class field initializer (no
-  // method, no ctor body) on a directly-captured class value is not recoverable
-  // — field-initializer free variables aren't surfaced by reflection. It fails
-  // cleanly (ReferenceError) rather than silently. Workaround: capture the
-  // factory (`() => make(100)`) or reference the var from a method.
-  test("known limitation: a field-initializer-only arrow capture is unbound", async () => {
+  test("a field-initializer-only arrow capture round-trips (AST + native scope resolve)", async () => {
     function make(offset: number) {
       return class {
         add = (x: number) => x + offset;
@@ -3715,7 +3709,36 @@ describe("interactions: deeper adversarial combos", () => {
     const C = make(100);
     void C;
     const K = (await roundtrip(() => C))();
-    expect(() => new K().add(5)).toThrow(/offset is not defined/);
+    expect(new K().add(5)).toBe(105);
+  });
+
+  test("field-init capture: multiple instance + static field values", async () => {
+    function make(a: number, b: string) {
+      return class {
+        x = a * 2;
+        y = a + 1;
+        static label = b;
+      };
+    }
+    const C = make(10, "L");
+    void C;
+    const K = (await roundtrip(() => C))();
+    const inst = new K();
+    expect(inst.x).toBe(20);
+    expect(inst.y).toBe(11);
+    expect((K as any).label).toBe("L");
+  });
+
+  test("field-init capture: initializer calls a captured function", async () => {
+    function make(factory: () => { v: number }) {
+      return class {
+        state = factory();
+      };
+    }
+    const C = make(() => ({ v: 7 }));
+    void C;
+    const K = (await roundtrip(() => C))();
+    expect(new K().state).toEqual({ v: 7 });
   });
 
   test("Map with NaN and -0 keys preserves lookup semantics", async () => {

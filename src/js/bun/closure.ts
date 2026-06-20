@@ -773,7 +773,12 @@ function reconstructFunctionExpr(fn: Function, ctx: Context): ReconstructedFunct
   const location = (fn as any)[Symbol.sourceLocation] as ReconstructedFunction["location"];
 
   const bindings: string[] = [];
+  // Names already resolvable in the reconstructed output (so a field-initializer
+  // capture below doesn't re-bind them): every free variable (inlined, shared at
+  // module scope, or re-imported all resolve by name).
+  const boundNames = new Set<string>();
   for (const variable of freeVariables) {
+    boundNames.add(variable.name);
     // Shared cells are declared once at module scope; the source resolves to
     // them by name, so don't shadow them with a private binding here.
     if (ctx.sharedIds.has(variable.id)) continue;
@@ -796,6 +801,14 @@ function reconstructFunctionExpr(fn: Function, ctx: Context): ReconstructedFunct
   if (heritage !== undefined) {
     source = heritage.source;
     bindings.push(heritage.binding);
+  }
+
+  // Variables referenced ONLY by a class field initializer are invisible to the
+  // bytecode free-variable scan (the initializer is a separate executable), but
+  // the AST surfaces their names and they still live in the class's scope. Find
+  // those names and resolve each natively against the class's scope chain.
+  for (const binding of fieldInitializerBindings(fn, source, boundNames, ctx)) {
+    bindings.push(binding);
   }
   const sourceLineCount = source.split("\n").length;
 
@@ -887,6 +900,100 @@ function classHeritage(fn: Function, source: string, ctx: Context): { source: st
     source: source.slice(0, span.start) + replacement + source.slice(span.end),
     binding: `const ${superName} = ${emitValue(superclass, ctx)};`,
   };
+}
+
+// The free identifier names referenced by an AST node, excluding names bound
+// within it (params, declarators, nested function/class names, destructuring).
+function freeIdentifiersOfNode(node: any): Set<string> {
+  const refs = new Set<string>();
+  const bound = new Set<string>();
+  const bindNames = (n: any): void => {
+    if (!n || typeof n !== "object") return;
+    switch (n.type) {
+      case "Identifier":
+        bound.add(n.name);
+        break;
+      case "AssignmentPattern":
+        bindNames(n.left);
+        break;
+      case "ArrayPattern":
+        for (const el of n.elements || []) bindNames(el);
+        break;
+      case "ObjectPattern":
+        for (const p of n.properties || []) bindNames(p.value);
+        break;
+      case "RestElement":
+        bindNames(n.argument);
+        break;
+    }
+  };
+  (function walk(n: any): void {
+    if ($isJSArray(n)) {
+      for (const x of n) walk(x);
+      return;
+    }
+    if (!n || typeof n !== "object" || typeof n.type !== "string") return;
+    if (n.type === "Identifier") {
+      refs.add(n.name);
+      return;
+    }
+    if (n.type === "MemberExpression") {
+      // `obj.prop` references `obj`, not `prop`; only `obj[expr]` reads `expr`.
+      walk(n.object);
+      if (n.computed) walk(n.property);
+      return;
+    }
+    if (
+      n.type === "FunctionDeclaration" ||
+      n.type === "FunctionExpression" ||
+      n.type === "ArrowFunctionExpression" ||
+      n.type === "ClassDeclaration" ||
+      n.type === "ClassExpression"
+    ) {
+      if (n.id) bound.add(n.id.name);
+      for (const p of n.params || []) bindNames(p);
+    }
+    if (n.type === "VariableDeclarator") bindNames(n.id);
+    for (const k in n) {
+      if (k === "type" || k === "start") continue;
+      walk(n[k]);
+    }
+  })(node);
+  for (const b of bound) refs.delete(b);
+  return refs;
+}
+
+// Resolves variables referenced only by a class field initializer (or a computed
+// member-key expression) and returns `const <name> = <value>;` bindings for the
+// ones that live in the class's scope and aren't already bound.
+function fieldInitializerBindings(fn: Function, source: string, boundNames: Set<string>, ctx: Context): string[] {
+  if (!source.trimStart().startsWith("class")) return [];
+  const classNode = parseFunctionNode(source);
+  const members = classNode?.body?.body;
+  if (!$isJSArray(members)) return [];
+  if (classNode.id?.name) boundNames.add(classNode.id.name);
+
+  const names = new Set<string>();
+  for (const m of members) {
+    if (!m || typeof m !== "object") continue;
+    // Field initializer values (`x = <expr>`). The value runs in the class's
+    // scope (per-instance for instance fields, at definition for static), so a
+    // captured var it references is resolvable. (Computed keys `[expr]` are
+    // consumed at definition and aren't in the class's runtime scope, so they
+    // can't be recovered this way.)
+    if (m.type === "PropertyDefinition" && m.value) for (const n of freeIdentifiersOfNode(m.value)) names.add(n);
+  }
+
+  const bindings: string[] = [];
+  for (const name of names) {
+    if (boundNames.has(name)) continue;
+    const resolved = $resolveClosureBinding(fn, name) as { found: boolean; value: unknown };
+    if (!resolved.found) continue; // a global, or not in the class's scope — leave as-is
+    boundNames.add(name);
+    const value = transform(undefined, name, resolved.value, ctx);
+    bindings.push(`const ${name} = ${emitValue(value, ctx)};`);
+  }
+  return bindings;
 }
 
 // Locates the heritage expression in a class header — the span between `extends`
@@ -1665,62 +1772,7 @@ function collectReferencedNames(transpiler: any, source: string): Set<string> {
   } catch {
     return new Set();
   }
-  const refs = new Set<string>();
-  const bound = new Set<string>();
-  // Collect the names a binding pattern introduces (params / declarators),
-  // including destructuring: `{a, b: c}`, `[x, ...rest]`, `a = 1`.
-  const bindNames = (node: any): void => {
-    if (!node || typeof node !== "object") return;
-    switch (node.type) {
-      case "Identifier":
-        bound.add(node.name);
-        break;
-      case "AssignmentPattern":
-        bindNames(node.left);
-        break;
-      case "ArrayPattern":
-        for (const el of node.elements || []) bindNames(el);
-        break;
-      case "ObjectPattern":
-        for (const p of node.properties || []) bindNames(p.value);
-        break;
-    }
-  };
-  (function walk(n: any): void {
-    if ($isJSArray(n)) {
-      for (const x of n) walk(x);
-      return;
-    }
-    if (!n || typeof n !== "object" || typeof n.type !== "string") return;
-    if (n.type === "Identifier") {
-      refs.add(n.name);
-      return;
-    }
-    if (n.type === "MemberExpression") {
-      // `obj.prop` references `obj`, not `prop` (a property name). Only a
-      // computed `obj[expr]` references the property expression.
-      walk(n.object);
-      if (n.computed) walk(n.property);
-      return;
-    }
-    if (
-      n.type === "FunctionDeclaration" ||
-      n.type === "FunctionExpression" ||
-      n.type === "ArrowFunctionExpression" ||
-      n.type === "ClassDeclaration" ||
-      n.type === "ClassExpression"
-    ) {
-      if (n.id) bound.add(n.id.name);
-      for (const p of n.params || []) bindNames(p);
-    }
-    if (n.type === "VariableDeclarator") bindNames(n.id);
-    for (const k in n) {
-      if (k === "type" || k === "start") continue;
-      walk(n[k]);
-    }
-  })(ast);
-  for (const b of bound) refs.delete(b);
-  return refs;
+  return freeIdentifiersOfNode(ast);
 }
 
 // **Experimental.** Like `serialize`, but routes the closure through Bun's
