@@ -396,3 +396,59 @@ test("source map remaps a thrown error to the original file", async () => {
   expect(caught?.message).toBe("kaboom");
   expect(caught?.stack).toContain("closure.test");
 });
+
+test("reconstructs an object getter (preserves dynamic behavior)", async () => {
+  let o = {
+    _x: 5,
+    get x() {
+      return this._x * 2;
+    },
+  };
+  void o;
+  const fn = await roundtrip(() => o);
+  const out = fn();
+  expect(out.x).toBe(10);
+  out._x = 100;
+  expect(out.x).toBe(200); // getter is live, not a frozen value
+});
+
+test("reconstructs a getter/setter pair", async () => {
+  let store = { _v: 0 } as any;
+  let o = {
+    get v() {
+      return store._v;
+    },
+    set v(n: number) {
+      store._v = n;
+    },
+  };
+  void [store, o];
+  const fn = await roundtrip(() => o);
+  const out = fn();
+  out.v = 42;
+  expect(out.v).toBe(42);
+});
+
+test("preserves non-enumerable data properties", async () => {
+  let o = {};
+  Object.defineProperty(o, "hidden", { value: 7, enumerable: false, writable: true, configurable: true });
+  void o;
+  const fn = await roundtrip(() => o);
+  const out = fn();
+  expect(out.hidden).toBe(7);
+  expect(Object.keys(out)).toEqual([]);
+});
+
+test("preserves a registered-symbol-keyed property", async () => {
+  const key = Symbol.for("bun.closure.test.key");
+  let o = { [key]: "value" };
+  void o;
+  const fn = await roundtrip(() => o);
+  expect(fn()[key]).toBe("value");
+});
+
+test("throws on a unique-symbol-keyed property", () => {
+  let o = { [Symbol("unique")]: 1 };
+  void o;
+  expect(() => serialize(() => o)).toThrow("unique symbol property key");
+});

@@ -240,8 +240,15 @@ function analyzeSharedCells(root: Function): { sharedIds: Set<number>; cellInfo:
     seenObjs.add(o);
     if (Array.isArray(o)) {
       for (const el of o) visitValue(el);
-    } else {
-      for (const key of Object.keys(o)) visitValue((o as any)[key]);
+      return;
+    }
+    // Walk own properties via descriptors so getters aren't invoked here (their
+    // values are reconstructed lazily, not eagerly).
+    for (const key of Reflect.ownKeys(o)) {
+      const descriptor = Object.getOwnPropertyDescriptor(o, key)!;
+      if (descriptor.get) visitValue(descriptor.get);
+      if (descriptor.set) visitValue(descriptor.set);
+      if ("value" in descriptor) visitValue(descriptor.value);
     }
   }
   function visitFn(fn: Function): void {
@@ -372,15 +379,72 @@ function emitObject(value: object, ctx: Context): string {
     }
   } else {
     ctx.module.push(`const ${name} = {};`);
-    for (const key of Object.keys(value)) {
-      const child = transform(value, key, (value as any)[key], ctx);
-      // An object property transformed to `undefined` is omitted (JSON-like).
-      if (child === undefined) continue;
-      ctx.module.push(`${name}[${JSON.stringify(key)}] = ${emitValue(child, ctx)};`);
-    }
+    emitOwnProperties(name, value, ctx);
   }
 
   return name;
+}
+
+// Emits each own property of `value` onto the hoisted `name`, preserving
+// accessor (get/set) properties, non-enumerable/non-writable flags, and
+// symbol keys. Plain enumerable writable data properties use a simple
+// assignment; everything else uses Object.defineProperty.
+function emitOwnProperties(name: string, value: object, ctx: Context): void {
+  for (const key of Reflect.ownKeys(value)) {
+    const keyExpr = propertyKeyExpression(key);
+    const descriptor = Object.getOwnPropertyDescriptor(value, key)!;
+
+    if (descriptor.get !== undefined || descriptor.set !== undefined) {
+      const parts: string[] = [];
+      if (descriptor.get) parts.push(`get: ${emitValue(descriptor.get, ctx)}`);
+      if (descriptor.set) parts.push(`set: ${emitValue(descriptor.set, ctx)}`);
+      parts.push(`enumerable: ${descriptor.enumerable}`, `configurable: ${descriptor.configurable}`);
+      ctx.module.push(`Object.defineProperty(${name}, ${keyExpr}, { ${parts.join(", ")} });`);
+      continue;
+    }
+
+    const keyName = typeof key === "string" ? key : key.toString();
+    const child = transform(value, keyName, descriptor.value, ctx);
+    // A replacer that returns undefined omits enumerable string data properties
+    // (JSON-like); other shapes keep the value.
+    if (child === undefined && typeof key === "string" && descriptor.enumerable) continue;
+
+    if (typeof key === "string" && descriptor.enumerable && descriptor.writable && descriptor.configurable) {
+      ctx.module.push(`${name}[${keyExpr}] = ${emitValue(child, ctx)};`);
+    } else {
+      ctx.module.push(
+        `Object.defineProperty(${name}, ${keyExpr}, { value: ${emitValue(child, ctx)}, writable: ${descriptor.writable}, enumerable: ${descriptor.enumerable}, configurable: ${descriptor.configurable} });`,
+      );
+    }
+  }
+}
+
+// Maps each well-known symbol to its global expression, so symbol-keyed
+// properties survive serialization.
+const WELL_KNOWN_SYMBOLS: Array<[symbol, string]> = [
+  [Symbol.iterator, "Symbol.iterator"],
+  [Symbol.asyncIterator, "Symbol.asyncIterator"],
+  [Symbol.hasInstance, "Symbol.hasInstance"],
+  [Symbol.isConcatSpreadable, "Symbol.isConcatSpreadable"],
+  [Symbol.match, "Symbol.match"],
+  [Symbol.matchAll, "Symbol.matchAll"],
+  [Symbol.replace, "Symbol.replace"],
+  [Symbol.search, "Symbol.search"],
+  [Symbol.species, "Symbol.species"],
+  [Symbol.split, "Symbol.split"],
+  [Symbol.toPrimitive, "Symbol.toPrimitive"],
+  [Symbol.toStringTag, "Symbol.toStringTag"],
+  [Symbol.unscopables, "Symbol.unscopables"],
+];
+
+function propertyKeyExpression(key: string | symbol): string {
+  if (typeof key === "string") return JSON.stringify(key);
+  const registered = Symbol.keyFor(key);
+  if (registered !== undefined) return `Symbol.for(${JSON.stringify(registered)})`;
+  for (const entry of WELL_KNOWN_SYMBOLS) {
+    if (entry[0] === key) return entry[1];
+  }
+  throw new TypeError(`Cannot serialize a unique symbol property key (${key.toString()})`);
 }
 
 const ERROR_TYPES = new Set([
@@ -533,6 +597,12 @@ function functionSourceToExpression(source: string, name: string): string {
   // Arrow: `(...) =>`, `x =>`, optionally async.
   if (/^(async\s+)?(\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>/.test(trimmed)) {
     return `(${source})`;
+  }
+  // Accessor source from a property descriptor: `get v() {...}` / `set v(n) {...}`
+  // (note the space — `get(...)` with no space is a method named "get"). Convert
+  // to a plain function expression; the accessor name is irrelevant.
+  if (/^(get|set)\s/.test(trimmed)) {
+    return `(${trimmed.replace(/^(get|set)\s+[^(]*/, "function ")})`;
   }
   return `({ ${source} })[${JSON.stringify(name)}]`;
 }
