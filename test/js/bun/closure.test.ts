@@ -2741,3 +2741,220 @@ describe("optimality (radical)", () => {
     expect({ stderr, exitCode }).toEqual({ stderr: expect.any(String), exitCode: 0 });
   });
 });
+
+// ===========================================================================
+// FRONTIER COVERAGE — value types beyond the basics, and their interactions
+// with circular refs, shared identity, classes, and pruning.
+// ===========================================================================
+describe("frontier: buffers & views", () => {
+  test("captured ArrayBuffer round-trips its bytes", async () => {
+    const buf = new ArrayBuffer(8);
+    new Uint8Array(buf).set([1, 2, 3, 4, 5, 6, 7, 8]);
+    void buf;
+    const out = (await roundtrip(() => buf))();
+    expect(out).toBeInstanceOf(ArrayBuffer);
+    expect([...new Uint8Array(out)]).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+  });
+
+  test("Float64Array and BigInt64Array round-trip", async () => {
+    const f = new Float64Array([1.5, -2.25, 3.125]);
+    const b = new BigInt64Array([1n, -2n, 9007199254740993n]);
+    void [f, b];
+    const out = (await roundtrip(() => ({ f, b })))();
+    expect([...out.f]).toEqual([1.5, -2.25, 3.125]);
+    expect([...out.b]).toEqual([1n, -2n, 9007199254740993n]);
+  });
+
+  test("DataView over a buffer round-trips and reads correct values", async () => {
+    const buf = new ArrayBuffer(8);
+    const dv = new DataView(buf);
+    dv.setFloat64(0, 3.14159);
+    void dv;
+    const out = (await roundtrip(() => dv))();
+    expect(out).toBeInstanceOf(DataView);
+    expect(out.getFloat64(0)).toBeCloseTo(3.14159);
+  });
+
+  // INTERACTION: two views over ONE ArrayBuffer must stay aliased.
+  test("two typed-array views over one ArrayBuffer keep a shared buffer", async () => {
+    const buf = new ArrayBuffer(8);
+    const a = new Uint8Array(buf);
+    const b = new Uint8Array(buf);
+    a.set([9, 9, 9, 9, 9, 9, 9, 9]);
+    void [a, b];
+    const out = (await roundtrip(() => ({ a, b })))();
+    expect(out.a.buffer).toBe(out.b.buffer); // shared identity preserved
+    out.a[0] = 42;
+    expect(out.b[0]).toBe(42); // write through a is visible via b
+  });
+
+  // INTERACTION: a typed-array sub-view (byteOffset + length) over a buffer.
+  test("a typed-array view with a byteOffset round-trips against its buffer", async () => {
+    const buf = new ArrayBuffer(16);
+    new Uint8Array(buf).set([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+    const mid = new Uint8Array(buf, 4, 4); // [4,5,6,7]
+    void mid;
+    const out = (await roundtrip(() => mid))();
+    expect([...out]).toEqual([4, 5, 6, 7]);
+    expect(out.byteOffset).toBe(4);
+  });
+});
+
+describe("frontier: errors", () => {
+  test("Error with a cause round-trips the cause", async () => {
+    const inner = new RangeError("inner");
+    const err = new Error("outer", { cause: inner });
+    void err;
+    const out = (await roundtrip(() => err))();
+    expect(out.message).toBe("outer");
+    expect(out.cause).toBeInstanceOf(RangeError);
+    expect((out.cause as Error).message).toBe("inner");
+  });
+
+  test("AggregateError preserves its errors array", async () => {
+    const agg = new AggregateError([new Error("a"), new TypeError("b")], "many");
+    void agg;
+    const out = (await roundtrip(() => agg))();
+    expect(out.message).toBe("many");
+    expect(out.errors.map((e: Error) => e.message)).toEqual(["a", "b"]);
+  });
+
+  test("a user Error subclass keeps its prototype and own fields", async () => {
+    class HttpError extends Error {
+      status: number;
+      constructor(status: number, msg: string) {
+        super(msg);
+        this.name = "HttpError";
+        this.status = status;
+      }
+    }
+    const err = new HttpError(404, "not found");
+    void err;
+    const out = (await roundtrip(() => err))();
+    expect(out.message).toBe("not found");
+    expect(out.status).toBe(404);
+    expect(out.name).toBe("HttpError");
+  });
+
+  test("Error with extra own properties round-trips them", async () => {
+    const err = new Error("x") as Error & { code: string };
+    err.code = "ECODE";
+    void err;
+    const out = (await roundtrip(() => err))() as Error & { code: string };
+    expect(out.code).toBe("ECODE");
+  });
+
+  // INTERACTION: circular cause chain.
+  test("a circular Error cause chain round-trips", async () => {
+    const err = new Error("self") as Error & { cause?: unknown };
+    err.cause = err;
+    void err;
+    const out = (await roundtrip(() => err))() as Error & { cause?: unknown };
+    expect(out.cause).toBe(out);
+  });
+});
+
+describe("frontier: boxed primitives & coercion", () => {
+  test("boxed Number/String/Boolean round-trip as objects", async () => {
+    const n = new Number(42);
+    const s = new String("hi");
+    const b = new Boolean(true);
+    void [n, s, b];
+    const out = (await roundtrip(() => ({ n, s, b })))();
+    expect(typeof out.n).toBe("object");
+    expect(out.n.valueOf()).toBe(42);
+    expect(out.s.valueOf()).toBe("hi");
+    expect(out.b.valueOf()).toBe(true);
+  });
+
+  test("object with Symbol.toPrimitive coerces correctly after round-trip", async () => {
+    const money = {
+      amount: 5,
+      [Symbol.toPrimitive](hint: string) {
+        return hint === "string" ? `$${this.amount}` : this.amount;
+      },
+    };
+    void money;
+    const out = (await roundtrip(() => money))();
+    expect(+out).toBe(5);
+    expect(`${out}`).toBe("$5");
+  });
+});
+
+describe("frontier: frozen & sealed", () => {
+  test("Object.freeze is preserved", async () => {
+    const o = Object.freeze({ a: 1, b: 2 });
+    void o;
+    const out = (await roundtrip(() => o))();
+    expect(Object.isFrozen(out)).toBe(true);
+    expect(out).toEqual({ a: 1, b: 2 });
+  });
+
+  test("Object.seal is preserved", async () => {
+    const o = Object.seal({ a: 1 });
+    void o;
+    const out = (await roundtrip(() => o))();
+    expect(Object.isSealed(out)).toBe(true);
+  });
+
+  // INTERACTION: frozen + circular.
+  test("a frozen circular object round-trips and stays frozen", async () => {
+    const o: any = Object.freeze(Object.assign(Object.create(null), { v: 1 }));
+    // freeze after wiring the cycle isn't possible if frozen; use a frozen graph
+    const a: any = { v: 1 };
+    const b: any = { v: 2, peer: a };
+    a.peer = b;
+    Object.freeze(a);
+    Object.freeze(b);
+    void [a, o];
+    const out = (await roundtrip(() => a))();
+    expect(Object.isFrozen(out)).toBe(true);
+    expect(out.peer.peer).toBe(out);
+  });
+
+  // INTERACTION: frozen class instance.
+  test("a frozen class instance round-trips frozen with working methods", async () => {
+    class P {
+      constructor(public x: number) {}
+      get() {
+        return this.x;
+      }
+    }
+    const p = Object.freeze(new P(7));
+    void p;
+    const out = (await roundtrip(() => p))();
+    expect(Object.isFrozen(out)).toBe(true);
+    expect(out.get()).toBe(7);
+  });
+});
+
+describe("frontier: collection key identity & guards", () => {
+  // INTERACTION: a Map object-key is also captured elsewhere → identity shared.
+  test("a Map object key shared with another capture keeps identity", async () => {
+    const key = { id: 1 };
+    const m = new Map<object, string>([[key, "v"]]);
+    void [key, m];
+    const out = (await roundtrip(() => ({ key, m })))();
+    expect(out.m.get(out.key)).toBe("v"); // same key object identity
+  });
+
+  test("a Set of objects preserves element identity for membership", async () => {
+    const x = { n: 1 };
+    const s = new Set([x]);
+    void [x, s];
+    const out = (await roundtrip(() => ({ x, s })))();
+    expect(out.s.has(out.x)).toBe(true);
+  });
+
+  test("WeakRef throws a clear error", () => {
+    const r = new WeakRef({ a: 1 });
+    void r;
+    expect(() => serialize(() => r)).toThrow(/WeakRef/i);
+  });
+
+  test("FinalizationRegistry throws a clear error", () => {
+    const reg = new FinalizationRegistry(() => {});
+    void reg;
+    expect(() => serialize(() => reg)).toThrow(/FinalizationRegistry/i);
+  });
+});

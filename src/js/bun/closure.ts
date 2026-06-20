@@ -917,6 +917,12 @@ function emitObject(value: object, ctx: Context): string {
   if (value instanceof Promise) {
     throw new TypeError("Cannot serialize a Promise");
   }
+  if (value instanceof WeakRef) {
+    throw new TypeError("Cannot serialize a WeakRef (its referent's liveness is not reproducible)");
+  }
+  if (typeof FinalizationRegistry !== "undefined" && value instanceof FinalizationRegistry) {
+    throw new TypeError("Cannot serialize a FinalizationRegistry (its registrations are not reproducible)");
+  }
   // Generator / async-generator objects and built-in iterator objects hold
   // suspended execution state (the yield point and local frame) in engine slots
   // that aren't reachable via reflection and can't be expressed as source.
@@ -965,10 +971,20 @@ function emitObject(value: object, ctx: Context): string {
       if (child === undefined) continue;
       ctx.module.push(`${name}[${JSON.stringify(key)}] = ${emitValue(child, ctx)};`);
     }
+  } else if (value instanceof Error) {
+    emitErrorBody(value, name, ctx);
   } else {
     ctx.module.push(`const ${name} = ${objectBaseExpression(value, ctx)};`);
     emitOwnProperties(name, value, ctx);
     emitPrivateFields(name, value, ctx);
+  }
+
+  // Preserve a non-extensible/sealed/frozen state — applied LAST, after every
+  // property (and any cycle) is wired, since a frozen object rejects mutation.
+  if (!Object.isExtensible(value)) {
+    if (Object.isFrozen(value)) ctx.module.push(`Object.freeze(${name});`);
+    else if (Object.isSealed(value)) ctx.module.push(`Object.seal(${name});`);
+    else ctx.module.push(`Object.preventExtensions(${name});`);
   }
 
   return name;
@@ -1007,13 +1023,16 @@ function objectBaseExpression(value: object, ctx: Context): string {
 // accessor (get/set) properties, non-enumerable/non-writable flags, and
 // symbol keys. Plain enumerable writable data properties use a simple
 // assignment; everything else uses Object.defineProperty.
-function emitOwnProperties(name: string, value: object, ctx: Context): void {
+function emitOwnProperties(name: string, value: object, ctx: Context, skip?: Set<string>): void {
   // Access-path pruning: when the closure only reads a known subset of this
   // object's string keys (and never uses it opaquely), `keepSets` holds exactly
   // those keys; emit only them. Symbol keys are never pruned (not statically
   // analyzable). "all" / absent means emit everything.
   const keep = ctx.keepSets.get(value);
   for (const key of Reflect.ownKeys(value)) {
+    if (skip !== undefined && typeof key === "string" && skip.has(key)) {
+      continue;
+    }
     if (keep !== undefined && keep !== "all" && typeof key === "string" && !keep.has(key)) {
       continue;
     }
@@ -1085,17 +1104,6 @@ function propertyKeyExpression(key: string | symbol): string {
   throw new TypeError(`Cannot serialize a unique symbol property key (${key.toString()})`);
 }
 
-const ERROR_TYPES = new Set([
-  "Error",
-  "TypeError",
-  "RangeError",
-  "SyntaxError",
-  "ReferenceError",
-  "EvalError",
-  "URIError",
-  "AggregateError",
-]);
-
 // Reconstructs common built-in object types. Returns true (and appends the
 // construction to ctx.module under `name`) if `value` is a recognized built-in;
 // returns false for plain objects/arrays, which the caller handles.
@@ -1123,28 +1131,93 @@ function emitBuiltin(value: object, name: string, ctx: Context): boolean {
     }
     return true;
   }
-  if (ArrayBuffer.isView(value) && !(value instanceof DataView)) {
-    const view = value as unknown as { length: number; constructor: { name: string }; [i: number]: unknown };
-    const elements: string[] = [];
-    for (let i = 0; i < view.length; i++) {
-      elements.push(emitValue(view[i], ctx));
+  // ArrayBuffer-backed: emit the underlying buffer through the normal value path
+  // (so multiple views over one buffer share it by identity) then build the view
+  // over it, preserving byteOffset/length. DataView and every typed-array kind go
+  // through here.
+  if (ArrayBuffer.isView(value)) {
+    const view = value as ArrayBufferView & { length?: number; constructor: { name: string } };
+    const bufferExpr = emitValue(view.buffer, ctx);
+    if (value instanceof DataView) {
+      ctx.module.push(`const ${name} = new DataView(${bufferExpr}, ${view.byteOffset}, ${view.byteLength});`);
+    } else {
+      ctx.module.push(
+        `const ${name} = new ${view.constructor.name}(${bufferExpr}, ${view.byteOffset}, ${view.length});`,
+      );
     }
-    ctx.module.push(`const ${name} = new ${view.constructor.name}([${elements.join(", ")}]);`);
     return true;
   }
-  if (value instanceof Error) {
-    const err = value as Error;
-    const ctorName = ERROR_TYPES.has((err.constructor && err.constructor.name) as string)
-      ? err.constructor.name
-      : "Error";
-    ctx.module.push(`const ${name} = new ${ctorName}(${JSON.stringify(err.message)});`);
-    if (err.name !== ctorName) {
-      ctx.module.push(`${name}.name = ${JSON.stringify(err.name)};`);
-    }
+  if (
+    value instanceof ArrayBuffer ||
+    (typeof SharedArrayBuffer !== "undefined" && value instanceof SharedArrayBuffer)
+  ) {
+    const ctor = value instanceof ArrayBuffer ? "ArrayBuffer" : "SharedArrayBuffer";
+    const bytes = [...new Uint8Array(value as ArrayBufferLike)];
+    ctx.module.push(`const ${name} = new ${ctor}(${(value as ArrayBufferLike).byteLength});`);
+    if (bytes.some(b => b !== 0)) ctx.module.push(`new Uint8Array(${name}).set([${bytes.join(", ")}]);`);
+    return true;
+  }
+  // Boxed primitives (new Number/String/Boolean) — objects wrapping a primitive.
+  if (value instanceof Number) {
+    ctx.module.push(`const ${name} = new Number(${serializeNumber((value as Number).valueOf())});`);
+    return true;
+  }
+  if (value instanceof String) {
+    ctx.module.push(`const ${name} = new String(${JSON.stringify((value as String).valueOf())});`);
+    return true;
+  }
+  if (value instanceof Boolean) {
+    ctx.module.push(`const ${name} = new Boolean(${(value as Boolean).valueOf()});`);
     return true;
   }
   return false;
 }
+
+// Known builtin Error constructors, in priority order (most specific first).
+const ERROR_BASES = [
+  "AggregateError",
+  "EvalError",
+  "RangeError",
+  "ReferenceError",
+  "SyntaxError",
+  "TypeError",
+  "URIError",
+  "Error",
+];
+
+// The nearest builtin Error constructor name in `value`'s prototype chain, so a
+// subclass instance is recreated from the right base (and its own prototype is
+// restored separately).
+function builtinErrorBase(value: object): string {
+  for (let p: object | null = value; p; p = Object.getPrototypeOf(p)) {
+    const ctor = (p as any).constructor;
+    if (typeof ctor === "function" && ERROR_BASES.includes(ctor.name) && (globalThis as any)[ctor.name] === ctor) {
+      return ctor.name;
+    }
+  }
+  return "Error";
+}
+
+// Reconstructs an Error: create the right builtin base (with [[ErrorData]]),
+// then restore every own property — `message`, `cause` (incl. circular), an
+// AggregateError's `errors`, and any custom fields (`code`, `status`, ...) —
+// and, for a subclass, its prototype. `stack` is intentionally not pinned to the
+// original location.
+function emitErrorBody(value: Error, name: string, ctx: Context): void {
+  const base = builtinErrorBase(value);
+  if (base === "AggregateError") {
+    ctx.module.push(`const ${name} = new AggregateError([], ${JSON.stringify(value.message)});`);
+  } else {
+    ctx.module.push(`const ${name} = new ${base}(${JSON.stringify(value.message)});`);
+  }
+  emitOwnProperties(name, value, ctx, ERROR_SKIP_KEYS);
+  const proto = Object.getPrototypeOf(value);
+  if (proto !== (globalThis as any)[base].prototype) {
+    ctx.module.push(`Object.setPrototypeOf(${name}, ${emitValue(proto, ctx)});`);
+  }
+}
+
+const ERROR_SKIP_KEYS = new Set(["stack"]);
 
 // Reconstructs a Proxy as `new Proxy(target, handler)`. Both the target and the
 // handler (whose traps are themselves serialized functions) recurse through the
@@ -1190,6 +1263,15 @@ function emitFunction(fn: Function, ctx: Context): string {
     const argExprs = bound.boundArgs.map(arg => emitValue(arg, ctx));
     const tail = argExprs.length ? `, ${argExprs.join(", ")}` : "";
     ctx.module.push(`const ${name} = ${targetExpr}.bind(${thisExpr}${tail});`);
+    return name;
+  }
+
+  // A global built-in (Error, Map, Array, EventTarget, ...) has no JS source but
+  // a stable global identity — reference it by name rather than trying (and
+  // failing) to reconstruct it. This is what lets `class X extends Error` and
+  // captured built-in constructors work.
+  if (isNativeFunctionSource(fn.toString()) && fn.name && (globalThis as any)[fn.name] === fn) {
+    ctx.module.push(`const ${name} = ${fn.name};`);
     return name;
   }
 
