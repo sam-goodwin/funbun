@@ -1,17 +1,23 @@
 // bun:closure — experimental closure serialization.
 //
 // `serialize(fn)` returns the source of an ES module whose `export default` is a
-// reconstruction of `fn`. Built incrementally:
+// reconstruction of `fn`, including the state it captures.
 //
-//   Step 1: functions with no free variables.
-//   Step 2: reconstruct captured PRIMITIVE free variables.
-//   Step 3: reference graph — objects/arrays, hoisted + deduplicated, cycles.
-//   Step 4a: nested functions, each reconstructed inside an isolated IIFE.
-//   Step 4b: shared mutable cells hoisted once at module scope by id.
-//   Step 5 (this): a JSON.stringify-style `replacer(key, value)` applied to
-//   every captured free-variable value, object property, and array element
-//   before it is serialized. An object property transformed to `undefined` is
-//   omitted (as in JSON.stringify).
+// Handles: captured primitives; objects/arrays with cycles and shared
+// references (deduped by identity); nested functions; shared mutable cells
+// across closures (hoisted once, by Symbol.freeVariables id); a JSON.stringify
+// `replacer(key, value)`; built-ins (Date/RegExp/Map/Set/typed arrays/Error);
+// Proxies and bound functions; property descriptors (getters/setters,
+// non-enumerable, registered/well-known symbol keys); prototypes (class
+// instances via Object.create(Class.prototype), null-proto objects); and class
+// values incl. statics, method-level captures, and `extends` inheritance. An
+// inline source map points stack traces back at the original source.
+//
+// Known limitations: `#private` fields/methods are invisible to reflection and
+// are not captured (and the constructor is not re-run on a reconstructed
+// instance); decorators are not part of `Function.prototype.toString()` and so
+// are not preserved; unique (non-registered) symbol values/keys and native
+// functions throw a clear error.
 
 type Replacer = (key: string, value: unknown) => unknown;
 
