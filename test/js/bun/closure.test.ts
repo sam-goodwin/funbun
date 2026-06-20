@@ -1005,3 +1005,73 @@ describe("more closure topologies", () => {
     await expect(collect()).resolves.toEqual([1, 2]);
   });
 });
+
+describe("access-path pruning", () => {
+  // Only the members the closure actually references should be serialized.
+  test("prunes unreferenced properties of a captured object", async () => {
+    const foo = { method: () => 42, unusedBig: "DO_NOT_SERIALIZE", alsoUnused: { deep: [1, 2, 3] } };
+    const code = serialize(() => foo.method());
+    expect(code).not.toContain("DO_NOT_SERIALIZE");
+    expect(code).not.toContain("alsoUnused");
+    const fn = await roundtrip(() => foo.method());
+    expect(fn()).toBe(42);
+  });
+
+  test("follows `this` into invoked methods (keeps what the method reads)", async () => {
+    const foo = {
+      compute() {
+        return this.config.x;
+      },
+      config: { x: 7, unusedField: 99 },
+      unusedTop: "NOPE",
+    };
+    const code = serialize(() => foo.compute());
+    expect(code).not.toContain("NOPE");
+    expect(code).not.toContain("unusedField");
+    const fn = await roundtrip(() => foo.compute());
+    expect(fn()).toBe(7);
+  });
+
+  test("keeps a nested access path and nothing else", async () => {
+    const foo = { a: { b: 5, bUnused: 6 }, aUnused: { z: 9 } };
+    const code = serialize(() => foo.a.b);
+    expect(code).not.toContain("bUnused");
+    expect(code).not.toContain("aUnused");
+    const fn = await roundtrip(() => foo.a.b);
+    expect(fn()).toBe(5);
+  });
+
+  test("keeps the whole object when it escapes (passed opaquely)", async () => {
+    const foo = { a: 1, b: 2 };
+    const sink = (o: object) => JSON.stringify(o);
+    const fn = await roundtrip(() => sink(foo));
+    expect(fn()).toBe(`{"a":1,"b":2}`);
+  });
+
+  test("keeps the whole object on computed access", async () => {
+    const key = "a";
+    const foo = { a: 11, b: 22 };
+    const fn = await roundtrip(() => foo[key as "a"]);
+    expect(fn()).toBe(11);
+  });
+
+  test("unions the members referenced across multiple closures sharing an object", async () => {
+    const shared = { x: 1, y: 2, z: 3 };
+    const read = () => shared.x + shared.y;
+    const code = serialize(read);
+    // x and y are used; z is not.
+    expect(code).not.toContain('"z"');
+    const fn = await roundtrip(read);
+    expect(fn()).toBe(3);
+  });
+
+  test("keeps everything reachable from an escaped object (cycle-safe)", async () => {
+    const inner: any = { tag: "leaf" };
+    const graph: any = { inner, note: "kept-because-graph-escapes" };
+    inner.parent = graph;
+    const fn = await roundtrip(() => graph);
+    const out = fn();
+    expect(out.note).toBe("kept-because-graph-escapes");
+    expect(out.inner.parent).toBe(out);
+  });
+});

@@ -51,6 +51,10 @@ interface Context {
   // verbatim source lands. `moduleIndex` indexes into `module` (or -1 for the
   // default-export expression).
   sourceBlocks: SourceBlock[];
+  // Per captured object value, which own string keys to serialize: a Set of the
+  // keys actually referenced by the closure (access-path pruning), or "all" /
+  // absent to serialize every key. See computeKeepSets.
+  keepSets: Map<object, Set<string> | "all">;
 }
 
 interface SourceBlock {
@@ -74,6 +78,7 @@ function serialize(fn: Function, replacer?: Replacer): string {
     sharedIds,
     replacer: typeof replacer === "function" ? replacer : undefined,
     sourceBlocks: [],
+    keepSets: computeKeepSets(fn),
   };
 
   // Emit shared cells at module scope (deduped by id) before any function that
@@ -323,6 +328,341 @@ function analyzeSharedCells(root: Function): { sharedIds: Set<number>; cellInfo:
   return { sharedIds, cellInfo };
 }
 
+// ── Access-path analysis ────────────────────────────────────────────────────
+// Determine, for each captured object, which of its properties the closure
+// actually references, so only those are serialized. Sound by construction:
+// any usage we can't prove is a clean static property read marks the value as
+// "used wholly" (keep everything), and we never under-serialize.
+
+let cachedTranspiler: any;
+function getTranspiler(): any {
+  return (cachedTranspiler ??= new (globalThis as any).Bun.Transpiler());
+}
+
+interface AccessNode {
+  all: boolean; // value is used in its entirety → keep all of it
+  children: Map<string, AccessNode>; // statically read string-property paths
+  calledMethods: Set<string>; // props invoked as `base.prop(...)` (this is bound to base)
+}
+function newAccessNode(): AccessNode {
+  return { all: false, children: new Map(), calledMethods: new Set() };
+}
+function accessChild(node: AccessNode, prop: string): AccessNode {
+  let c = node.children.get(prop);
+  if (c === undefined) {
+    c = newAccessNode();
+    node.children.set(prop, c);
+  }
+  return c;
+}
+
+// Parse a function's source (in any form `Function.prototype.toString` yields)
+// and return its AST node, or null if it can't be parsed.
+function parseFunctionNode(source: string): any | null {
+  const t = getTranspiler();
+  const tryParse = (code: string): any | null => {
+    let prog: any;
+    try {
+      prog = t.ast(code);
+    } catch {
+      return null;
+    }
+    const body = prog?.body;
+    if (!$isJSArray(body) || body.length === 0) return null;
+    const first = body[0];
+    if (first.type === "FunctionDeclaration" || first.type === "ClassDeclaration") return first;
+    if (first.type === "ExpressionStatement") {
+      const e = first.expression;
+      if (
+        e &&
+        (e.type === "ArrowFunctionExpression" || e.type === "FunctionExpression" || e.type === "ClassExpression")
+      ) {
+        return e;
+      }
+      // method shorthand: `m(){}`, `get x(){}`, `async *m(){}`, `[sym](){}`
+      if (e && e.type === "ObjectExpression" && e.properties?.length) {
+        const p = e.properties[0];
+        if (p && p.value) return p.value;
+      }
+    }
+    return null;
+  };
+  return tryParse("(" + source + ")") ?? tryParse(source) ?? tryParse("({" + source + "})");
+}
+
+// Walk a function AST and record how each `rootNames` identifier (free variable
+// names, or "this") is used. Returns name → AccessNode.
+function analyzeAccess(fnNode: any, rootNames: Set<string>): Map<string, AccessNode> {
+  const table = new Map<string, AccessNode>();
+  const get = (name: string): AccessNode => {
+    let n = table.get(name);
+    if (n === undefined) {
+      n = newAccessNode();
+      table.set(name, n);
+    }
+    return n;
+  };
+
+  // If `node` is a member chain rooted at a tracked name, return the AccessNode
+  // for that path (creating it); computed/dynamic access marks the base whole.
+  function accessOf(node: any): AccessNode | null {
+    if (!node || typeof node !== "object") return null;
+    if (node.type === "Identifier") return rootNames.has(node.name) ? get(node.name) : null;
+    if (node.type === "ThisExpression") return rootNames.has("this") ? get("this") : null;
+    if (node.type === "MemberExpression") {
+      const base = accessOf(node.object);
+      if (base === null) return null;
+      if (node.computed) {
+        base.all = true; // `base[expr]` defeats static pruning of base
+        walk(node.property);
+        return null;
+      }
+      const prop = node.property?.name;
+      if (typeof prop !== "string") {
+        base.all = true;
+        return null;
+      }
+      return accessChild(base, prop);
+    }
+    return null;
+  }
+
+  function walk(node: any): void {
+    if ($isJSArray(node)) {
+      for (const n of node) walk(n);
+      return;
+    }
+    if (!node || typeof node !== "object" || typeof node.type !== "string") return;
+    switch (node.type) {
+      case "Identifier":
+        if (rootNames.has(node.name)) get(node.name).all = true; // bare reference escapes
+        return;
+      case "ThisExpression":
+        if (rootNames.has("this")) get("this").all = true;
+        return;
+      case "MemberExpression": {
+        const a = accessOf(node);
+        if (a !== null) {
+          a.all = true; // a rooted read used here as a whole value
+          return;
+        }
+        walk(node.object);
+        if (node.computed) walk(node.property);
+        return;
+      }
+      case "CallExpression": {
+        const callee = node.callee;
+        if (callee && callee.type === "MemberExpression" && !callee.computed) {
+          const base = accessOf(callee.object);
+          const method = callee.property?.name;
+          if (base !== null && typeof method === "string") {
+            accessChild(base, method); // keep the method property
+            base.calledMethods.add(method); // and follow its `this`
+            walk(node.arguments);
+            return;
+          }
+        }
+        walk(callee);
+        walk(node.arguments);
+        return;
+      }
+      default:
+        for (const key in node) {
+          if (key === "type" || key === "start") continue;
+          walk(node[key]);
+        }
+        return;
+    }
+  }
+
+  walk(fnNode.params);
+  walk(fnNode.body);
+  return table;
+}
+
+// Own-or-prototype descriptor for a string key, without invoking getters.
+function lookupDescriptor(obj: object, key: string): PropertyDescriptor | undefined {
+  let o: object | null = obj;
+  while (o !== null) {
+    const d = Object.getOwnPropertyDescriptor(o, key);
+    if (d !== undefined) return d;
+    o = Object.getPrototypeOf(o);
+  }
+  return undefined;
+}
+
+// Build the per-value keep-sets: for each captured object, the set of own string
+// keys to serialize (or "all"). Walks every reachable function, analyzes its
+// access paths, and follows `this` into invoked methods so their reads are kept.
+function computeKeepSets(root: Function): Map<object, Set<string> | "all"> {
+  const keepSets = new Map<object, Set<string> | "all">();
+  const seenFns = new Set<Function>();
+  const seenObjs = new Set<object>();
+  const followed = new Map<object, Set<string>>(); // receiver → methods already this-followed
+
+  // Mark a value — and everything reachable through its object graph — as
+  // serialized whole. Keep-all must propagate: if an object escapes, every
+  // object it transitively contains is emitted in full too, overriding any
+  // narrower keep-set a closure's access analysis may have assigned. Functions
+  // are not traversed here — their captured free variables are pruned by their
+  // own analysis (the function body only uses what it uses).
+  function keepAll(value: object): void {
+    const stack: object[] = [value];
+    while (stack.length) {
+      const o = stack.pop()!;
+      if (o === null || typeof o !== "object") continue;
+      if (keepSets.get(o) === "all") continue;
+      keepSets.set(o, "all");
+      if ($isProxyObject(o)) continue; // emitted via emitProxy, not keep-sets
+      if ($isJSArray(o)) {
+        for (const el of o as unknown[]) {
+          if (el !== null && typeof el === "object") stack.push(el as object);
+        }
+        continue;
+      }
+      for (const key of Reflect.ownKeys(o)) {
+        const d = Object.getOwnPropertyDescriptor(o, key)!;
+        if ("value" in d && d.value !== null && typeof d.value === "object") stack.push(d.value);
+      }
+    }
+  }
+
+  // Apply an access node to a value: union its kept keys, recurse into children,
+  // and this-follow invoked methods. `node === undefined` means "used wholly".
+  function apply(value: unknown, node: AccessNode | undefined): void {
+    if (value === null || (typeof value !== "object" && typeof value !== "function")) return;
+    if (typeof value === "function") return; // functions are serialized whole
+    const obj = value as object;
+    if (node === undefined || node.all) {
+      keepAll(obj);
+      return;
+    }
+    if (keepSets.get(obj) === "all") return;
+    let cur = keepSets.get(obj) as Set<string> | undefined;
+    if (cur === undefined) {
+      cur = new Set();
+      keepSets.set(obj, cur);
+    }
+    for (const [prop, childNode] of node.children) {
+      cur.add(prop);
+      const d = lookupDescriptor(obj, prop);
+      if (d !== undefined && "value" in d) apply(d.value, childNode);
+      // accessor/missing props: kept (added above) but not recursed into.
+    }
+    for (const method of node.calledMethods) thisFollow(obj, method);
+  }
+
+  // A method `obj.m(...)` runs with `this === obj`; fold the method body's
+  // `this.X` reads into `obj`'s keep-set so reconstruction stays correct.
+  function thisFollow(obj: object, method: string): void {
+    let done = followed.get(obj);
+    if (done === undefined) {
+      done = new Set();
+      followed.set(obj, done);
+    }
+    if (done.has(method)) return;
+    done.add(method);
+
+    if (keepSets.get(obj) === "all") return;
+    const d = lookupDescriptor(obj, method);
+    if (d === undefined || !("value" in d)) {
+      // accessor-valued or missing method: can't safely inspect → keep all.
+      keepAll(obj);
+      return;
+    }
+    const fn = d.value;
+    if (typeof fn !== "function") return;
+    let source: string;
+    try {
+      source = fn.toString();
+    } catch {
+      keepAll(obj);
+      return;
+    }
+    const fnNode = parseFunctionNode(source);
+    if (fnNode === null) {
+      keepAll(obj);
+      return;
+    }
+    const thisNode = analyzeAccess(fnNode, new Set(["this"])).get("this");
+    if (thisNode === undefined) return; // method doesn't touch `this`
+    apply(obj, thisNode); // its `this.X` reads are reads on `obj`
+  }
+
+  function visitValueFns(value: unknown): void {
+    if (value === null) return;
+    const type = typeof value;
+    if (type !== "function" && type !== "object") return;
+    if ($isProxyObject(value)) {
+      const handler = $getProxyInternalField(value, $proxyFieldHandler);
+      if (handler === null) return;
+      visitValueFns($getProxyInternalField(value, $proxyFieldTarget));
+      visitValueFns(handler);
+      return;
+    }
+    if (type === "function") {
+      const bound = (value as any)[Symbol.boundFunction] as BoundDetails | undefined;
+      if (bound !== undefined) {
+        visitValueFns(bound.target);
+        visitValueFns(bound.boundThis);
+        for (const arg of bound.boundArgs) visitValueFns(arg);
+        return;
+      }
+      visitFn(value as Function);
+      return;
+    }
+    const obj = value as object;
+    if (seenObjs.has(obj)) return;
+    seenObjs.add(obj);
+    if ($isJSArray(obj)) {
+      for (const el of obj as unknown[]) visitValueFns(el);
+      return;
+    }
+    for (const key of Reflect.ownKeys(obj)) {
+      const d = Object.getOwnPropertyDescriptor(obj, key)!;
+      if (d.get) visitValueFns(d.get);
+      if (d.set) visitValueFns(d.set);
+      if ("value" in d) visitValueFns(d.value);
+    }
+    const proto = Object.getPrototypeOf(obj);
+    if (proto !== null && proto !== Object.prototype) {
+      const ctor = (proto as any).constructor;
+      visitValueFns(typeof ctor === "function" && ctor.prototype === proto ? ctor : proto);
+    }
+  }
+
+  function visitFn(fn: Function): void {
+    if (seenFns.has(fn)) return;
+    seenFns.add(fn);
+    let source: string;
+    try {
+      source = fn.toString();
+    } catch {
+      return;
+    }
+    const freeVariables = allFreeVariables(fn, source);
+    if (freeVariables.length === 0) return;
+    const rootNames = new Set(freeVariables.map(v => v.name));
+    const fnNode = parseFunctionNode(source);
+    const table = fnNode === null ? null : analyzeAccess(fnNode, rootNames);
+    for (const v of freeVariables) {
+      apply(v.value, table === null ? undefined : table.get(v.name));
+      visitValueFns(v.value);
+    }
+    const superclass = Object.getPrototypeOf(fn);
+    if (typeof superclass === "function" && superclass !== Function.prototype) visitValueFns(superclass);
+  }
+
+  try {
+    visitFn(root);
+  } catch {
+    // Any analysis failure must not break serialization: fall back to emitting
+    // everything (the pre-pruning behaviour) by discarding partial keep-sets.
+    return new Map();
+  }
+  return keepSets;
+}
+
 // Returns the set of functions that can reach themselves through the capture
 // graph (self-loops and longer cycles).
 function findCyclicFunctions(edges: Map<Function, Set<Function>>): Set<Function> {
@@ -565,7 +905,15 @@ function objectBaseExpression(value: object, ctx: Context): string {
 // symbol keys. Plain enumerable writable data properties use a simple
 // assignment; everything else uses Object.defineProperty.
 function emitOwnProperties(name: string, value: object, ctx: Context): void {
+  // Access-path pruning: when the closure only reads a known subset of this
+  // object's string keys (and never uses it opaquely), `keepSets` holds exactly
+  // those keys; emit only them. Symbol keys are never pruned (not statically
+  // analyzable). "all" / absent means emit everything.
+  const keep = ctx.keepSets.get(value);
   for (const key of Reflect.ownKeys(value)) {
+    if (keep !== undefined && keep !== "all" && typeof key === "string" && !keep.has(key)) {
+      continue;
+    }
     const keyExpr = propertyKeyExpression(key);
     const descriptor = Object.getOwnPropertyDescriptor(value, key)!;
 
