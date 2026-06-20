@@ -331,3 +331,34 @@ test("reconstructs a captured object with a method (shorthand)", async () => {
   const fn = await roundtrip(() => o.add(5));
   expect(fn()).toBe(15);
 });
+
+test("reconstructs a bound function (bound args)", async () => {
+  function add(a: number, b: number) {
+    return a + b;
+  }
+  let bound = add.bind(null, 10);
+  void bound;
+  const fn = await roundtrip(() => bound(5));
+  expect(fn()).toBe(15);
+});
+
+test("serializes a bound function as the root", async () => {
+  function mul(a: number, b: number) {
+    return a * b;
+  }
+  const fn = await roundtrip(mul.bind(null, 6));
+  expect(fn(7)).toBe(42);
+});
+
+test("reconstructs a bound method preserving bound this", async () => {
+  let counter = {
+    n: 0,
+    inc() {
+      return ++this.n;
+    },
+  };
+  let bound = counter.inc.bind(counter);
+  void bound;
+  const fn = await roundtrip(() => [bound(), bound()]);
+  expect(fn()).toEqual([1, 2]);
+});

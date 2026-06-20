@@ -59,6 +59,7 @@
 #include "JavaScriptCore/StackVisitor.h"
 #include "JavaScriptCore/VM.h"
 #include "JavaScriptCore/JSFunction.h"
+#include "JavaScriptCore/JSBoundFunction.h"
 #include "JavaScriptCore/JSScope.h"
 #include "JavaScriptCore/SymbolTable.h"
 #include "JavaScriptCore/JSSymbolTableObject.h"
@@ -3093,6 +3094,34 @@ JSC_DEFINE_CUSTOM_GETTER(functionFreeVariablesGetter, (JSC::JSGlobalObject * glo
     RELEASE_AND_RETURN(scope, JSC::JSValue::encode(result));
 }
 
+// ===================== Symbol.boundFunction (experimental) =====================
+// For a bound function (the result of Function.prototype.bind), returns a plain
+// object { target, boundThis, boundArgs } exposing its internals so a serializer
+// can reconstruct `target.bind(boundThis, ...boundArgs)`. Returns undefined for
+// any function that is not a bound function. Bound functions otherwise stringify
+// as "[native code]", hiding what they wrap.
+JSC_DEFINE_CUSTOM_GETTER(functionBoundDetailsGetter, (JSC::JSGlobalObject * globalObject, JSC::EncodedJSValue thisValue, JSC::PropertyName))
+{
+    JSC::VM& vm = JSC::getVM(globalObject);
+    auto scope = DECLARE_THROW_SCOPE(vm);
+
+    JSC::JSBoundFunction* bound = dynamicDowncast<JSC::JSBoundFunction>(JSC::JSValue::decode(thisValue));
+    if (!bound)
+        return JSC::JSValue::encode(JSC::jsUndefined());
+
+    JSC::JSArray* boundArgs = bound->boundArgsCopy(globalObject);
+    RETURN_IF_EXCEPTION(scope, {});
+
+    JSC::JSObject* result = JSC::constructEmptyObject(globalObject);
+    result->putDirect(vm, JSC::Identifier::fromString(vm, "target"_s), bound->targetFunction(), 0);
+    result->putDirect(vm, JSC::Identifier::fromString(vm, "boundThis"_s), bound->boundThis(), 0);
+    result->putDirect(vm, JSC::Identifier::fromString(vm, "boundArgs"_s),
+        boundArgs ? JSC::JSValue(boundArgs) : JSC::JSValue(JSC::constructEmptyArray(globalObject, nullptr)), 0);
+    RETURN_IF_EXCEPTION(scope, {});
+
+    return JSC::JSValue::encode(result);
+}
+
 // This is like `putDirectBuiltinFunction` but for the global static list.
 #define globalBuiltinFunction(vm, globalObject, identifier, function, attributes) JSC::JSGlobalObject::GlobalPropertyInfo(identifier, JSFunction::create(vm, function, globalObject), attributes)
 
@@ -3253,6 +3282,24 @@ void GlobalObject::addBuiltinGlobals(JSC::VM& vm)
         if (JSC::JSObject* symbolConstructor = symbolConstructorValue.getObject()) {
             symbolConstructor->putDirect(vm, JSC::Identifier::fromString(vm, "freeVariables"_s),
                 JSC::Symbol::create(vm, vm.symbolRegistry().symbolForKey(freeVariablesKey)),
+                PropertyAttribute::DontEnum | PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly | 0);
+        }
+    }
+
+    // ----- Symbol.boundFunction (experimental) -----
+    // Exposes a bound function's internals as `fn[Symbol.boundFunction]`.
+    {
+        const auto boundFunctionKey = "Symbol.boundFunction"_s;
+        this->functionPrototype()->putDirectCustomAccessor(vm,
+            JSC::Identifier::fromUid(vm.symbolRegistry().symbolForKey(boundFunctionKey)),
+            JSC::CustomGetterSetter::create(vm, functionBoundDetailsGetter, nullptr),
+            PropertyAttribute::DontEnum | PropertyAttribute::ReadOnly | PropertyAttribute::CustomAccessor | 0);
+
+        JSC::JSValue symbolConstructorValue = this->get(this, JSC::Identifier::fromString(vm, "Symbol"_s));
+        RETURN_IF_EXCEPTION(scope, );
+        if (JSC::JSObject* symbolConstructor = symbolConstructorValue.getObject()) {
+            symbolConstructor->putDirect(vm, JSC::Identifier::fromString(vm, "boundFunction"_s),
+                JSC::Symbol::create(vm, vm.symbolRegistry().symbolForKey(boundFunctionKey)),
                 PropertyAttribute::DontEnum | PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly | 0);
         }
     }

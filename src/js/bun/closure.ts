@@ -67,7 +67,10 @@ function serialize(fn: Function, replacer?: Replacer): string {
     ctx.module.push(`${cell.kind} ${cell.name} = ${emitValue(value, ctx)};`);
   }
 
-  const exportExpr = reconstructFunctionExpr(fn, ctx);
+  // A bound (or already-hoisted) root is emitted via the value path and
+  // exported by reference; otherwise reconstruct it inline.
+  const exportExpr =
+    (fn as any)[Symbol.boundFunction] !== undefined ? emitFunction(fn, ctx) : reconstructFunctionExpr(fn, ctx);
   const prelude = ctx.module.length ? ctx.module.join("\n") + "\n" : "";
   return `${prelude}export default ${exportExpr};\n`;
 }
@@ -92,8 +95,18 @@ function analyzeSharedCells(root: Function): { sharedIds: Set<number>; cellInfo:
       visitValue(handler);
       return;
     }
-    if (type === "function") visitFn(value as Function);
-    else visitObj(value as object);
+    if (type === "function") {
+      const bound = (value as any)[Symbol.boundFunction] as BoundDetails | undefined;
+      if (bound !== undefined) {
+        visitValue(bound.target);
+        visitValue(bound.boundThis);
+        for (const arg of bound.boundArgs) visitValue(arg);
+        return;
+      }
+      visitFn(value as Function);
+    } else {
+      visitObj(value as object);
+    }
   }
   function visitObj(o: object): void {
     if (seenObjs.has(o)) return;
@@ -306,12 +319,31 @@ function emitProxy(value: object, ctx: Context): string {
   return name;
 }
 
+interface BoundDetails {
+  target: Function;
+  boundThis: unknown;
+  boundArgs: unknown[];
+}
+
 function emitFunction(fn: Function, ctx: Context): string {
   const existing = ctx.refs.get(fn);
   if (existing !== undefined) return existing;
 
   const name = REF_PREFIX + ctx.counter++;
   ctx.refs.set(fn, name);
+
+  // Bound functions stringify as native code; reconstruct them from their
+  // internals instead: target.bind(boundThis, ...boundArgs).
+  const bound = (fn as any)[Symbol.boundFunction] as BoundDetails | undefined;
+  if (bound !== undefined) {
+    const targetExpr = emitValue(bound.target, ctx);
+    const thisExpr = emitValue(bound.boundThis, ctx);
+    const argExprs = bound.boundArgs.map(arg => emitValue(arg, ctx));
+    const tail = argExprs.length ? `, ${argExprs.join(", ")}` : "";
+    ctx.module.push(`const ${name} = ${targetExpr}.bind(${thisExpr}${tail});`);
+    return name;
+  }
+
   const expr = reconstructFunctionExpr(fn, ctx);
   ctx.module.push(`const ${name} = ${expr};`);
   return name;
