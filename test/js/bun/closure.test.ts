@@ -1,4 +1,4 @@
-import { test, expect } from "bun:test";
+import { test, expect, describe } from "bun:test";
 import { serialize } from "bun:closure";
 import { tempDir } from "harness";
 
@@ -693,4 +693,62 @@ test("known limitation: a var captured only by a field initializer on a direct c
   void C;
   const Klass = (await roundtrip(() => C))();
   expect(() => new Klass()).toThrow(); // base is not defined
+});
+
+describe("round-tripping a reference to a method (not the containing object)", () => {
+  let obj = {
+    [Symbol.iterator]() {
+      return [10, 20][Symbol.iterator]();
+    },
+    *count() {
+      yield 1;
+      yield 2;
+    },
+    async ping() {
+      return "pong";
+    },
+    plain(x: number) {
+      return x + 1;
+    },
+  };
+
+  test("symbol-keyed method reference", async () => {
+    const iter = await roundtrip(obj[Symbol.iterator]);
+    expect([...{ [Symbol.iterator]: iter }]).toEqual([10, 20]);
+  });
+
+  test("generator method reference", async () => {
+    const count = await roundtrip(obj.count);
+    expect([...count()]).toEqual([1, 2]);
+  });
+
+  test("async method reference", async () => {
+    const ping = await roundtrip(obj.ping);
+    await expect(ping()).resolves.toBe("pong");
+  });
+
+  test("plain method reference", async () => {
+    const plain = await roundtrip(obj.plain);
+    expect(plain(41)).toBe(42);
+  });
+});
+
+test("round-trips an extracted method that captures a free variable", async () => {
+  function make() {
+    let n = 7;
+    return {
+      read() {
+        return n;
+      },
+      bump() {
+        return ++n;
+      },
+    };
+  }
+  const o = make();
+  const read = await roundtrip(o.read);
+  const bump = await roundtrip(o.bump);
+  // Each is extracted independently, so they get independent copies of `n`.
+  expect(read()).toBe(7);
+  expect(bump()).toBe(8);
 });
