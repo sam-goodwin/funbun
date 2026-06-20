@@ -7,11 +7,11 @@
 //   Step 2: reconstruct captured PRIMITIVE free variables.
 //   Step 3: reference graph — objects/arrays, hoisted + deduplicated, cycles.
 //   Step 4a: nested functions, each reconstructed inside an isolated IIFE.
-//   Step 4b (this): shared mutable cells. A captured cell (identified by its
-//   Symbol.freeVariables `id`) referenced by two or more functions is hoisted
-//   once at module scope under its original name, so every reconstructed
-//   function closes over the same binding — mutations stay shared. Cells used by
-//   a single function remain private to its IIFE.
+//   Step 4b: shared mutable cells hoisted once at module scope by id.
+//   Step 5 (this): a JSON.stringify-style `replacer(key, value)` applied to
+//   every captured free-variable value, object property, and array element
+//   before it is serialized. An object property transformed to `undefined` is
+//   omitted (as in JSON.stringify).
 
 type Replacer = (key: string, value: unknown) => unknown;
 
@@ -36,15 +36,22 @@ interface Context {
   // Cell ids (Symbol.freeVariables id) shared by 2+ functions: hoisted to module
   // scope under their original name, skipped in per-function IIFEs.
   sharedIds: Set<number>;
+  replacer: Replacer | undefined;
 }
 
-function serialize(fn: Function, _replacer?: Replacer): string {
+function serialize(fn: Function, replacer?: Replacer): string {
   if (typeof fn !== "function") {
     throw new TypeError("serialize() expects a function");
   }
 
   const { sharedIds, cellInfo } = analyzeSharedCells(fn);
-  const ctx: Context = { module: [], refs: new Map(), counter: 0, sharedIds };
+  const ctx: Context = {
+    module: [],
+    refs: new Map(),
+    counter: 0,
+    sharedIds,
+    replacer: typeof replacer === "function" ? replacer : undefined,
+  };
 
   // Emit shared cells at module scope (deduped by id) before any function that
   // closes over them. Distinct shared cells with the same name can't coexist.
@@ -56,7 +63,8 @@ function serialize(fn: Function, _replacer?: Replacer): string {
       throw new TypeError(`Cannot serialize: two distinct shared variables are both named "${cell.name}"`);
     }
     namesById.set(cell.name, id);
-    ctx.module.push(`${cell.kind} ${cell.name} = ${emitValue(cell.value, ctx)};`);
+    const value = transform(undefined, cell.name, cell.value, ctx);
+    ctx.module.push(`${cell.kind} ${cell.name} = ${emitValue(value, ctx)};`);
   }
 
   const exportExpr = reconstructFunctionExpr(fn, ctx);
@@ -126,13 +134,21 @@ function reconstructFunctionExpr(fn: Function, ctx: Context): string {
     // Shared cells are declared once at module scope; the source resolves to
     // them by name, so don't shadow them with a private binding here.
     if (ctx.sharedIds.has(variable.id)) continue;
-    bindings.push(`${variable.kind} ${variable.name} = ${emitValue(variable.value, ctx)};`);
+    const value = transform(undefined, variable.name, variable.value, ctx);
+    bindings.push(`${variable.kind} ${variable.name} = ${emitValue(value, ctx)};`);
   }
 
   if (bindings.length === 0) {
     return `(${source})`;
   }
   return `(function () {\n${bindings.join("\n")}\nreturn (${source});\n})()`;
+}
+
+// Applies the replacer (if any) to a value before it is serialized. `holder` is
+// the object/array the value came from (the replacer's `this`), matching
+// JSON.stringify; it is undefined for top-level free-variable values.
+function transform(holder: unknown, key: string, value: unknown, ctx: Context): unknown {
+  return ctx.replacer ? ctx.replacer.$call(holder, key, value) : value;
 }
 
 // Returns a JS expression for `value`, appending any hoisted declarations to
@@ -171,13 +187,17 @@ function emitObject(value: object, ctx: Context): string {
     ctx.module.push(`const ${name} = [];`);
     for (let i = 0; i < value.length; i++) {
       if (i in value) {
-        ctx.module.push(`${name}[${i}] = ${emitValue(value[i], ctx)};`);
+        const child = transform(value, String(i), value[i], ctx);
+        ctx.module.push(`${name}[${i}] = ${emitValue(child, ctx)};`);
       }
     }
   } else {
     ctx.module.push(`const ${name} = {};`);
     for (const key of Object.keys(value)) {
-      ctx.module.push(`${name}[${JSON.stringify(key)}] = ${emitValue((value as any)[key], ctx)};`);
+      const child = transform(value, key, (value as any)[key], ctx);
+      // An object property transformed to `undefined` is omitted (JSON-like).
+      if (child === undefined) continue;
+      ctx.module.push(`${name}[${JSON.stringify(key)}] = ${emitValue(child, ctx)};`);
     }
   }
 

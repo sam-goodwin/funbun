@@ -197,3 +197,39 @@ test("a captured function that itself captures an object shares that object", as
   });
   expect(fn()).toBe(1);
 });
+
+test("replacer transforms captured free-variable values", async () => {
+  let secret = "real";
+  void secret;
+  const code = serialize(
+    () => secret,
+    (key, value) => (key === "secret" ? "redacted" : value),
+  );
+  using dir = tempDir("closure-replacer", { "mod.mjs": code });
+  const { default: fn } = await import(`${String(dir)}/mod.mjs`);
+  expect(fn()).toBe("redacted");
+});
+
+test("replacer transforms nested object properties", async () => {
+  let o = { keep: 1, double: 5 };
+  void o;
+  const code = serialize(
+    () => o,
+    (key, value) => (key === "double" ? (value as number) * 2 : value),
+  );
+  using dir = tempDir("closure-replacer-nested", { "mod.mjs": code });
+  const { default: fn } = await import(`${String(dir)}/mod.mjs`);
+  expect(fn()).toEqual({ keep: 1, double: 10 });
+});
+
+test("replacer omits object properties it returns undefined for", async () => {
+  let o = { keep: 1, drop: 2 };
+  void o;
+  const code = serialize(
+    () => o,
+    (key, value) => (key === "drop" ? undefined : value),
+  );
+  using dir = tempDir("closure-replacer-omit", { "mod.mjs": code });
+  const { default: fn } = await import(`${String(dir)}/mod.mjs`);
+  expect(fn()).toEqual({ keep: 1 });
+});
