@@ -1591,4 +1591,73 @@ describe("bundler", () => {
     compile: true,
     run: { stdout: "ok" },
   });
+
+  // --- Namespace member tree-shaking ---
+  // Direct `import * as ns` from a module and `export *` star re-exports
+  // already drop unused members. `export * as ns` re-exports do NOT yet — see
+  // the KNOWN LIMITATION test at the end.
+
+  itBundled("barrel/NamespaceImportTreeShakesMembers", {
+    files: {
+      "/entry.js": /* js */ `
+        import * as ns from './m.js';
+        console.log(ns.used());
+      `,
+      "/m.js": /* js */ `
+        export function used() { return 'ok'; }
+        export function unused() { return 'UNUSED_MARKER'; }
+      `,
+    },
+    outdir: "/out",
+    onAfterBundle(api) {
+      api.expectFile("/out/entry.js").not.toContain("UNUSED_MARKER");
+    },
+    run: { stdout: "ok" },
+  });
+
+  itBundled("barrel/ExportStarNamedTreeShakesMembers", {
+    files: {
+      "/entry.js": /* js */ `
+        import { used } from './barrel.js';
+        console.log(used());
+      `,
+      "/barrel.js": /* js */ `export * from './m.js';`,
+      "/m.js": /* js */ `
+        export function used() { return 'ok'; }
+        export function unused() { return 'UNUSED_MARKER'; }
+      `,
+    },
+    outdir: "/out",
+    onAfterBundle(api) {
+      api.expectFile("/out/entry.js").not.toContain("UNUSED_MARKER");
+    },
+    run: { stdout: "ok" },
+  });
+
+  // KNOWN LIMITATION — target for member-level namespace tree-shaking.
+  // When a namespace is RE-EXPORTED via `export * as ns` and only accessed
+  // statically (`ns.member`, never bare `ns` or `ns[dynamic]`), unused members
+  // are NOT dropped: the namespace object is materialized whole (via
+  // `__export({...})` in linker_context/doStep5.rs `create_exports_for_file`,
+  // which has no per-member use tracking). This test characterizes the current
+  // behavior; flip `.toContain` to `.not.toContain` when namespace-member
+  // tree-shaking lands.
+  itBundled("barrel/ExportStarAsNamespaceKeepsUnusedMembers", {
+    files: {
+      "/entry.js": /* js */ `
+        import { ns } from './barrel.js';
+        console.log(ns.used());
+      `,
+      "/barrel.js": /* js */ `export * as ns from './m.js';`,
+      "/m.js": /* js */ `
+        export function used() { return 'ok'; }
+        export function unused() { return 'UNUSED_MARKER'; }
+      `,
+    },
+    outdir: "/out",
+    onAfterBundle(api) {
+      api.expectFile("/out/entry.js").toContain("UNUSED_MARKER");
+    },
+    run: { stdout: "ok" },
+  });
 });
