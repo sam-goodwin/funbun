@@ -193,16 +193,67 @@ re-bound to that state.
 
 ### What round-trips (tested)
 
-Closures with captured primitives/objects/arrays (incl. cycles & shared refs);
-nested functions; shared mutable cells; recursion & mutual recursion; the
-replacer; Date/RegExp/Map/Set/typed-arrays/Error; Proxies; bound functions;
-class values/instances/inheritance/statics/getters/setters/private-fields;
-extracted method references (generator/async/symbol-keyed methods); registered &
-well-known symbols; sparse arrays; cross-module captures; generators & async
-generators; and a broad swath of body syntax (destructuring/defaults/rest/spread,
-optional chaining/nullish, template & tagged templates, regex, try/catch/finally,
-labeled loops, switch, `arguments`, async iteration). WeakMap/WeakSet/Promise and
-unique symbols throw clear errors rather than silently losing data.
+Coverage is tracked objectively — **`bun run closure:coverage`** prints a
+capability manifest (~230 items) where each "supported" claim names a test whose
+text must exist, so the number can't drift. Current state: **225 supported, 5
+guarded limitations, 100% coverage / 100% safety** (every case either round-trips
+or fails with a clear error — never silent corruption).
+
+- **Values:** primitives (incl. `-0`/`NaN`/`Infinity`/bigint); plain/nested/null-
+  prototype objects; arrays (incl. sparse + holes); cycles & shared references
+  (identity preserved); `Date`/`RegExp`/`Map`/`Set`; **all typed arrays +
+  `DataView` + `ArrayBuffer`/`SharedArrayBuffer`** (views over one buffer keep a
+  **shared buffer**); **boxed primitives**; **`Error`** (incl. `cause`,
+  `AggregateError.errors`, subclasses, custom fields); **`Object.freeze`/seal**
+  (incl. frozen built-ins & frozen cycles); **unique symbols** (recreated, intra-
+  closure identity preserved); registered & well-known symbols.
+- **Weak collections & settled promises** (native snapshot): **`WeakMap`/
+  `WeakSet`** (live-entry snapshot), **`WeakRef`** (live referent), **`Finalization
+  Registry`** (callback + registrations), **fulfilled/rejected Promises**.
+- **Functions & classes:** nested functions, shared mutable cells, recursion &
+  mutual recursion (incl. **cross-module circular** import graphs); bound
+  functions; **native built-ins referenced by global path** (`Math.max`,
+  `Array.prototype.slice`, `console.log`, …); class values/instances/inheritance/
+  `super`/statics/getters/setters/private fields & methods/`#x in obj`/static
+  blocks/computed members; **mixins** & **computed `extends`** (`extends
+  mixin(Base)`); **built-in subclasses** (`extends Array/Map/Set`,
+  `instanceof` preserved); extracted method refs; generators & async generators;
+  **`using`/`await using`**; **field-initializer closure captures** (via AST +
+  native scope resolution); a method **decorator**.
+- **Modules:** named/aliased/default/namespace imports, barrels, `export *` /
+  `export * as`, re-export chains, node:* externals kept — all member-pruned.
+- **Optimality:** access-path pruning (`a.b` serializes `b`, not `a`),
+  this-following into methods & getters, namespace member pruning.
+- **AsyncLocalStorage:** see §3.1.
+- **Revoked Proxy** reconstructs as a revoked proxy. **Source maps** stay correct
+  through every transform (private-rewrite, heritage rewrite, import re-emit, ALS
+  wrap).
+
+### 3.1 AsyncLocalStorage — capturing the active context
+
+A captured `AsyncLocalStorage` instance is treated **opaquely** (its native
+internals — e.g. Bun's `jsCleanupLater` cleanup callback — are never walked, in
+`analyzeSharedCells` / `computeKeepSets` / `keepAll` / `emitValue`) and
+reconstructed as a fresh `new AsyncLocalStorage()`.
+
+The interesting part is the **async context**: serializing a closure *inside*
+`als.run(store, …)` snapshots the active store and wraps the reified root so each
+call re-enters `als.run(store, …)`. So the closure, shipped elsewhere and reified,
+sees the same store from `als.getStore()`:
+
+```js
+als.run({ user: "alice" }, () => serialize(() => als.getStore().user))
+//  → reify in another process → fn() === "alice"
+```
+
+It composes: nested runs capture the **innermost** store; the context survives
+across `await`s in a reified async closure (and through promise continuations);
+multiple ALS instances each capture their own; concurrent runs stay independent;
+the store is snapshotted **by value** (later mutation doesn't leak; cycles &
+cross-links preserved; a store object that's *also* a captured free variable
+reconstructs as one object). The wrapper applies only to plain/async function
+roots — a **class** root (would break `new`) or **generator** root (body iterates
+after `run` returns) reconstructs gracefully *without* context restoration.
 
 ---
 
@@ -214,9 +265,10 @@ unique symbols throw clear errors rather than silently losing data.
 - **Cell identity drives sharing.** The `id` is the linchpin: shared mutable
   state, recursion, and mutual recursion are all "is this the same cell?"
   questions.
-- **Fail loud, not lossy.** Anything that can't be faithfully serialized
-  (WeakMap, Promise, unique symbol, native function) throws a clear error instead
-  of emitting something subtly wrong.
+- **Fail loud, not lossy.** Anything that can't be faithfully serialized (a
+  pending Promise, a live generator object) throws a clear error instead of
+  emitting something subtly wrong — the `closure:coverage` "Safety" metric tracks
+  that every case either round-trips or errors cleanly (currently 100%).
 - **Private → public is an explicit, opt-in fidelity trade**, chosen with the
   user, because `#private` cannot be written from outside its class.
 
@@ -224,18 +276,32 @@ unique symbols throw clear errors rather than silently losing data.
 
 ## 5. Known limitations
 
-- **Field-initializer-only captures.** A variable captured *only* by a class
-  field initializer (no method references it), on a class captured as a direct
-  value, can't be recovered — the class's member executables aren't reachable
-  from the class constructor that `Symbol.freeVariables` operates on. Workaround:
-  capture the class's factory, or reference the variable in any method. (Common
-  patterns are unaffected.)
-- **Decorators** aren't part of `Function.prototype.toString()`, so they aren't
-  preserved.
+The 5 remaining guarded limitations (each fails with a **clear error**, never
+silent loss):
+
+- **Pending Promise** — genuinely impossible: its resolution lives in the event
+  loop (live I/O / timers / a suspended async frame), not expressible as source.
+  *Settled* promises round-trip.
+- **Generator / async-generator / iterator objects** — a live generator object
+  holds suspended execution state (the yield point + local frame) in engine slots
+  that aren't reachable via reflection and can't be expressed as source. The
+  generator *function* round-trips; the live *object* throws. (The hardest
+  remaining item; would need bytecode-level frame transplant.)
+- **Two distinct shared cells with the same name** — both hoist to module scope
+  under their original name and collide; throws. Could be fixed by mangling.
+
+Other notes:
+
+- **Field-initializer captures now work** (AST + native `$resolveClosureBinding`),
+  *except* a computed key `[expr]` capturing a closure var (consumed at class-
+  definition time, not in the class's runtime scope).
+- **Native functions** are referenced by their globalThis path; only a native
+  with *no* global path (a true engine-internal) still errors.
+- **AsyncLocalStorage** context restoration applies to plain/async function roots
+  only (§3.1).
 - **Source-map application** (§6).
-- **The string-based transforms are regex/scanner-driven** and therefore
-  fragile at the edges (e.g. `#` inside a regex literal). This is the main
-  motivation for the AST direction in §7.
+- **String-based transforms are regex/scanner-driven** — fragile at the edges;
+  the main motivation for the AST direction in §7.
 
 ---
 
