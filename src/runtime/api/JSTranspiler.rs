@@ -1865,7 +1865,53 @@ impl<'a> AstJsConverter<'a> {
                 node.put(self.global, "name", nm);
                 Ok(node)
             }
+            B::BArray(arr) => {
+                let node = self.node("ArrayPattern", b.loc.start)?;
+                let items = arr.items.slice();
+                let elements = JSValue::create_empty_array(self.global, items.len())?;
+                for (i, item) in items.iter().enumerate() {
+                    let el = self.binding_with_default(&item.binding, item.default_value)?;
+                    elements.put_index(self.global, i as u32, el)?;
+                }
+                node.put(self.global, "elements", elements);
+                Ok(node)
+            }
+            B::BObject(obj) => {
+                let node = self.node("ObjectPattern", b.loc.start)?;
+                let props = obj.properties.slice();
+                let properties = JSValue::create_empty_array(self.global, props.len())?;
+                for (i, p) in props.iter().enumerate() {
+                    let pn = self.node("Property", p.value.loc.start)?;
+                    let key = self.expr(&p.key)?;
+                    pn.put(self.global, "key", key);
+                    let value = self.binding_with_default(&p.value, p.default_value)?;
+                    pn.put(self.global, "value", value);
+                    properties.put_index(self.global, i as u32, pn)?;
+                }
+                node.put(self.global, "properties", properties);
+                Ok(node)
+            }
             _ => self.node("UnsupportedBinding", b.loc.start),
+        }
+    }
+
+    // A binding pattern element, wrapped in `AssignmentPattern` when it carries
+    // a default value (`[a = 1]`, `{ a = 1 }`).
+    fn binding_with_default(
+        &self,
+        b: &bun_ast::Binding,
+        default: Option<bun_ast::Expr>,
+    ) -> JsResult<JSValue> {
+        let inner = self.binding(b)?;
+        match default {
+            Some(def) => {
+                let node = self.node("AssignmentPattern", b.loc.start)?;
+                node.put(self.global, "left", inner);
+                let right = self.expr(&def)?;
+                node.put(self.global, "right", right);
+                Ok(node)
+            }
+            None => Ok(inner),
         }
     }
 

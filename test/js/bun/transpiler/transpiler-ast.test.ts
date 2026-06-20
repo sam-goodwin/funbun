@@ -154,6 +154,35 @@ describe("Transpiler.ast", () => {
     });
   });
 
+  test("destructuring params expose ArrayPattern / ObjectPattern bindings", () => {
+    const a = ast(`const f = ({ a, b: c, d = 1 }, [x, z]) => a`).body[0].declarations[0].init;
+    expect(stripStart(a.params)).toEqual([
+      {
+        type: "ObjectPattern",
+        properties: [
+          { type: "Property", key: { type: "StringLiteral", value: "a" }, value: { type: "Identifier", name: "a" } },
+          { type: "Property", key: { type: "StringLiteral", value: "b" }, value: { type: "Identifier", name: "c" } },
+          {
+            type: "Property",
+            key: { type: "StringLiteral", value: "d" },
+            value: {
+              type: "AssignmentPattern",
+              left: { type: "Identifier", name: "d" },
+              right: { type: "NumericLiteral", value: 1 },
+            },
+          },
+        ],
+      },
+      {
+        type: "ArrayPattern",
+        elements: [
+          { type: "Identifier", name: "x" },
+          { type: "Identifier", name: "z" },
+        ],
+      },
+    ]);
+  });
+
   test("import declarations expose source + specifiers (local vs imported)", () => {
     const body = ast(`import def, { a, b as c } from "./dep"; import * as ns from "./y";`).body;
     expect(stripStart(body[0])).toEqual({

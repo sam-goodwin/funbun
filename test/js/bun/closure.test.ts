@@ -1174,7 +1174,9 @@ describe("bundle (bundler-backed)", () => {
         const genVals = await Array.fromAsync((await rt(gen)).mod.default());
         const secret = { token: "SECRET", keep: "KEEP" };
         const r = await rt(() => secret.keep + ":" + secret.token, (k, v) => (k === "token" ? "REDACTED" : v));
-        console.log(JSON.stringify({ method, cls, genVals, replacerHidSecret: !r.out.includes("SECRET"), replaced: r.mod.default() }));
+        let base = 10;
+        const destructured = (await rt(({ a, b: c }) => a + c + base)).mod.default({ a: 1, b: 2 });
+        console.log(JSON.stringify({ method, cls, genVals, replacerHidSecret: !r.out.includes("SECRET"), replaced: r.mod.default(), destructured }));
       `,
     });
 
@@ -1192,6 +1194,7 @@ describe("bundle (bundler-backed)", () => {
       genVals: [1, 2],
       replacerHidSecret: true,
       replaced: "KEEP:REDACTED",
+      destructured: 13,
     });
     expect({ stderr, exitCode }).toEqual({ stderr: expect.any(String), exitCode: 0 });
   });

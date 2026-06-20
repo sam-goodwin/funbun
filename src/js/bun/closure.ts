@@ -1301,6 +1301,25 @@ function collectReferencedNames(transpiler: any, source: string): Set<string> {
   }
   const refs = new Set<string>();
   const bound = new Set<string>();
+  // Collect the names a binding pattern introduces (params / declarators),
+  // including destructuring: `{a, b: c}`, `[x, ...rest]`, `a = 1`.
+  const bindNames = (node: any): void => {
+    if (!node || typeof node !== "object") return;
+    switch (node.type) {
+      case "Identifier":
+        bound.add(node.name);
+        break;
+      case "AssignmentPattern":
+        bindNames(node.left);
+        break;
+      case "ArrayPattern":
+        for (const el of node.elements || []) bindNames(el);
+        break;
+      case "ObjectPattern":
+        for (const p of node.properties || []) bindNames(p.value);
+        break;
+    }
+  };
   (function walk(n: any): void {
     if ($isJSArray(n)) {
       for (const x of n) walk(x);
@@ -1326,9 +1345,9 @@ function collectReferencedNames(transpiler: any, source: string): Set<string> {
       n.type === "ClassExpression"
     ) {
       if (n.id) bound.add(n.id.name);
-      for (const p of n.params || []) if (p?.type === "Identifier") bound.add(p.name);
+      for (const p of n.params || []) bindNames(p);
     }
-    if (n.type === "VariableDeclarator" && n.id?.type === "Identifier") bound.add(n.id.name);
+    if (n.type === "VariableDeclarator") bindNames(n.id);
     for (const k in n) {
       if (k === "type" || k === "start") continue;
       walk(n[k]);
