@@ -2958,3 +2958,218 @@ describe("frontier: collection key identity & guards", () => {
     expect(() => serialize(() => reg)).toThrow(/FinalizationRegistry/i);
   });
 });
+
+describe("frontier: language features & advanced", () => {
+  test("SharedArrayBuffer and a view over it round-trip", async () => {
+    const sab = new SharedArrayBuffer(4);
+    new Uint8Array(sab).set([1, 2, 3, 4]);
+    const view = new Int32Array(sab);
+    void [sab, view];
+    const out = (await roundtrip(() => ({ sab, view })))();
+    expect(out.sab).toBeInstanceOf(SharedArrayBuffer);
+    expect(out.view.buffer).toBe(out.sab); // shared identity
+  });
+
+  test("instance own accessor (defineProperty getter/setter) round-trips", async () => {
+    const o: any = { _v: 1 };
+    Object.defineProperty(o, "v", {
+      get() {
+        return this._v * 10;
+      },
+      set(n: number) {
+        this._v = n;
+      },
+      configurable: true,
+    });
+    void o;
+    const out = (await roundtrip(() => o))();
+    expect(out.v).toBe(10);
+    out.v = 5;
+    expect(out.v).toBe(50);
+  });
+
+  test("`using` syntax round-trips and disposes the resource", async () => {
+    const makeRes = (log: string[]) => ({
+      [Symbol.dispose]() {
+        log.push("disposed");
+      },
+    });
+    void makeRes;
+    const code = serialize(() => {
+      const log: string[] = [];
+      {
+        using r = makeRes(log);
+        log.push("used");
+      }
+      return log;
+    });
+    expect(code).toContain("using");
+    using dir = tempDir(`closure-using-${counter++}`, { "mod.mjs": code });
+    const fn = (await import(`${String(dir)}/mod.mjs`)).default as () => string[];
+    expect(fn()).toEqual(["used", "disposed"]);
+  });
+
+  test("`await using` syntax round-trips and async-disposes", async () => {
+    const makeRes = (log: string[]) => ({
+      async [Symbol.asyncDispose]() {
+        log.push("async-disposed");
+      },
+    });
+    void makeRes;
+    const fn = await roundtrip(async () => {
+      const log: string[] = [];
+      {
+        await using r = makeRes(log);
+        log.push("used");
+      }
+      return log;
+    });
+    await expect(fn()).resolves.toEqual(["used", "async-disposed"]);
+  });
+
+  // INTERACTION: using over a captured class instance whose dispose mutates a
+  // shared captured cell.
+  test("`using` over a captured disposable class instance", async () => {
+    let disposeCount = 0;
+    class Res {
+      [Symbol.dispose]() {
+        disposeCount++;
+      }
+    }
+    const res = new Res();
+    void [res, disposeCount];
+    const fn = await roundtrip(() => {
+      let ok = false;
+      {
+        using r = res;
+        ok = true;
+      }
+      return ok;
+    });
+    expect(fn()).toBe(true);
+  });
+
+  test("private getter/setter accessors round-trip", async () => {
+    class Box {
+      #v = 1;
+      get #doubled() {
+        return this.#v * 2;
+      }
+      set #val(n: number) {
+        this.#v = n;
+      }
+      read() {
+        return this.#doubled;
+      }
+      write(n: number) {
+        this.#val = n;
+      }
+    }
+    const b = new Box();
+    void b;
+    const out = (await roundtrip(() => b))();
+    expect(out.read()).toBe(2);
+    out.write(10);
+    expect(out.read()).toBe(20);
+  });
+
+  test("static private accessor round-trips", async () => {
+    class Cfg {
+      static #data = 5;
+      static get #value() {
+        return Cfg.#data * 3;
+      }
+      static read() {
+        return Cfg.#value;
+      }
+    }
+    void Cfg;
+    const K = (await roundtrip(() => Cfg))();
+    expect(K.read()).toBe(15);
+  });
+
+  // INTERACTION: private accessor + inheritance.
+  test("private accessor used through an inherited method", async () => {
+    class Base {
+      #secret = 7;
+      get #s() {
+        return this.#secret;
+      }
+      reveal() {
+        return this.#s;
+      }
+    }
+    class Derived extends Base {}
+    const d = new Derived();
+    void d;
+    const out = (await roundtrip(() => d))();
+    expect(out.reveal()).toBe(7);
+  });
+
+  test("nested Proxy (proxy wrapping a proxy) round-trips", async () => {
+    const inner = new Proxy({ a: 1 }, { get: (t, k) => (k === "a" ? 100 : (t as any)[k]) });
+    const outer = new Proxy(inner, { get: (t, k) => (k === "a" ? (t as any).a + 1 : (t as any)[k]) });
+    void outer;
+    const out = (await roundtrip(() => outer))();
+    expect((out as any).a).toBe(101);
+  });
+
+  // INTERACTION: proxy inside an object graph, with the target also captured.
+  test("a proxy and its target captured together keep one target", async () => {
+    const target = { n: 1 };
+    const p = new Proxy(target, {});
+    void [target, p];
+    const out = (await roundtrip(() => ({ target, p })))();
+    out.target.n = 42;
+    expect((out.p as any).n).toBe(42); // proxy sees writes to the shared target
+  });
+});
+
+describe("frontier: decorators", () => {
+  test("a method decorator round-trips", async () => {
+    const calls: string[] = [];
+    function traced<T extends (...a: any[]) => any>(value: T, _ctx: any): T {
+      return function (this: any, ...args: any[]) {
+        calls.push("call");
+        return value.apply(this, args);
+      } as T;
+    }
+    void [calls, traced];
+    class Svc {
+      @traced
+      greet() {
+        return "hi";
+      }
+    }
+    void Svc;
+    const K = (await roundtrip(() => Svc))();
+    expect(new K().greet()).toBe("hi");
+  });
+});
+
+describe("frontier: top-level await context", () => {
+  test("a closure capturing a top-level-await value round-trips", async () => {
+    using dir = tempDir(`closure-tla-${counter++}`, {
+      "runner.mjs": `
+        import { serialize } from "bun:closure";
+        import { writeFileSync } from "node:fs";
+        const base = await Promise.resolve(40);     // top-level await
+        const offset = await Promise.resolve(2);
+        const code = serialize(() => base + offset);
+        const url = new URL("./out.mjs", import.meta.url);
+        writeFileSync(url, code);
+        const ns = await import(url.href);
+        process.stdout.write("RESULT:" + ns.default() + "\\n");
+      `,
+    });
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), String(dir) + "/runner.mjs"],
+      env: { ...bunEnv, BUN_DEBUG_QUIET_LOGS: "1" },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    const line = stdout.split("\n").find(l => l.startsWith("RESULT:"));
+    expect({ line: line ?? `<none> ${stderr}`, exitCode }).toEqual({ line: "RESULT:42", exitCode: 0 });
+  });
+});

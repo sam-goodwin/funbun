@@ -174,9 +174,12 @@ export const CATEGORIES: CoverageCategory[] = [
       ),
       L("val.weakref", "WeakRef (clear error)", "WeakRef throws a clear error"),
       L("val.finalization-registry", "FinalizationRegistry (clear error)", "FinalizationRegistry throws a clear error"),
-      // Roadmap — remaining value types:
-      T("val.shared-arraybuffer", "SharedArrayBuffer (impl present; needs a test)"),
-      T("val.own-accessor-instance", "instance own (not prototype) accessor"),
+      S("val.shared-arraybuffer", "SharedArrayBuffer + shared view", "SharedArrayBuffer and a view over it round-trip"),
+      S(
+        "val.own-accessor-instance",
+        "instance own accessor (defineProperty)",
+        "instance own accessor (defineProperty getter/setter) round-trips",
+      ),
     ],
   },
   {
@@ -223,8 +226,22 @@ export const CATEGORIES: CoverageCategory[] = [
         "two distinct shared cells, same name (clear error)",
         "two distinct shared cells with the same name throw",
       ),
-      T("scope.using", "`using` / `await using` explicit resource management"),
-      T("scope.tla", "closure created under top-level await"),
+      S(
+        "scope.using",
+        "`using` resource management + disposal",
+        "`using` syntax round-trips and disposes the resource",
+      ),
+      S("scope.await-using", "`await using` async disposal", "`await using` syntax round-trips and async-disposes"),
+      S(
+        "scope.using-instance",
+        "using over a captured disposable instance",
+        "`using` over a captured disposable class instance",
+      ),
+      S(
+        "scope.tla",
+        "closure captured under top-level await",
+        "a closure capturing a top-level-await value round-trips",
+      ),
     ],
   },
   {
@@ -336,9 +353,14 @@ export const CATEGORIES: CoverageCategory[] = [
         "field-initializer-only capture on direct class value",
         "a var captured only by a field initializer on a direct class value is unbound",
       ),
-      T("cls.decorators", "class / method / field decorators"),
-      T("cls.private-accessor", "private #getter / #setter accessors"),
-      T("cls.static-private-accessor", "static private accessors"),
+      S("cls.decorators", "method decorator round-trips", "a method decorator round-trips"),
+      S("cls.private-accessor", "private #getter / #setter accessors", "private getter/setter accessors round-trip"),
+      S("cls.static-private-accessor", "static private accessor", "static private accessor round-trips"),
+      S(
+        "cls.private-accessor-inherited",
+        "private accessor via inherited method",
+        "private accessor used through an inherited method",
+      ),
     ],
   },
   {
@@ -375,7 +397,12 @@ export const CATEGORIES: CoverageCategory[] = [
       L("px.revoked", "revoked Proxy (clear error)", "throws on a revoked Proxy"),
       S("bind.args", "bound function (bound args)", "reconstructs a bound function (bound args)"),
       S("bind.this", "bound method preserves bound this", "reconstructs a bound method preserving bound this"),
-      T("px.nested", "Proxy wrapping a Proxy / proxy in object graph"),
+      S("px.nested", "Proxy wrapping a Proxy", "nested Proxy (proxy wrapping a proxy) round-trips"),
+      S(
+        "px.shared-target",
+        "proxy + shared target identity",
+        "a proxy and its target captured together keep one target",
+      ),
     ],
   },
   {
