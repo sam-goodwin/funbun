@@ -539,3 +539,49 @@ test("reconstructs an instance of a subclass", async () => {
   expect(out.label).toBe("derived");
   expect(out.greet()).toBe("hi from derived"); // inherited method works
 });
+
+test("preserves static class members", async () => {
+  class Cfg {
+    static VERSION = "1.0";
+    static make() {
+      return new Cfg();
+    }
+    greet() {
+      return "hi";
+    }
+  }
+  void Cfg;
+  const Klass = (await roundtrip(() => Cfg))();
+  expect(Klass.VERSION).toBe("1.0");
+  expect(Klass.make().greet()).toBe("hi");
+});
+
+test("reconstructs a prototype getter via a class instance", async () => {
+  class Temp {
+    c: number;
+    constructor(c: number) {
+      this.c = c;
+    }
+    get fahrenheit() {
+      return (this.c * 9) / 5 + 32;
+    }
+  }
+  let inst = new Temp(100);
+  void inst;
+  const out = (await roundtrip(() => inst))();
+  expect(out.fahrenheit).toBe(212);
+});
+
+test("reconstructs a class whose method captures a free variable", async () => {
+  function makeClass(offset: number) {
+    return class {
+      add(x: number) {
+        return x + offset;
+      }
+    };
+  }
+  let Adder = makeClass(10);
+  void Adder;
+  const Klass = (await roundtrip(() => Adder))();
+  expect(new Klass().add(5)).toBe(15);
+});

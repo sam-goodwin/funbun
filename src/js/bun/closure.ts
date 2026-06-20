@@ -260,8 +260,13 @@ function analyzeSharedCells(root: Function): { sharedIds: Set<number>; cellInfo:
   function visitFn(fn: Function): void {
     if (seenFns.has(fn)) return;
     seenFns.add(fn);
-    const freeVariables = (fn as any)[Symbol.freeVariables] as FreeVariable[] | undefined;
-    if (!freeVariables) return;
+    let source: string;
+    try {
+      source = fn.toString();
+    } catch {
+      return;
+    }
+    const freeVariables = allFreeVariables(fn, source);
     for (const variable of freeVariables) {
       let set = cellFunctions.get(variable.id);
       if (set === undefined) {
@@ -305,7 +310,7 @@ function reconstructFunctionExpr(fn: Function, ctx: Context): ReconstructedFunct
     throw new TypeError("Cannot serialize a native function (no JavaScript source is available)");
   }
 
-  const freeVariables = (fn as any)[Symbol.freeVariables] as FreeVariable[];
+  const freeVariables = allFreeVariables(fn, source);
   const location = (fn as any)[Symbol.sourceLocation] as ReconstructedFunction["location"];
   const sourceLineCount = source.split("\n").length;
 
@@ -338,6 +343,45 @@ function reconstructFunctionExpr(fn: Function, ctx: Context): ReconstructedFunct
     sourceLineCount,
     location,
   };
+}
+
+// The free variables a function closes over. For a class, Symbol.freeVariables
+// reports only what the constructor body references, not its methods — so union
+// in each method's (and static member's) own free variables, deduped by cell id.
+// Methods share the class's defining scope, so same-named captures are the same
+// cell.
+function allFreeVariables(fn: Function, source: string): FreeVariable[] {
+  const own = ((fn as any)[Symbol.freeVariables] as FreeVariable[] | undefined) ?? [];
+  if (!source.trimStart().startsWith("class")) return own;
+
+  const byId = new Map<number, FreeVariable>();
+  for (const variable of own) {
+    // `#name` private brands are an internal mechanism recreated by the class
+    // body itself — never an external capture.
+    if (variable.name.startsWith("#")) continue;
+    byId.set(variable.id, variable);
+  }
+  collectMemberFreeVariables(fn, fn, byId);
+  if (typeof fn === "function" && fn.prototype) collectMemberFreeVariables(fn.prototype, fn, byId);
+  return [...byId.values()];
+}
+
+function collectMemberFreeVariables(holder: object, classFn: Function, byId: Map<number, FreeVariable>): void {
+  for (const key of Reflect.ownKeys(holder)) {
+    const descriptor = Object.getOwnPropertyDescriptor(holder, key)!;
+    for (const member of [descriptor.value, descriptor.get, descriptor.set]) {
+      if (typeof member !== "function") continue;
+      const memberVars = (member as any)[Symbol.freeVariables] as FreeVariable[] | undefined;
+      if (!memberVars) continue;
+      for (const variable of memberVars) {
+        // A reference to the class's own name resolves to the class expression's
+        // binding, and `#name` private brands are recreated by the class body —
+        // neither should be bound externally.
+        if (variable.value === classFn || variable.name.startsWith("#")) continue;
+        if (!byId.has(variable.id)) byId.set(variable.id, variable);
+      }
+    }
+  }
 }
 
 // If `fn` is a class declared as `class X extends <Identifier> { ... }`, returns
