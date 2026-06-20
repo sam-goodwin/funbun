@@ -1074,6 +1074,45 @@ describe("access-path pruning", () => {
     expect(out.note).toBe("kept-because-graph-escapes");
     expect(out.inner.parent).toBe(out);
   });
+
+  // A namespace import (`import * as ns`) is a captured free variable. serialize()
+  // (no bundler) inlines only the referenced members and tree-shakes the rest —
+  // runtime visibility makes the static `export *` barrel problem moot.
+  test("inlines and prunes a namespace import without the bundler", async () => {
+    using dir = tempDir(`closure-ns-serialize-${counter++}`, {
+      "m.mjs": `
+        export function alpha() { return "ALPHA"; }
+        export function unused() { return "UNUSED_MARKER"; }
+        export const cfg = { a: 1, big: "BIG_UNUSED_MARKER" };
+      `,
+      "main.mjs": `
+        import { serialize } from "bun:closure";
+        import { writeFileSync } from "node:fs";
+        import * as m from "./m.mjs";
+        const out = serialize(() => m.cfg.a + ":" + m.alpha());
+        writeFileSync(new URL("./out.mjs", import.meta.url), out);
+        console.log(JSON.stringify({
+          unusedTreeShaken: !out.includes("UNUSED_MARKER"),
+          bigPruned: !out.includes("BIG_UNUSED_MARKER"),
+          hasSourceMap: out.includes("sourceMappingURL"),
+        }));
+        console.log("RESULT:" + (await import(new URL("./out.mjs", import.meta.url).href)).default());
+      `,
+    });
+
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), String(dir) + "/main.mjs"],
+      env: { ...bunEnv, BUN_DEBUG_QUIET_LOGS: "1" },
+      stderr: "pipe",
+      stdout: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    const lines = stdout.trim().split("\n");
+
+    expect(JSON.parse(lines[0])).toEqual({ unusedTreeShaken: true, bigPruned: true, hasSourceMap: true });
+    expect(lines.find(l => l.startsWith("RESULT:"))).toBe("RESULT:1:ALPHA");
+    expect({ stderr, exitCode }).toEqual({ stderr: expect.any(String), exitCode: 0 });
+  });
 });
 
 describe("bundle (bundler-backed)", () => {

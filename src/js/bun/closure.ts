@@ -830,6 +830,13 @@ function emitValue(value: unknown, ctx: Context): string {
   }
 }
 
+// A module namespace object (`import * as ns`) stringifies as `[object Module]`.
+// Captured at load so user code can't tamper with `Object.prototype.toString`.
+const objectToString = Object.prototype.toString;
+function isModuleNamespaceObject(value: object): boolean {
+  return objectToString.$call(value) === "[object Module]";
+}
+
 function emitObject(value: object, ctx: Context): string {
   const existing = ctx.refs.get(value);
   if (existing !== undefined) return existing;
@@ -862,6 +869,21 @@ function emitObject(value: object, ctx: Context): string {
     }
     // Preserve the length, including trailing holes.
     ctx.module.push(`${name}.length = ${array.length};`);
+  } else if (isModuleNamespaceObject(value)) {
+    // A module namespace (`import * as ns`) — emit only the members the closure
+    // referenced (access-path pruned), as a plain object. Its exotic prototype
+    // chain and `Symbol.toStringTag` must NOT be walked (that reaches native
+    // built-ins). Each member is read live and serialized like any value, so
+    // imported functions/objects are inlined and tree-shaken to what's used.
+    ctx.module.push(`const ${name} = {};`);
+    const keep = ctx.keepSets.get(value);
+    for (const key of Reflect.ownKeys(value)) {
+      if (typeof key !== "string") continue;
+      if (keep !== undefined && keep !== "all" && !keep.has(key)) continue;
+      const child = transform(value, key, (value as any)[key], ctx);
+      if (child === undefined) continue;
+      ctx.module.push(`${name}[${JSON.stringify(key)}] = ${emitValue(child, ctx)};`);
+    }
   } else {
     ctx.module.push(`const ${name} = ${objectBaseExpression(value, ctx)};`);
     emitOwnProperties(name, value, ctx);
