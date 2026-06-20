@@ -4223,3 +4223,68 @@ describe("ALS rich: promises & async contexts", () => {
     await expect(reified()).resolves.toEqual([100, 100, 100]);
   });
 });
+
+describe("ALS rich: intermixing & complex stores", () => {
+  test("two ALS captured, only one has an active store — only that one is restored", async () => {
+    const withCtx = new AsyncLocalStorage<string>();
+    const without = new AsyncLocalStorage<string>();
+    const code = withCtx.run("HAS", () =>
+      serialize(() => `${withCtx.getStore()}/${without.getStore() ?? "none"}`),
+    );
+    const reified = await reify<() => string>(code);
+    expect(reified()).toBe("HAS/none");
+  });
+
+  test("the store is a complex nested object (snapshotted by value)", async () => {
+    const als = new AsyncLocalStorage<any>();
+    const store = { user: { id: 1, roles: ["admin", "user"] }, meta: new Map([["k", "v"]]) };
+    const code = als.run(store, () => serialize(() => als.getStore()));
+    const reified = await reify<() => any>(code);
+    const out = reified();
+    expect(out.user).toEqual({ id: 1, roles: ["admin", "user"] });
+    expect(out.meta.get("k")).toBe("v");
+  });
+
+  test("the store contains a function which is reconstructed and callable", async () => {
+    const als = new AsyncLocalStorage<{ format: (n: number) => string }>();
+    const code = als.run({ format: (n: number) => `#${n}` }, () =>
+      serialize(() => als.getStore()!.format(7)),
+    );
+    const reified = await reify<() => string>(code);
+    expect(reified()).toBe("#7");
+  });
+
+  test("a circular store round-trips", async () => {
+    const als = new AsyncLocalStorage<any>();
+    const store: any = { name: "root" };
+    store.self = store;
+    const code = als.run(store, () => serialize(() => als.getStore()));
+    const reified = await reify<() => any>(code);
+    const out = reified();
+    expect(out.name).toBe("root");
+    expect(out.self).toBe(out); // cycle preserved
+  });
+
+  test("the SAME object captured as both the store and a closure free variable keeps identity", async () => {
+    const als = new AsyncLocalStorage<{ v: number }>();
+    const shared = { v: 1 };
+    void shared;
+    const code = als.run(shared, () => serialize(() => als.getStore() === shared));
+    const reified = await reify<() => boolean>(code);
+    expect(reified()).toBe(true); // store and captured `shared` reconstruct as one object
+  });
+
+  test("two ALS whose stores reference each other (cross-linked) round-trip", async () => {
+    const a = new AsyncLocalStorage<any>();
+    const b = new AsyncLocalStorage<any>();
+    const storeA: any = { name: "a" };
+    const storeB: any = { name: "b", peer: storeA };
+    storeA.peer = storeB;
+    const code = a.run(storeA, () => b.run(storeB, () => serialize(() => [a.getStore(), b.getStore()])));
+    const reified = await reify<() => any[]>(code);
+    const [outA, outB] = reified();
+    expect(outA.name).toBe("a");
+    expect(outA.peer).toBe(outB); // cross-links preserved
+    expect(outB.peer).toBe(outA);
+  });
+});
