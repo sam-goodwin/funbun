@@ -500,3 +500,42 @@ test("private #fields are not captured (documented limitation)", async () => {
   expect(out.constructor.name).toBe("Counter");
   expect(() => out.value).toThrow();
 });
+
+test("reconstructs a subclass value (extends superclass)", async () => {
+  class Animal {
+    kind() {
+      return "animal";
+    }
+    speak() {
+      return "generic";
+    }
+  }
+  class Dog extends Animal {
+    speak() {
+      return "woof";
+    }
+  }
+  void Dog;
+  const fn = await roundtrip(() => Dog);
+  const Klass = fn();
+  const d = new Klass();
+  expect(d.speak()).toBe("woof"); // own method
+  expect(d.kind()).toBe("animal"); // inherited method
+});
+
+test("reconstructs an instance of a subclass", async () => {
+  class Base {
+    greet() {
+      return "hi from " + (this as any).label;
+    }
+  }
+  class Derived extends Base {
+    label = "derived";
+  }
+  let inst = new Derived();
+  void inst;
+  const fn = await roundtrip(() => inst);
+  const out = fn();
+  expect(out.label).toBe("derived");
+  expect(out.greet()).toBe("hi from derived"); // inherited method works
+});

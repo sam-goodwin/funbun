@@ -272,6 +272,11 @@ function analyzeSharedCells(root: Function): { sharedIds: Set<number>; cellInfo:
       set.add(fn);
       visitValue(variable.value);
     }
+    // A class's superclass is reconstructed too, so analyze it.
+    const superclass = Object.getPrototypeOf(fn);
+    if (typeof superclass === "function" && superclass !== Function.prototype) {
+      visitValue(superclass);
+    }
   }
 
   visitFn(root);
@@ -313,6 +318,12 @@ function reconstructFunctionExpr(fn: Function, ctx: Context): ReconstructedFunct
     bindings.push(`${variable.kind} ${variable.name} = ${emitValue(value, ctx)};`);
   }
 
+  // A class's `extends <Identifier>` superclass is referenced by the source but
+  // is not a free variable, so bind it explicitly (its identity is the class's
+  // own prototype). Only simple-identifier heritage is handled.
+  const superclassBinding = classHeritageBinding(fn, source, ctx);
+  if (superclassBinding !== undefined) bindings.push(superclassBinding);
+
   // functionSourceToExpression always places the original source on its own
   // first line, so the only vertical offset comes from the IIFE wrapper.
   const fnExpr = functionSourceToExpression(source, (fn as any).name);
@@ -327,6 +338,20 @@ function reconstructFunctionExpr(fn: Function, ctx: Context): ReconstructedFunct
     sourceLineCount,
     location,
   };
+}
+
+// If `fn` is a class declared as `class X extends <Identifier> { ... }`, returns
+// a binding that brings the superclass into scope under that identifier. The
+// superclass is the class's own prototype (set by `extends`), which is reliable
+// even though it is not reported as a free variable.
+function classHeritageBinding(fn: Function, source: string, ctx: Context): string | undefined {
+  const trimmed = source.trimStart();
+  if (!trimmed.startsWith("class")) return undefined;
+  const superclass = Object.getPrototypeOf(fn);
+  if (typeof superclass !== "function" || superclass === Function.prototype) return undefined;
+  const match = trimmed.match(/^class\s+(?:[A-Za-z_$][\w$]*\s+)?extends\s+([A-Za-z_$][\w$]*)\s*\{/);
+  if (match === null) return undefined;
+  return `const ${match[1]} = ${emitValue(superclass, ctx)};`;
 }
 
 // Applies the replacer (if any) to a value before it is serialized. `holder` is
