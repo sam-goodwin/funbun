@@ -1075,3 +1075,47 @@ describe("access-path pruning", () => {
     expect(out.inner.parent).toBe(out);
   });
 });
+
+describe("bundle (bundler-backed)", () => {
+  // bundle() routes the closure through Bun's bundler: imports are resolved and
+  // inlined (which plain serialize cannot do), unused exports are tree-shaken,
+  // and captured state is pruned to referenced members.
+  test("resolves imports, tree-shakes, prunes state, and round-trips", async () => {
+    using dir = tempDir(`closure-bundle-${counter++}`, {
+      "dep.mjs": `
+        export function alpha() { return "ALPHA"; }
+        export function unusedExport() { return "UNUSED_SHOULD_TREESHAKE"; }
+      `,
+      "main.mjs": `
+        import { alpha } from "./dep.mjs";
+        import { bundle } from "bun:closure";
+        import { writeFileSync } from "node:fs";
+        let n = 5;
+        const obj = { pick: "PICK", drop: "DROP_ME" };
+        const fn = () => alpha() + ":" + n + ":" + obj.pick;
+        const out = await bundle(fn);
+        writeFileSync(new URL("./out.mjs", import.meta.url), out);
+        console.log(JSON.stringify({
+          importInlined: out.includes("ALPHA"),
+          treeShaken: !out.includes("UNUSED_SHOULD_TREESHAKE"),
+          statePruned: !out.includes("DROP_ME"),
+        }));
+        const m = await import(new URL("./out.mjs", import.meta.url).href);
+        console.log("RESULT:" + m.default());
+      `,
+    });
+
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), String(dir) + "/main.mjs"],
+      env: { ...bunEnv, BUN_DEBUG_QUIET_LOGS: "1" },
+      stderr: "pipe",
+      stdout: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    const lines = stdout.trim().split("\n");
+
+    expect(JSON.parse(lines[0])).toEqual({ importInlined: true, treeShaken: true, statePruned: true });
+    expect(lines.find(l => l.startsWith("RESULT:"))).toBe("RESULT:ALPHA:5:PICK");
+    expect({ stderr, exitCode }).toEqual({ stderr: expect.any(String), exitCode: 0 });
+  });
+});

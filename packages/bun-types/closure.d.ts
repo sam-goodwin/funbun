@@ -34,4 +34,27 @@ declare module "bun:closure" {
    * ```
    */
   function serialize(fn: Function, replacer?: ClosureReplacer): string;
+
+  /**
+   * **Experimental.** Like {@link serialize}, but routes the closure through
+   * Bun's bundler. The closure's captured state is emitted as a virtual module
+   * and its module-level imports are re-imported from their original sources,
+   * so the bundler resolves, inlines, and tree-shakes them.
+   *
+   * Unlike {@link serialize} — which drops imported bindings, producing a module
+   * that throws `"x is not defined"` — `bundle` produces a working standalone
+   * module for closures that reference imports. It is async because the bundler
+   * is async.
+   *
+   * @param fn The function to serialize.
+   * @returns A promise for the bundled ES module source.
+   * @example
+   * ```ts
+   * import { bundle } from "bun:closure";
+   * import { renderTemplate } from "./templates.ts";
+   * const greet = (name: string) => renderTemplate(name);
+   * const moduleSource = await bundle(greet); // renderTemplate inlined + tree-shaken
+   * ```
+   */
+  function bundle(fn: Function): Promise<string>;
 }

@@ -1289,6 +1289,150 @@ function isNativeFunctionSource(source: string): boolean {
   return trimmed.endsWith("[native code] }") || trimmed.endsWith("[native code]\n}");
 }
 
+// Collect the free identifier names a function's source references (so we know
+// which module-level imports the closure depends on). Bound names (params,
+// declarations, nested function names) are excluded.
+function collectReferencedNames(transpiler: any, source: string): Set<string> {
+  let ast: any;
+  try {
+    ast = transpiler.ast("(" + source + ")");
+  } catch {
+    return new Set();
+  }
+  const refs = new Set<string>();
+  const bound = new Set<string>();
+  (function walk(n: any): void {
+    if ($isJSArray(n)) {
+      for (const x of n) walk(x);
+      return;
+    }
+    if (!n || typeof n !== "object" || typeof n.type !== "string") return;
+    if (n.type === "Identifier") {
+      refs.add(n.name);
+      return;
+    }
+    if (n.type === "FunctionDeclaration" || n.type === "FunctionExpression" || n.type === "ArrowFunctionExpression") {
+      if (n.id) bound.add(n.id.name);
+      for (const p of n.params || []) if (p?.type === "Identifier") bound.add(p.name);
+    }
+    if (n.type === "VariableDeclarator" && n.id?.type === "Identifier") bound.add(n.id.name);
+    for (const k in n) {
+      if (k === "type" || k === "start") continue;
+      walk(n[k]);
+    }
+  })(ast);
+  for (const b of bound) refs.delete(b);
+  return refs;
+}
+
+// **Experimental.** Like `serialize`, but routes the closure through Bun's
+// bundler: the closure's captured state is emitted as a virtual state module,
+// its module-level imports are re-imported from their original sources, and the
+// bundler resolves + inlines + tree-shakes them. Unlike `serialize`, closures
+// that reference imported bindings produce a working standalone module. Async
+// (the bundler is async). Returns the bundled ESM source.
+async function bundle(fn: Function): Promise<string> {
+  if (typeof fn !== "function") {
+    throw new TypeError("bundle() expects a function");
+  }
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const Bun = (globalThis as any).Bun;
+  const transpiler = new Bun.Transpiler();
+
+  const source = fn.toString();
+  const location = (fn as any)[Symbol.sourceLocation];
+  const url: string | undefined = location?.url;
+
+  // 1. Captured state → a virtual module exporting each free variable. Reuses
+  //    the existing value emitter (objects, prototypes, pruning, cycles, …).
+  const { sharedIds } = analyzeSharedCells(fn);
+  const ctx: Context = {
+    module: [],
+    refs: new Map(),
+    counter: 0,
+    sharedIds,
+    replacer: undefined,
+    sourceBlocks: [],
+    keepSets: computeKeepSets(fn),
+  };
+  const freeVariables = allFreeVariables(fn, source);
+  const stateExports: string[] = [];
+  const stateNames = new Set<string>();
+  for (const variable of freeVariables) {
+    if (stateNames.has(variable.name)) continue;
+    stateNames.add(variable.name);
+    const value = transform(undefined, variable.name, variable.value, ctx);
+    stateExports.push(`export const ${variable.name} = ${emitValue(value, ctx)};`);
+  }
+  const stateModule = (ctx.module.length ? ctx.module.join("\n") + "\n" : "") + stateExports.join("\n");
+
+  // 2. Recover the closure module's import bindings: localName → original source.
+  const bindings = new Map<string, { source: string; imported?: string; default?: boolean; star?: boolean }>();
+  if (url && fs.existsSync(url)) {
+    const moduleAst = transpiler.ast(fs.readFileSync(url, "utf8"));
+    for (const stmt of moduleAst.body) {
+      if (stmt.type !== "ImportDeclaration" || typeof stmt.source !== "string") continue;
+      const resolved = path.resolve(path.dirname(url), stmt.source);
+      for (const spec of stmt.specifiers) {
+        if (spec.type === "ImportSpecifier") bindings.set(spec.local, { source: resolved, imported: spec.imported });
+        else if (spec.type === "ImportDefaultSpecifier") bindings.set(spec.local, { source: resolved, default: true });
+        else if (spec.type === "ImportNamespaceSpecifier") bindings.set(spec.local, { source: resolved, star: true });
+      }
+    }
+  }
+
+  // 3. Re-import each referenced module-level dependency from its original source.
+  const importLines: string[] = [];
+  const emitted = new Set<string>();
+  for (const name of collectReferencedNames(transpiler, source)) {
+    if (stateNames.has(name) || name in (globalThis as any) || emitted.has(name)) {
+      continue;
+    }
+    const b = bindings.get(name);
+    if (!b) continue;
+    emitted.add(name);
+    if (b.default) importLines.push(`import ${name} from ${JSON.stringify(b.source)};`);
+    else if (b.star) importLines.push(`import * as ${name} from ${JSON.stringify(b.source)};`);
+    else
+      importLines.push(
+        `import { ${b.imported === name ? name : `${b.imported} as ${name}`} } from ${JSON.stringify(b.source)};`,
+      );
+  }
+
+  // 4. Synthetic entry wiring imports + state to the reconstructed closure.
+  const entry = [
+    ...importLines,
+    stateNames.size ? `import { ${[...stateNames].join(", ")} } from "bun-closure:state";` : "",
+    `export default (${source});`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  // 5. Drive the bundler; it resolves + inlines + tree-shakes the real imports.
+  const result = await Bun.build({
+    entrypoints: ["bun-closure:entry"],
+    format: "esm",
+    plugins: [
+      {
+        name: "bun-closure",
+        setup(build: any) {
+          build.onResolve({ filter: /^bun-closure:/ }, (args: any) => ({ path: args.path, namespace: "bun-closure" }));
+          build.onLoad({ filter: /.*/, namespace: "bun-closure" }, (args: any) => ({
+            loader: "js",
+            contents: args.path === "bun-closure:entry" ? entry : stateModule,
+          }));
+        },
+      },
+    ],
+  });
+  if (!result.success) {
+    throw new Error("Failed to bundle closure:\n" + result.logs.map((l: unknown) => String(l)).join("\n"));
+  }
+  return await result.outputs[0].text();
+}
+
 export default {
   serialize,
+  bundle,
 };
