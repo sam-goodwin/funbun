@@ -948,10 +948,46 @@ describe("unserializable values throw clearly (no silent loss)", () => {
     void w;
     expect(() => serialize(() => w)).toThrow("WeakSet");
   });
-  test("Promise", () => {
-    let p = Promise.resolve(1);
+  test("a pending Promise throws a clear error", () => {
+    let p = new Promise(() => {}); // never settles
     void p;
-    expect(() => serialize(() => p)).toThrow("Promise");
+    expect(() => serialize(() => p)).toThrow(/pending Promise/);
+  });
+});
+
+describe("settled promises round-trip", () => {
+  test("a fulfilled promise reconstructs with its value", async () => {
+    let p = Promise.resolve(42);
+    await p; // ensure settled before serializing
+    void p;
+    const out = (await roundtrip(() => p))();
+    await expect(out).resolves.toBe(42);
+  });
+
+  test("a fulfilled promise resolving to a captured object", async () => {
+    let p = Promise.resolve({ a: 1, nested: [2, 3] });
+    await p;
+    void p;
+    const out = (await roundtrip(() => p))();
+    await expect(out).resolves.toEqual({ a: 1, nested: [2, 3] });
+  });
+
+  test("a rejected promise reconstructs with its reason", async () => {
+    let p = Promise.reject(new TypeError("boom"));
+    await p.catch(() => {}); // settle + handle the original
+    void p;
+    const out = (await roundtrip(() => p))();
+    await expect(out).rejects.toThrow("boom");
+  });
+
+  test("a fulfilled promise nested in a captured object", async () => {
+    let p = Promise.resolve("inner");
+    await p;
+    const o = { label: "x", promise: p };
+    void o;
+    const result = (await roundtrip(() => o))();
+    expect(result.label).toBe("x");
+    await expect(result.promise).resolves.toBe("inner");
   });
 });
 

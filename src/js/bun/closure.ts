@@ -1006,8 +1006,14 @@ function emitObject(value: object, ctx: Context): string {
   if (value instanceof WeakMap || value instanceof WeakSet) {
     throw new TypeError("Cannot serialize a WeakMap/WeakSet (its entries are not enumerable)");
   }
-  if (value instanceof Promise) {
-    throw new TypeError("Cannot serialize a Promise");
+  if (value instanceof Promise && $peekPromiseStatus(value) === 0) {
+    // A pending promise's resolution is tied to live I/O / timers / a suspended
+    // async frame in the event loop — not expressible as source. (Settled
+    // promises are reconstructed in emitBuiltin.)
+    throw new TypeError(
+      "Cannot serialize a pending Promise (its resolution is tied to live I/O or timers). " +
+        "Await it first, or serialize the settled value.",
+    );
   }
   if (value instanceof WeakRef) {
     throw new TypeError("Cannot serialize a WeakRef (its referent's liveness is not reproducible)");
@@ -1247,6 +1253,22 @@ function propertyKeyExpression(key: string | symbol): string {
 // caller can detect and restore a subclass instance); returns null for plain
 // objects/arrays, which the caller handles.
 function emitBuiltin(value: object, name: string, ctx: Context): object | null {
+  // A settled promise reconstructs from its result: Promise.resolve(value) /
+  // Promise.reject(reason). Rejected promises are pre-handled (`.catch(...)`) so
+  // module load doesn't raise an unhandled-rejection — the reason is still
+  // delivered to anyone who awaits/catches `name`. (Pending promises already
+  // threw in emitObject.)
+  if (value instanceof Promise) {
+    const status = $peekPromiseStatus(value);
+    const settled = $peekPromiseSettledValue(value);
+    if (status === 2) {
+      ctx.module.push(`const ${name} = Promise.reject(${emitValue(settled, ctx)});`);
+      ctx.module.push(`${name}.catch(() => {});`);
+    } else {
+      ctx.module.push(`const ${name} = Promise.resolve(${emitValue(settled, ctx)});`);
+    }
+    return Promise.prototype;
+  }
   if (value instanceof Date) {
     ctx.module.push(`const ${name} = new Date(${(value as Date).getTime()});`);
     return Date.prototype;

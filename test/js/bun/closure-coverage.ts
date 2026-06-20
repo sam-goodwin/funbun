@@ -110,7 +110,18 @@ export const CATEGORIES: CoverageCategory[] = [
       L("val.unique-symbol-key", "unique symbol key (clear error)", "throws on a unique-symbol-keyed property"),
       L("val.weakmap", "WeakMap (clear error)", "WeakMap"),
       L("val.weakset", "WeakSet (clear error)", "WeakSet"),
-      L("val.promise", "Promise (clear error)", "let p = Promise.resolve(1)"),
+      S(
+        "val.promise-fulfilled",
+        "fulfilled promise (value reconstructed)",
+        "a fulfilled promise reconstructs with its value",
+      ),
+      S(
+        "val.promise-rejected",
+        "rejected promise (reason reconstructed)",
+        "a rejected promise reconstructs with its reason",
+      ),
+      S("val.promise-nested", "settled promise nested in an object", "a fulfilled promise nested in a captured object"),
+      L("val.promise-pending", "pending Promise (clear error)", "a pending Promise throws a clear error"),
       L(
         "val.generator-object",
         "generator object (clear error)",
