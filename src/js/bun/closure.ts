@@ -250,6 +250,12 @@ function analyzeSharedCells(root: Function): { sharedIds: Set<number>; cellInfo:
       if (descriptor.set) visitValue(descriptor.set);
       if ("value" in descriptor) visitValue(descriptor.value);
     }
+    // A class instance is reconstructed via its class, so analyze that too.
+    const proto = Object.getPrototypeOf(o);
+    if (proto !== null && proto !== Object.prototype) {
+      const ctor = (proto as any).constructor;
+      visitValue(typeof ctor === "function" && ctor.prototype === proto ? ctor : proto);
+    }
   }
   function visitFn(fn: Function): void {
     if (seenFns.has(fn)) return;
@@ -378,11 +384,29 @@ function emitObject(value: object, ctx: Context): string {
       }
     }
   } else {
-    ctx.module.push(`const ${name} = {};`);
+    ctx.module.push(`const ${name} = ${objectBaseExpression(value, ctx)};`);
     emitOwnProperties(name, value, ctx);
   }
 
   return name;
+}
+
+// Returns the expression that creates a fresh object with `value`'s prototype.
+// Plain objects use `{}`; null-prototype objects use `Object.create(null)`; a
+// class instance is recreated via `Object.create(<Class>.prototype)` so its
+// methods, prototype chain, and `instanceof` survive (its own public fields are
+// then assigned by the caller). NOTE: `#private` fields are invisible to
+// reflection and are not captured, and the constructor is not re-run.
+function objectBaseExpression(value: object, ctx: Context): string {
+  const proto = Object.getPrototypeOf(value);
+  if (proto === Object.prototype) return "{}";
+  if (proto === null) return "Object.create(null)";
+
+  const ctor = (proto as any).constructor;
+  if (typeof ctor === "function" && ctor.prototype === proto) {
+    return `Object.create(${emitValue(ctor, ctx)}.prototype)`;
+  }
+  return `Object.create(${emitValue(proto, ctx)})`;
 }
 
 // Emits each own property of `value` onto the hoisted `name`, preserving

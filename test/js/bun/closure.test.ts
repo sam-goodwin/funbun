@@ -452,3 +452,51 @@ test("throws on a unique-symbol-keyed property", () => {
   void o;
   expect(() => serialize(() => o)).toThrow("unique symbol property key");
 });
+
+test("reconstructs a class instance (prototype, methods, fields)", async () => {
+  class Animal {
+    name: string;
+    constructor(n: string) {
+      this.name = n;
+    }
+    speak() {
+      return this.name + " noise";
+    }
+  }
+  let inst = new Animal("rex");
+  void inst;
+  const fn = await roundtrip(() => inst);
+  const out = fn();
+  expect(out.name).toBe("rex");
+  expect(out.speak()).toBe("rex noise");
+  // Cross-module: it's an instance of the *reconstructed* class.
+  expect(out.constructor.name).toBe("Animal");
+  expect(out instanceof out.constructor).toBe(true);
+});
+
+test("reconstructs a null-prototype object", async () => {
+  let o: any = Object.create(null);
+  o.a = 1;
+  void o;
+  const fn = await roundtrip(() => o);
+  const out = fn();
+  expect(out.a).toBe(1);
+  expect(Object.getPrototypeOf(out)).toBe(null);
+});
+
+test("private #fields are not captured (documented limitation)", async () => {
+  class Counter {
+    #n = 5;
+    get value() {
+      return this.#n;
+    }
+  }
+  let c = new Counter();
+  void c;
+  const fn = await roundtrip(() => c);
+  const out = fn();
+  // Prototype/methods survive, but the private field does not exist on the
+  // reconstruction, so reading it throws. (#private is invisible to reflection.)
+  expect(out.constructor.name).toBe("Counter");
+  expect(() => out.value).toThrow();
+});
