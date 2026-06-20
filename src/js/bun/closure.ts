@@ -483,6 +483,8 @@ function emitValue(value: unknown, ctx: Context): string {
       // A Proxy whose target is callable has typeof "function".
       if ($isProxyObject(value)) return emitProxy(value as object, ctx);
       return emitFunction(value as Function, ctx);
+    case "symbol":
+      return emitSymbol(value as symbol);
     default:
       throw new TypeError(`Cannot serialize a free variable of type ${typeof value}`);
   }
@@ -502,12 +504,15 @@ function emitObject(value: object, ctx: Context): string {
 
   if (Array.isArray(value)) {
     ctx.module.push(`const ${name} = [];`);
-    for (let i = 0; i < value.length; i++) {
-      if (i in value) {
-        const child = transform(value, String(i), value[i], ctx);
+    const array = value as unknown[];
+    for (let i = 0; i < array.length; i++) {
+      if (i in array) {
+        const child = transform(value, String(i), array[i], ctx);
         ctx.module.push(`${name}[${i}] = ${emitValue(child, ctx)};`);
       }
     }
+    // Preserve the length, including trailing holes.
+    ctx.module.push(`${name}.length = ${array.length};`);
   } else {
     ctx.module.push(`const ${name} = ${objectBaseExpression(value, ctx)};`);
     emitOwnProperties(name, value, ctx);
@@ -597,6 +602,18 @@ const WELL_KNOWN_SYMBOLS: Array<[symbol, string]> = [
   [Symbol.toStringTag, "Symbol.toStringTag"],
   [Symbol.unscopables, "Symbol.unscopables"],
 ];
+
+// Symbols with a stable global identity (registered via Symbol.for, or the
+// well-known symbols) can be reconstructed; a unique symbol cannot (its identity
+// is not reproducible).
+function emitSymbol(value: symbol): string {
+  const registered = Symbol.keyFor(value);
+  if (registered !== undefined) return `Symbol.for(${JSON.stringify(registered)})`;
+  for (const entry of WELL_KNOWN_SYMBOLS) {
+    if (entry[0] === value) return entry[1];
+  }
+  throw new TypeError(`Cannot serialize a unique symbol value (${value.toString()})`);
+}
 
 function propertyKeyExpression(key: string | symbol): string {
   if (typeof key === "string") return JSON.stringify(key);

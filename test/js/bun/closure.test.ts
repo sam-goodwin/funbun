@@ -1,6 +1,6 @@
 import { test, expect, describe } from "bun:test";
 import { serialize } from "bun:closure";
-import { tempDir } from "harness";
+import { tempDir, bunExe, bunEnv } from "harness";
 
 // Round-trip: serialize a function, write the resulting module, dynamic-import
 // it, and return its default export so we can exercise it.
@@ -782,4 +782,155 @@ describe("recursion topologies", () => {
     expect(f(10)).toBe(true);
     expect(f(7)).toBe(false);
   });
+});
+
+describe("function forms round-trip", () => {
+  test("named function expression with self-reference", async () => {
+    const f = await roundtrip(function fac(n: number): number {
+      return n <= 1 ? 1 : n * fac(n - 1);
+    });
+    expect(f(4)).toBe(24);
+  });
+  test("generator with yield* delegation", async () => {
+    function* inner() {
+      yield 1;
+      yield 2;
+    }
+    function* outer() {
+      yield* inner();
+      yield 3;
+    }
+    void [inner, outer];
+    const g = await roundtrip(outer);
+    expect([...g()]).toEqual([1, 2, 3]);
+  });
+  test("async function awaiting a captured promise-returning fn", async () => {
+    let delay = (x: number) => Promise.resolve(x + 1);
+    void delay;
+    const f = await roundtrip(async () => (await delay(41)) * 1);
+    await expect(f()).resolves.toBe(42);
+  });
+});
+
+describe("exotic body syntax survives transforms", () => {
+  test("destructuring params, defaults, rest, spread", async () => {
+    const f = await roundtrip(
+      (a: number, { b = 10 } = {} as any, ...rest: number[]) => a + b + rest.reduce((x, y) => x + y, 0),
+    );
+    expect(f(1, { b: 2 }, 3, 4)).toBe(10);
+    expect(f(1)).toBe(11);
+  });
+  test("optional chaining, nullish, template, tagged template, regex", async () => {
+    function tag(strings: TemplateStringsArray, ...v: any[]) {
+      return strings.join("|") + "::" + v.join(",");
+    }
+    void tag;
+    const f = await roundtrip((o: any) => {
+      const re = /(\d+)-(\d+)/;
+      const m = "12-34".match(re);
+      return tag`a${o?.x ?? "none"}b${m?.[1]}`;
+    });
+    expect(f({ x: 5 })).toBe("a|b|::5,12");
+    expect(f(null)).toBe("a|b|::none,12");
+  });
+  test("try/catch/finally, labeled loops, switch", async () => {
+    const original = (n: number) => {
+      let out = "";
+      outer: for (let i = 0; i < 5; i++) {
+        for (let j = 0; j < 5; j++) {
+          if (j === n) continue outer;
+          if (i === 3) break outer;
+          out += `${i}${j}`;
+        }
+      }
+      try {
+        switch (n) {
+          case 1:
+            return out + "one";
+          default:
+            throw new Error("x");
+        }
+      } catch {
+        return out + "caught";
+      } finally {
+        out += "!";
+      }
+    };
+    const f = await roundtrip(original);
+    for (const n of [0, 1, 2, 3]) expect(f(n)).toBe(original(n));
+  });
+});
+
+describe("captured value types", () => {
+  test("registered symbol value (Symbol.for)", async () => {
+    let s = Symbol.for("bun.closure.test.sym");
+    void s;
+    const f = await roundtrip(() => s);
+    expect(f()).toBe(Symbol.for("bun.closure.test.sym"));
+  });
+  test("well-known symbol value", async () => {
+    let s = Symbol.iterator;
+    void s;
+    const f = await roundtrip(() => s);
+    expect(f()).toBe(Symbol.iterator);
+  });
+  test("unique symbol value throws", () => {
+    let s = Symbol("unique");
+    void s;
+    expect(() => serialize(() => s)).toThrow("unique symbol value");
+  });
+  test("sparse array preserves holes and length", async () => {
+    let arr = [1, , 3];
+    arr.length = 5;
+    void arr;
+    const out = (await roundtrip(() => arr))();
+    expect(out.length).toBe(5);
+    expect(1 in out).toBe(false);
+    expect(out[0]).toBe(1);
+    expect(out[2]).toBe(3);
+  });
+  test("deeply nested mixed graph with a cycle", async () => {
+    let inner: any = { tag: "leaf" };
+    let graph: any = { list: [1, { fn: () => inner.tag }], inner };
+    inner.parent = graph;
+    void graph;
+    const out = (await roundtrip(() => graph))();
+    expect(out.list[1].fn()).toBe("leaf");
+    expect(out.inner.parent).toBe(out);
+  });
+});
+
+test("captures a function and a value imported from another module", async () => {
+  using dir = tempDir("closure-xmod", {
+    "dep.ts": `export function helper(x: number) { return x * 10; }\nexport const FACTOR = 3;\n`,
+    "main.ts": `
+      import { serialize } from "bun:closure";
+      import { helper, FACTOR } from "./dep.ts";
+      import fs from "node:fs";
+      let h = helper, f = FACTOR;
+      fs.writeFileSync(new URL("./out.mjs", import.meta.url), serialize(() => h(f)));
+    `,
+    "runner.ts": `
+      const fn = (await import("./out.mjs")).default;
+      console.log(fn());
+    `,
+  });
+  await using gen = Bun.spawn({
+    cmd: [bunExe(), "main.ts"],
+    cwd: String(dir),
+    env: { ...bunEnv, BUN_DEBUG_QUIET_LOGS: "1" },
+    stderr: "pipe",
+  });
+  const genErr = await gen.stderr.text();
+  expect({ err: genErr, code: await gen.exited }).toEqual({ err: expect.any(String), code: 0 });
+  await using proc = Bun.spawn({
+    cmd: [bunExe(), "runner.ts"],
+    cwd: String(dir),
+    env: { ...bunEnv, BUN_DEBUG_QUIET_LOGS: "1" },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, , exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+  expect(stdout.trim()).toBe("30");
+  expect(exitCode).toBe(0);
 });
