@@ -536,6 +536,41 @@ export const CATEGORIES: CoverageCategory[] = [
         "shared cell across generator + function",
         "a shared cell mutated by both a generator and a plain function",
       ),
+      S(
+        "ix.array-subclass",
+        "class extends Array (instanceof preserved)",
+        "a class extends Array instance round-trips with its prototype",
+      ),
+      S("ix.map-subclass", "class extends Map", "a class extends Map instance round-trips with its prototype"),
+      S("ix.set-subclass", "class extends Set", "a class extends Set instance round-trips"),
+      S("ix.frozen-array", "frozen array", "a frozen array round-trips frozen"),
+      S(
+        "ix.custom-proto",
+        "object with a custom (non-class) prototype",
+        "an object with a custom (non-class) prototype round-trips the chain",
+      ),
+      S(
+        "ix.toprimitive-frozen",
+        "Symbol.toPrimitive on a frozen object",
+        "Symbol.toPrimitive on a frozen object still coerces",
+      ),
+      S("ix.map-map-key", "Map keyed by another Map", "a Map keyed by another Map round-trips identity"),
+      S(
+        "ix.accessor-shared-cell",
+        "accessor pair sharing one captured cell",
+        "an accessor pair sharing one captured cell stays consistent",
+      ),
+      S("ix.bound-to-proxy", "function bound to a Proxy receiver", "a function bound to a Proxy receiver round-trips"),
+      S(
+        "ix.mega",
+        "frozen subclass + private + Map + super",
+        "mega: frozen subclass instance with private field + Map + super",
+      ),
+      S(
+        "ix.async-await-using",
+        "async fn with await using over a disposable",
+        "an async function using `await using` over a captured disposable",
+      ),
     ],
   },
 ];

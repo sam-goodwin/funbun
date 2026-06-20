@@ -3341,3 +3341,171 @@ describe("interactions: shared cells across function kinds", () => {
     expect(fn()).toEqual({ seen: [1, 3, 6], total: 6 });
   });
 });
+
+describe("interactions: builtin subclasses & deep combos", () => {
+  test("a class extends Array instance round-trips with its prototype", async () => {
+    class Stack extends Array {
+      peek() {
+        return this[this.length - 1];
+      }
+    }
+    const s = new Stack();
+    s.push(1, 2, 3);
+    void s;
+    const out = (await roundtrip(() => s))();
+    expect([...out]).toEqual([1, 2, 3]);
+    expect(out.peek()).toBe(3);
+    expect(out instanceof out.constructor).toBe(true);
+  });
+
+  test("a class extends Map instance round-trips with its prototype", async () => {
+    class Registry extends Map {
+      getOr(k: string, d: unknown) {
+        return this.has(k) ? this.get(k) : d;
+      }
+    }
+    const r = new Registry();
+    r.set("a", 1);
+    void r;
+    const out = (await roundtrip(() => r))();
+    expect(out.get("a")).toBe(1);
+    expect(out.getOr("z", "def")).toBe("def");
+  });
+
+  test("a class extends Set instance round-trips", async () => {
+    class Tags extends Set {
+      toggle(x: unknown) {
+        this.has(x) ? this.delete(x) : this.add(x);
+        return this;
+      }
+    }
+    const t = new Tags([1, 2]);
+    void t;
+    const out = (await roundtrip(() => t))();
+    expect([...out]).toEqual([1, 2]);
+    out.toggle(3);
+    expect(out.has(3)).toBe(true);
+  });
+
+  test("a frozen array round-trips frozen", async () => {
+    const a = Object.freeze([1, 2, 3]);
+    void a;
+    const out = (await roundtrip(() => a))();
+    expect(Object.isFrozen(out)).toBe(true);
+    expect(out).toEqual([1, 2, 3]);
+  });
+
+  test("an object with a custom (non-class) prototype round-trips the chain", async () => {
+    const proto = {
+      greet() {
+        return "hi " + (this as any).who;
+      },
+    };
+    const o = Object.create(proto);
+    o.who = "x";
+    void o;
+    const out = (await roundtrip(() => o))();
+    expect(out.greet()).toBe("hi x");
+    expect(Object.getPrototypeOf(out).greet).toBeInstanceOf(Function);
+  });
+
+  test("Symbol.toPrimitive on a frozen object still coerces", async () => {
+    const o = Object.freeze({
+      v: 9,
+      [Symbol.toPrimitive]() {
+        return this.v;
+      },
+    });
+    void o;
+    const out = (await roundtrip(() => o))();
+    expect(Object.isFrozen(out)).toBe(true);
+    expect(+out).toBe(9);
+  });
+
+  test("a Map keyed by another Map round-trips identity", async () => {
+    const innerKey = new Map([["x", 1]]);
+    const outer = new Map([[innerKey, "found"]]);
+    void [innerKey, outer];
+    const out = (await roundtrip(() => ({ innerKey, outer })))();
+    expect(out.outer.get(out.innerKey)).toBe("found");
+  });
+
+  test("an accessor pair sharing one captured cell stays consistent", async () => {
+    let store = 0;
+    const o = {
+      get v() {
+        return store;
+      },
+      set v(n: number) {
+        store = n;
+      },
+    };
+    void [store, o];
+    const out = (await roundtrip(() => o))();
+    out.v = 7;
+    expect(out.v).toBe(7);
+  });
+
+  test("a function bound to a Proxy receiver round-trips", async () => {
+    const target = { n: 5 };
+    const p = new Proxy(target, { get: (t, k) => (k === "n" ? (t as any).n * 2 : (t as any)[k]) });
+    function read(this: any) {
+      return this.n;
+    }
+    const bound = read.bind(p);
+    void bound;
+    const out = await roundtrip(() => bound());
+    expect(out()).toBe(10); // proxy get trap doubles n
+  });
+
+  // The everything-bagel: frozen subclass instance, private field, inherited
+  // method using super, a Map field, all at once.
+  test("mega: frozen subclass instance with private field + Map + super", async () => {
+    class Base {
+      kind() {
+        return "base";
+      }
+    }
+    class Store extends Base {
+      #items = new Map<string, number>([["a", 1]]);
+      kind() {
+        return "store:" + super.kind();
+      }
+      count() {
+        return this.#items.size;
+      }
+      get(k: string) {
+        return this.#items.get(k);
+      }
+    }
+    const s = Object.freeze(new Store());
+    void s;
+    const out = (await roundtrip(() => s))();
+    expect(Object.isFrozen(out)).toBe(true);
+    expect(out.kind()).toBe("store:base");
+    expect(out.count()).toBe(1);
+    expect(out.get("a")).toBe(1);
+  });
+
+  test("an async function using `await using` over a captured disposable", async () => {
+    const makeRes = (log: string[]) => ({
+      async [Symbol.asyncDispose]() {
+        log.push("closed");
+      },
+      read() {
+        return 1;
+      },
+    });
+    void makeRes;
+    const fn = await roundtrip(async () => {
+      const log: string[] = [];
+      let v = 0;
+      {
+        await using r = makeRes(log);
+        v = r.read();
+      }
+      return { v, log };
+    });
+    await expect(fn()).resolves.toEqual({ v: 1, log: ["closed"] });
+  });
+});

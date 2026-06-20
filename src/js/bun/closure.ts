@@ -947,8 +947,18 @@ function emitObject(value: object, ctx: Context): string {
   // Record BEFORE recursing so a self-reference resolves to `name`.
   ctx.refs.set(value, name);
 
-  if (!emitBuiltin(value, name, ctx)) {
+  const builtinProto = emitBuiltin(value, name, ctx);
+  if (builtinProto === null) {
     emitObjectBody(value, name, ctx);
+    // An array subclass (`class X extends Array`) is constructed as a plain array
+    // above; restore its prototype and any extra (non-index) own/private fields.
+    if (Array.isArray(value) && Object.getPrototypeOf(value) !== Array.prototype) {
+      restoreSubclass(value, name, ctx, arrayIndexSkip(value));
+    }
+  } else if (Object.getPrototypeOf(value) !== builtinProto) {
+    // A built-in subclass (`class X extends Map/Set/...`): the base data is built;
+    // restore the subclass prototype + its own/private instance fields.
+    restoreSubclass(value, name, ctx);
   }
 
   // Preserve a non-extensible/sealed/frozen state — applied LAST, after every
@@ -961,6 +971,30 @@ function emitObject(value: object, ctx: Context): string {
   }
 
   return name;
+}
+
+// Restores a built-in subclass instance: set its real prototype, then emit its
+// extra own properties (instance fields) and private fields. `skip` excludes
+// keys already materialized by the base construction (array indices + length).
+function restoreSubclass(value: object, name: string, ctx: Context, skip?: Set<string>): void {
+  // Point at the reconstructed class's own `.prototype` (not a standalone copy)
+  // so `instanceof` and the shared prototype identity survive — same shape as
+  // objectBaseExpression's class-instance case.
+  const proto = Object.getPrototypeOf(value);
+  const ctor = (proto as any)?.constructor;
+  const protoExpr =
+    typeof ctor === "function" && ctor.prototype === proto
+      ? `${emitValue(ctor, ctx)}.prototype`
+      : emitValue(proto, ctx);
+  ctx.module.push(`Object.setPrototypeOf(${name}, ${protoExpr});`);
+  emitOwnProperties(name, value, ctx, skip);
+  emitPrivateFields(name, value, ctx);
+}
+
+function arrayIndexSkip(value: unknown[]): Set<string> {
+  const skip = new Set<string>(["length"]);
+  for (let i = 0; i < value.length; i++) skip.add(String(i));
+  return skip;
 }
 
 function emitObjectBody(value: object, name: string, ctx: Context): void {
@@ -1113,37 +1147,39 @@ function propertyKeyExpression(key: string | symbol): string {
   throw new TypeError(`Cannot serialize a unique symbol property key (${key.toString()})`);
 }
 
-// Reconstructs common built-in object types. Returns true (and appends the
-// construction to ctx.module under `name`) if `value` is a recognized built-in;
-// returns false for plain objects/arrays, which the caller handles.
-function emitBuiltin(value: object, name: string, ctx: Context): boolean {
+// Reconstructs common built-in object types. Appends the construction to
+// ctx.module under `name` and returns the built-in's NATURAL prototype (so the
+// caller can detect and restore a subclass instance); returns null for plain
+// objects/arrays, which the caller handles.
+function emitBuiltin(value: object, name: string, ctx: Context): object | null {
   if (value instanceof Date) {
     ctx.module.push(`const ${name} = new Date(${(value as Date).getTime()});`);
-    return true;
+    return Date.prototype;
   }
   if (value instanceof RegExp) {
     const re = value as RegExp;
     ctx.module.push(`const ${name} = new RegExp(${JSON.stringify(re.source)}, ${JSON.stringify(re.flags)});`);
-    return true;
+    return RegExp.prototype;
   }
   if (value instanceof Map) {
     ctx.module.push(`const ${name} = new Map();`);
     for (const entry of value as Map<unknown, unknown>) {
       ctx.module.push(`${name}.set(${emitValue(entry[0], ctx)}, ${emitValue(entry[1], ctx)});`);
     }
-    return true;
+    return Map.prototype;
   }
   if (value instanceof Set) {
     ctx.module.push(`const ${name} = new Set();`);
     for (const element of value as Set<unknown>) {
       ctx.module.push(`${name}.add(${emitValue(element, ctx)});`);
     }
-    return true;
+    return Set.prototype;
   }
   // ArrayBuffer-backed: emit the underlying buffer through the normal value path
   // (so multiple views over one buffer share it by identity) then build the view
   // over it, preserving byteOffset/length. DataView and every typed-array kind go
-  // through here.
+  // through here. (Subclassing these is not supported — return the live prototype
+  // so no subclass-restore is attempted.)
   if (ArrayBuffer.isView(value)) {
     const view = value as ArrayBufferView & { length?: number; constructor: { name: string } };
     const bufferExpr = emitValue(view.buffer, ctx);
@@ -1154,7 +1190,7 @@ function emitBuiltin(value: object, name: string, ctx: Context): boolean {
         `const ${name} = new ${view.constructor.name}(${bufferExpr}, ${view.byteOffset}, ${view.length});`,
       );
     }
-    return true;
+    return Object.getPrototypeOf(value);
   }
   if (
     value instanceof ArrayBuffer ||
@@ -1164,22 +1200,22 @@ function emitBuiltin(value: object, name: string, ctx: Context): boolean {
     const bytes = [...new Uint8Array(value as ArrayBufferLike)];
     ctx.module.push(`const ${name} = new ${ctor}(${(value as ArrayBufferLike).byteLength});`);
     if (bytes.some(b => b !== 0)) ctx.module.push(`new Uint8Array(${name}).set([${bytes.join(", ")}]);`);
-    return true;
+    return Object.getPrototypeOf(value);
   }
   // Boxed primitives (new Number/String/Boolean) — objects wrapping a primitive.
   if (value instanceof Number) {
     ctx.module.push(`const ${name} = new Number(${serializeNumber((value as Number).valueOf())});`);
-    return true;
+    return Number.prototype;
   }
   if (value instanceof String) {
     ctx.module.push(`const ${name} = new String(${JSON.stringify((value as String).valueOf())});`);
-    return true;
+    return String.prototype;
   }
   if (value instanceof Boolean) {
     ctx.module.push(`const ${name} = new Boolean(${(value as Boolean).valueOf()});`);
-    return true;
+    return Boolean.prototype;
   }
-  return false;
+  return null;
 }
 
 // Known builtin Error constructors, in priority order (most specific first).
