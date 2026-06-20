@@ -484,21 +484,55 @@ test("reconstructs a null-prototype object", async () => {
   expect(Object.getPrototypeOf(out)).toBe(null);
 });
 
-test("private #fields are not captured (documented limitation)", async () => {
+test("reconstructs a class instance's private #field state (made public)", async () => {
   class Counter {
     #n = 5;
     get value() {
       return this.#n;
     }
+    bump() {
+      return ++this.#n;
+    }
   }
   let c = new Counter();
+  c.bump(); // #n is now 6
   void c;
-  const fn = await roundtrip(() => c);
-  const out = fn();
-  // Prototype/methods survive, but the private field does not exist on the
-  // reconstruction, so reading it throws. (#private is invisible to reflection.)
+  const out = (await roundtrip(() => c))();
+  // Private #field value is snapshotted and restored (as a mangled public field);
+  // methods that referenced #n keep working.
+  expect(out.value).toBe(6);
+  expect(out.bump()).toBe(7);
   expect(out.constructor.name).toBe("Counter");
-  expect(() => out.value).toThrow();
+});
+
+test("reconstructs a class with a private method (made public)", async () => {
+  class Svc {
+    #secret = 42;
+    #compute() {
+      return this.#secret * 2;
+    }
+    run() {
+      return this.#compute();
+    }
+  }
+  let s = new Svc();
+  void s;
+  const out = (await roundtrip(() => s))();
+  expect(out.run()).toBe(84);
+});
+
+test("private field rewrite skips strings and comments", async () => {
+  class WithHash {
+    #n = 1;
+    tag() {
+      // a comment mentioning #n should be untouched
+      return "literal #n stays" + this.#n;
+    }
+  }
+  let w = new WithHash();
+  void w;
+  const out = (await roundtrip(() => w))();
+  expect(out.tag()).toBe("literal #n stays1");
 });
 
 test("reconstructs a subclass value (extends superclass)", async () => {

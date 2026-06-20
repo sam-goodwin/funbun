@@ -68,6 +68,8 @@
 #include "JavaScriptCore/JSGlobalLexicalEnvironment.h"
 #include "JavaScriptCore/Symbol.h"
 #include "JavaScriptCore/SymbolInlines.h"
+#include "JavaScriptCore/PropertyNameArray.h"
+#include "JavaScriptCore/EnumerationMode.h"
 #include "JavaScriptCore/FunctionExecutable.h"
 #include "JavaScriptCore/SourceProvider.h"
 #include "JavaScriptCore/UnlinkedFunctionExecutable.h"
@@ -3150,6 +3152,49 @@ JSC_DEFINE_CUSTOM_GETTER(functionSourceLocationGetter, (JSC::JSGlobalObject * gl
     return JSC::JSValue::encode(result);
 }
 
+// ===================== Symbol.privateFields (experimental) =====================
+// Returns an object's own private (`#name`) instance fields as an array of
+// { name: "#name", value }. Private fields are otherwise unreadable via
+// reflection; a serializer uses this to snapshot a class instance's private
+// state. Returns an empty array for objects without private fields.
+JSC_DEFINE_CUSTOM_GETTER(objectPrivateFieldsGetter, (JSC::JSGlobalObject * globalObject, JSC::EncodedJSValue thisValue, JSC::PropertyName))
+{
+    JSC::VM& vm = JSC::getVM(globalObject);
+    auto scope = DECLARE_THROW_SCOPE(vm);
+
+    JSC::JSArray* result = JSC::constructEmptyArray(globalObject, nullptr);
+    RETURN_IF_EXCEPTION(scope, {});
+
+    JSC::JSObject* object = JSC::JSValue::decode(thisValue).getObject();
+    if (!object)
+        return JSC::JSValue::encode(result);
+
+    JSC::PropertyNameArrayBuilder propertyNames(vm, JSC::PropertyNameMode::Symbols, JSC::PrivateSymbolMode::Include);
+    object->methodTable()->getOwnPropertyNames(object, globalObject, propertyNames, JSC::DontEnumPropertiesMode::Include);
+    RETURN_IF_EXCEPTION(scope, {});
+
+    unsigned index = 0;
+    for (const auto& identifier : propertyNames) {
+        WTF::UniquedStringImpl* uid = identifier.impl();
+        if (!uid || !uid->isSymbol() || !static_cast<WTF::SymbolImpl*>(uid)->isPrivate())
+            continue;
+        // Only own data fields (private methods/accessors are recreated from the
+        // class source, not snapshotted as instance state).
+        JSC::JSValue value = object->getDirect(vm, identifier);
+        if (!value)
+            continue;
+
+        JSC::JSObject* entry = JSC::constructEmptyObject(globalObject);
+        // The private symbol's description already includes the leading "#".
+        entry->putDirect(vm, JSC::Identifier::fromString(vm, "name"_s), JSC::jsString(vm, WTF::String { static_cast<WTF::StringImpl*>(uid) }), 0);
+        entry->putDirect(vm, JSC::Identifier::fromString(vm, "value"_s), value, 0);
+        result->putDirectIndex(globalObject, index++, entry);
+        RETURN_IF_EXCEPTION(scope, {});
+    }
+
+    return JSC::JSValue::encode(result);
+}
+
 // This is like `putDirectBuiltinFunction` but for the global static list.
 #define globalBuiltinFunction(vm, globalObject, identifier, function, attributes) JSC::JSGlobalObject::GlobalPropertyInfo(identifier, JSFunction::create(vm, function, globalObject), attributes)
 
@@ -3346,6 +3391,25 @@ void GlobalObject::addBuiltinGlobals(JSC::VM& vm)
         if (JSC::JSObject* symbolConstructor = symbolConstructorValue.getObject()) {
             symbolConstructor->putDirect(vm, JSC::Identifier::fromString(vm, "sourceLocation"_s),
                 JSC::Symbol::create(vm, vm.symbolRegistry().symbolForKey(sourceLocationKey)),
+                PropertyAttribute::DontEnum | PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly | 0);
+        }
+    }
+
+    // ----- Symbol.privateFields (experimental) -----
+    // Exposes an object's own private (`#name`) instance fields as
+    // `obj[Symbol.privateFields]`. Accessor lives on Object.prototype.
+    {
+        const auto privateFieldsKey = "Symbol.privateFields"_s;
+        this->objectPrototype()->putDirectCustomAccessor(vm,
+            JSC::Identifier::fromUid(vm.symbolRegistry().symbolForKey(privateFieldsKey)),
+            JSC::CustomGetterSetter::create(vm, objectPrivateFieldsGetter, nullptr),
+            PropertyAttribute::DontEnum | PropertyAttribute::ReadOnly | PropertyAttribute::CustomAccessor | 0);
+
+        JSC::JSValue symbolConstructorValue = this->get(this, JSC::Identifier::fromString(vm, "Symbol"_s));
+        RETURN_IF_EXCEPTION(scope, );
+        if (JSC::JSObject* symbolConstructor = symbolConstructorValue.getObject()) {
+            symbolConstructor->putDirect(vm, JSC::Identifier::fromString(vm, "privateFields"_s),
+                JSC::Symbol::create(vm, vm.symbolRegistry().symbolForKey(privateFieldsKey)),
                 PropertyAttribute::DontEnum | PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly | 0);
         }
     }

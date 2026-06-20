@@ -266,6 +266,8 @@ function analyzeSharedCells(root: Function): { sharedIds: Set<number>; cellInfo:
       const ctor = (proto as any).constructor;
       visitValue(typeof ctor === "function" && ctor.prototype === proto ? ctor : proto);
     }
+    const privateFields = (o as any)[Symbol.privateFields] as Array<{ value: unknown }> | undefined;
+    if (privateFields) for (const field of privateFields) visitValue(field.value);
   }
   function visitFn(fn: Function): void {
     if (seenFns.has(fn)) return;
@@ -315,10 +317,14 @@ interface ReconstructedFunction {
 // Returns an expression that evaluates to a reconstruction of `fn`, wrapping its
 // captured variables in an IIFE scope when it has any.
 function reconstructFunctionExpr(fn: Function, ctx: Context): ReconstructedFunction {
-  const source = fn.toString();
-  if (isNativeFunctionSource(source)) {
+  const original = fn.toString();
+  if (isNativeFunctionSource(original)) {
     throw new TypeError("Cannot serialize a native function (no JavaScript source is available)");
   }
+  // Transform `#private` class members into mangled public members so instances
+  // can be reconstructed. Same-line replacement, so line counts are preserved
+  // (source maps stay correct).
+  const source = original.trimStart().startsWith("class") ? rewritePrivateMembers(original) : original;
 
   const freeVariables = allFreeVariables(fn, source);
   const location = (fn as any)[Symbol.sourceLocation] as ReconstructedFunction["location"];
@@ -465,9 +471,21 @@ function emitObject(value: object, ctx: Context): string {
   } else {
     ctx.module.push(`const ${name} = ${objectBaseExpression(value, ctx)};`);
     emitOwnProperties(name, value, ctx);
+    emitPrivateFields(name, value, ctx);
   }
 
   return name;
+}
+
+// Emits an instance's private (#name) field values (read natively) as the
+// matching mangled public properties the rewritten class methods reference.
+function emitPrivateFields(name: string, value: object, ctx: Context): void {
+  const privateFields = (value as any)[Symbol.privateFields] as Array<{ name: string; value: unknown }> | undefined;
+  if (!privateFields || privateFields.length === 0) return;
+  for (const field of privateFields) {
+    const child = transform(value, field.name, field.value, ctx);
+    ctx.module.push(`${name}[${JSON.stringify(mangledPrivateName(field.name))}] = ${emitValue(child, ctx)};`);
+  }
 }
 
 // Returns the expression that creates a fresh object with `value`'s prototype.
@@ -721,6 +739,133 @@ function functionSourceToExpression(source: string, name: string): string {
   }
   // Fallback: wrap and extract by name (should be unreachable for valid sources).
   return `({ ${source} })[${JSON.stringify(name)}]`;
+}
+
+// Private (#name) members can't be set from outside the class, so a serialized
+// instance can't restore them. With the user's consent we transform them into
+// regular (mangled) public members: every `#name` in the class source becomes
+// `PRIVATE_PREFIX + name`, and a reconstructed instance's private-field values
+// (read natively via Symbol.privateFields) are assigned to the same mangled
+// keys. Methods/fields that were private become public — an intentional
+// fidelity trade. The rewrite skips strings, template text, and comments so it
+// only touches `#name` in code position.
+const PRIVATE_PREFIX = "$bunClosurePrivate$";
+
+function mangledPrivateName(hashName: string): string {
+  // hashName is like "#n"; drop the leading "#".
+  return PRIVATE_PREFIX + hashName.slice(1);
+}
+
+function rewritePrivateMembers(source: string): string {
+  if (source.indexOf("#") === -1) return source;
+  let i = 0;
+  const n = source.length;
+  const isIdentStart = (c: string | undefined) => c !== undefined && /[A-Za-z_$]/.test(c);
+  const isIdentPart = (c: string | undefined) => c !== undefined && /[\w$]/.test(c);
+
+  function scanString(quote: string): string {
+    let out = source[i];
+    i++;
+    while (i < n && source[i] !== quote) {
+      if (source[i] === "\\") {
+        out += source[i] + (source[i + 1] ?? "");
+        i += 2;
+      } else {
+        out += source[i];
+        i++;
+      }
+    }
+    if (i < n) {
+      out += source[i];
+      i++;
+    }
+    return out;
+  }
+
+  function scanTemplate(): string {
+    let out = "`";
+    i++;
+    while (i < n) {
+      const c = source[i];
+      if (c === "\\") {
+        out += c + (source[i + 1] ?? "");
+        i += 2;
+        continue;
+      }
+      if (c === "`") {
+        out += "`";
+        i++;
+        return out;
+      }
+      if (c === "$" && source[i + 1] === "{") {
+        out += "${";
+        i += 2;
+        out += scanCode(true); // consumes through the matching `}`
+        continue;
+      }
+      out += c;
+      i++;
+    }
+    return out;
+  }
+
+  function scanCode(stopAtCloseBrace: boolean): string {
+    let out = "";
+    let braceDepth = 0;
+    while (i < n) {
+      const c = source[i];
+      if (stopAtCloseBrace && c === "}" && braceDepth === 0) {
+        i++;
+        return out + "}";
+      }
+      if (c === "{") {
+        braceDepth++;
+        out += c;
+        i++;
+        continue;
+      }
+      if (c === "}") {
+        braceDepth--;
+        out += c;
+        i++;
+        continue;
+      }
+      if (c === "/" && source[i + 1] === "/") {
+        const e = source.indexOf("\n", i);
+        const end = e === -1 ? n : e;
+        out += source.slice(i, end);
+        i = end;
+        continue;
+      }
+      if (c === "/" && source[i + 1] === "*") {
+        const e = source.indexOf("*/", i + 2);
+        const end = e === -1 ? n : e + 2;
+        out += source.slice(i, end);
+        i = end;
+        continue;
+      }
+      if (c === '"' || c === "'") {
+        out += scanString(c);
+        continue;
+      }
+      if (c === "`") {
+        out += scanTemplate();
+        continue;
+      }
+      if (c === "#" && isIdentStart(source[i + 1])) {
+        let j = i + 1;
+        while (j < n && isIdentPart(source[j])) j++;
+        out += PRIVATE_PREFIX + source.slice(i + 1, j);
+        i = j;
+        continue;
+      }
+      out += c;
+      i++;
+    }
+    return out;
+  }
+
+  return scanCode(false);
 }
 
 function isNativeFunctionSource(source: string): boolean {
