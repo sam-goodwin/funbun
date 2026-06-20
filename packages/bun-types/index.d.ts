@@ -13,6 +13,7 @@
 /// <reference path="./ffi.d.ts" />
 /// <reference path="./html-rewriter.d.ts" />
 /// <reference path="./jsc.d.ts" />
+/// <reference path="./closure.d.ts" />
 /// <reference path="./sqlite.d.ts" />
 /// <reference path="./test.d.ts" />
 /// <reference path="./wasm.d.ts" />

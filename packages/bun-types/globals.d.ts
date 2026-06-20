@@ -1104,6 +1104,42 @@ interface SymbolConstructor {
    * ```
    */
   readonly freeVariables: unique symbol;
+
+  /**
+   * **Experimental.** A well-known symbol exposing a bound function's internals.
+   *
+   * `fn[Symbol.boundFunction]` returns `{ target, boundThis, boundArgs }` for a
+   * function created with `Function.prototype.bind`, or `undefined` for any
+   * other function.
+   *
+   * @experimental
+   */
+  readonly boundFunction: unique symbol;
+
+  /**
+   * **Experimental.** A well-known symbol exposing a function's definition site.
+   *
+   * `fn[Symbol.sourceLocation]` returns `{ url, line, column }` (1-based) for
+   * where a JavaScript function was defined, or `undefined` for native
+   * functions.
+   *
+   * @experimental
+   */
+  readonly sourceLocation: unique symbol;
+}
+
+/** **Experimental.** A bound function's internals — see {@link SymbolConstructor.boundFunction}. */
+interface BoundFunctionDetails {
+  target: Function;
+  boundThis: unknown;
+  boundArgs: unknown[];
+}
+
+/** **Experimental.** A function's definition site — see {@link SymbolConstructor.sourceLocation}. */
+interface FunctionSourceLocation {
+  url: string;
+  line: number;
+  column: number;
 }
 
 interface Function {
@@ -1115,6 +1151,24 @@ interface Function {
    * @see {@link SymbolConstructor.freeVariables}
    */
   readonly [Symbol.freeVariables]: FreeVariableDescriptor[];
+
+  /**
+   * **Experimental.** This bound function's internals, or `undefined` if it is
+   * not a bound function.
+   *
+   * @experimental
+   * @see {@link SymbolConstructor.boundFunction}
+   */
+  readonly [Symbol.boundFunction]: BoundFunctionDetails | undefined;
+
+  /**
+   * **Experimental.** This function's definition site, or `undefined` for native
+   * functions.
+   *
+   * @experimental
+   * @see {@link SymbolConstructor.sourceLocation}
+   */
+  readonly [Symbol.sourceLocation]: FunctionSourceLocation | undefined;
 }
 
 interface ArrayBufferConstructor {
