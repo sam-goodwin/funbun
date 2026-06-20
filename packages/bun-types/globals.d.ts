@@ -1047,6 +1047,73 @@ interface ErrorConstructor {
   stackTraceLimit: number;
 }
 
+/**
+ * **Experimental.** A descriptor of a single variable a closure captures, as
+ * returned by `fn[Symbol.freeVariables]`.
+ */
+interface FreeVariableDescriptor {
+  /** The variable's name. */
+  name: string;
+  /**
+   * A stable id for the underlying variable *cell*. Two closures that close
+   * over the same variable observe the same id — so a serializer can represent
+   * a shared mutable binding once and have both closures reference it.
+   */
+  id: number;
+  /** The variable's current value. */
+  value: any;
+  /**
+   * `"const"` for read-only bindings, `"let"` otherwise. `var` and parameters
+   * are not distinguished from `let` after compilation.
+   */
+  kind: "const" | "let";
+}
+
+interface SymbolConstructor {
+  /**
+   * **Experimental.** A well-known symbol used to read the free variables a
+   * closure captures.
+   *
+   * Accessing `fn[Symbol.freeVariables]` returns an array of
+   * {@link FreeVariableDescriptor} objects describing the variables `fn` closes
+   * over. This reflects the mutable heap-allocated captured state of the
+   * closure:
+   *
+   * - `let`/`var` bindings, function parameters, captured object and closure
+   *   references, and `const` bindings with computed initializers are included.
+   * - `const` bindings whose initializer is a compile-time constant are folded
+   *   into the function's code and therefore do not appear.
+   *
+   * Native (non-JavaScript) functions return an empty array.
+   *
+   * @experimental This is a Bun-specific primitive and may change.
+   *
+   * @example
+   * ```ts
+   * function makeCounter() {
+   *   let n = 0;
+   *   return () => ++n;
+   * }
+   * const counter = makeCounter();
+   * counter();
+   * counter[Symbol.freeVariables];
+   * // [{ name: "n", id: 1048576, value: 1, kind: "let" }]
+   * ```
+   */
+  readonly freeVariables: unique symbol;
+}
+
+interface Function {
+  /**
+   * **Experimental.** The free variables this closure captures, as an array of
+   * {@link FreeVariableDescriptor} objects.
+   *
+   * @experimental
+   * @see {@link SymbolConstructor.freeVariables}
+   */
+  readonly [Symbol.freeVariables]: FreeVariableDescriptor[];
+}
+
 interface ArrayBufferConstructor {
   new (byteLength: number, options: { maxByteLength?: number }): ArrayBuffer;
 }

@@ -58,6 +58,15 @@
 #include "JavaScriptCore/StackFrame.h"
 #include "JavaScriptCore/StackVisitor.h"
 #include "JavaScriptCore/VM.h"
+#include "JavaScriptCore/JSFunction.h"
+#include "JavaScriptCore/JSScope.h"
+#include "JavaScriptCore/SymbolTable.h"
+#include "JavaScriptCore/JSSymbolTableObject.h"
+#include "JavaScriptCore/JSLexicalEnvironment.h"
+#include "JavaScriptCore/JSModuleEnvironment.h"
+#include "JavaScriptCore/JSGlobalLexicalEnvironment.h"
+#include "JavaScriptCore/Symbol.h"
+#include "JavaScriptCore/SymbolInlines.h"
 #include "AddEventListenerOptions.h"
 #include "AsyncContextFrame.h"
 #include "BunClientData.h"
@@ -67,6 +76,7 @@
 #include "BunPlugin.h"
 #include "BunProcess.h"
 #include "BunSecureContextCache.h"
+#include "BunFreeVariableIdTable.h"
 #include "ProcessIdentifier.h"
 #include "BunWorkerGlobalScope.h"
 #include "CallSite.h"
@@ -999,6 +1009,13 @@ GlobalObject::GlobalObject(JSC::VM& vm, JSC::Structure* structure, WebCore::Scri
     // m_scriptExecutionContext = globalEventScope.m_context;
     mockModule = Bun::JSMockModule::create(this);
     globalEventScope->m_context = m_scriptExecutionContext;
+}
+
+Bun::FreeVariableIdTable& GlobalObject::freeVariableIdTable()
+{
+    if (!m_freeVariableIdTable)
+        m_freeVariableIdTable = makeUnique<Bun::FreeVariableIdTable>();
+    return *m_freeVariableIdTable;
 }
 
 GlobalObject::~GlobalObject()
@@ -2907,6 +2924,136 @@ JSValue GlobalObject_getGlobalThis(VM& vm, JSObject* globalObject)
     return uncheckedDowncast<Zig::GlobalObject>(globalObject)->globalThis();
 }
 
+// ===================== Symbol.freeVariables (experimental) =====================
+// Returns the variables a closure captures as an array of descriptors:
+//   [{ name: string, id: number, value: any, kind: "const" | "let" }]
+//
+// JSC only heap-allocates a variable into a scope environment when some nested
+// function closes over it, so the union of every environment in a function's
+// scope chain is the set of free variables reachable from that closure.
+//
+// `id` identifies the underlying variable *cell*, which is (environment
+// instance, scope offset). Two closures that close over the same variable share
+// the same environment instance, so they observe the same id — that is what lets
+// a serializer represent a shared mutable binding once and have both closures
+// reference it. Ids come from a GC-aware per-global table.
+//
+// This reflects the *mutable captured state*: `const` bindings whose initializer
+// is a compile-time constant are folded into the bytecode and never get a scope
+// slot, so they do not appear (they travel with the function's code). `kind` is
+// "const" for read-only bindings and "let" otherwise — `var`/parameters are not
+// distinguished from `let` after compilation.
+//
+// EnvType is JSLexicalEnvironment (function/block activations); it exposes
+// symbolTable()/variableAt()/isValidScopeOffset(). `seen` makes inner scopes
+// shadow outer ones (the chain is walked innermost-first).
+template<typename EnvType>
+static void collectFreeVariablesFrom(JSC::JSGlobalObject* globalObject, JSC::VM& vm, EnvType* env, JSC::JSArray* result, unsigned& nextIndex, WTF::HashSet<WTF::UniquedStringImpl*>& seen, Bun::FreeVariableIdTable& idTable, JSC::ThrowScope& scope)
+{
+    struct CapturedSlot {
+        RefPtr<WTF::UniquedStringImpl> name;
+        JSC::ScopeOffset offset;
+        bool isReadOnly;
+    };
+
+    JSC::SymbolTable* symbolTable = env->symbolTable();
+
+    // Snapshot captured names/offsets while holding the symbol table lock. The
+    // plain ConcurrentJSLocker establishes an AssertNoGC scope (holding the lock
+    // across a GC would deadlock the collector, which also locks symbol tables),
+    // so we must not allocate until it is released.
+    WTF::Vector<CapturedSlot> captured;
+    {
+        JSC::ConcurrentJSLocker locker(symbolTable->m_lock);
+        for (auto iter = symbolTable->begin(locker), end = symbolTable->end(locker); iter != end; ++iter) {
+            const JSC::SymbolTableEntry& entry = iter->value;
+            if (entry.isNull())
+                continue;
+            JSC::VarOffset varOffset = entry.varOffset();
+            // Only scope-allocated variables have a slot to read; locals/args
+            // that weren't captured live in registers and aren't present here.
+            if (!varOffset.isScope())
+                continue;
+            JSC::ScopeOffset offset = entry.scopeOffset();
+            if (!env->isValidScopeOffset(offset))
+                continue;
+            WTF::UniquedStringImpl* uid = iter->key.get();
+            if (!uid || uid->isSymbol())
+                continue;
+            captured.append(CapturedSlot { iter->key, offset, entry.isReadOnly() });
+        }
+    }
+
+    uint64_t environmentId = 0;
+    bool haveEnvironmentId = false;
+
+    for (const auto& slot : captured) {
+        // The variable slots stay alive via the environment (reachable from the
+        // function this getter was called on), so reading them here is safe.
+        JSC::JSValue value = env->variableAt(slot.offset).get();
+        // Empty means the binding is in its temporal dead zone / not yet
+        // initialized — skip rather than expose the JSC empty sentinel.
+        if (!value || value.isEmpty())
+            continue;
+        if (!seen.add(slot.name.get()).isNewEntry)
+            continue;
+
+        if (!haveEnvironmentId) {
+            environmentId = idTable.idForEnvironment(env);
+            haveEnvironmentId = true;
+        }
+        // Pack (environmentId, offset) into one stable, JS-safe-integer id.
+        // Scope offsets are small; 20 bits is far more than any real function.
+        ASSERT(slot.offset.offset() < (1u << 20));
+        double cellId = static_cast<double>(environmentId) * (1u << 20) + slot.offset.offset();
+
+        JSC::JSObject* descriptor = JSC::constructEmptyObject(globalObject);
+        descriptor->putDirect(vm, JSC::Identifier::fromString(vm, "name"_s), JSC::jsString(vm, WTF::String { static_cast<WTF::StringImpl*>(slot.name.get()) }), 0);
+        descriptor->putDirect(vm, JSC::Identifier::fromString(vm, "id"_s), JSC::jsNumber(cellId), 0);
+        descriptor->putDirect(vm, JSC::Identifier::fromString(vm, "value"_s), value, 0);
+        descriptor->putDirect(vm, JSC::Identifier::fromString(vm, "kind"_s), JSC::jsString(vm, String(slot.isReadOnly ? "const"_s : "let"_s)), 0);
+
+        result->putDirectIndex(globalObject, nextIndex++, descriptor);
+        RETURN_IF_EXCEPTION(scope, );
+    }
+}
+
+JSC_DEFINE_CUSTOM_GETTER(functionFreeVariablesGetter, (JSC::JSGlobalObject * globalObject, JSC::EncodedJSValue thisValue, JSC::PropertyName))
+{
+    JSC::VM& vm = JSC::getVM(globalObject);
+    auto scope = DECLARE_THROW_SCOPE(vm);
+
+    JSC::JSArray* result = JSC::constructEmptyArray(globalObject, nullptr);
+    RETURN_IF_EXCEPTION(scope, {});
+
+    JSC::JSFunction* function = dynamicDowncast<JSC::JSFunction>(JSC::JSValue::decode(thisValue));
+    if (!function)
+        return JSC::JSValue::encode(result);
+
+    Bun::FreeVariableIdTable& idTable = defaultGlobalObject(globalObject)->freeVariableIdTable();
+
+    unsigned nextIndex = 0;
+    WTF::HashSet<WTF::UniquedStringImpl*> seen;
+    for (JSC::JSScope* current = function->scope(); current; current = current->next()) {
+        // Stop at module/global scope. Those bindings (module-level consts,
+        // imports, globals) are ambient — available wherever the closure is
+        // re-instantiated — not part of its captured activation state, and the
+        // module environment otherwise pulls in every top-level binding rather
+        // than just the ones this closure reaches.
+        if (current->inherits<JSC::JSGlobalObject>()
+            || current->inherits<JSC::JSGlobalLexicalEnvironment>()
+            || current->inherits<JSC::JSModuleEnvironment>())
+            break;
+
+        if (auto* env = dynamicDowncast<JSC::JSLexicalEnvironment>(current)) {
+            collectFreeVariablesFrom(globalObject, vm, env, result, nextIndex, seen, idTable, scope);
+            RETURN_IF_EXCEPTION(scope, {});
+        }
+    }
+
+    RELEASE_AND_RETURN(scope, JSC::JSValue::encode(result));
+}
+
 // This is like `putDirectBuiltinFunction` but for the global static list.
 #define globalBuiltinFunction(vm, globalObject, identifier, function, attributes) JSC::JSGlobalObject::GlobalPropertyInfo(identifier, JSFunction::create(vm, function, globalObject), attributes)
 
@@ -3049,6 +3196,27 @@ void GlobalObject::addBuiltinGlobals(JSC::VM& vm)
     consoleObject->putDirectCustomAccessor(vm, Identifier::fromString(vm, "Console"_s), CustomGetterSetter::create(vm, getConsoleConstructor, nullptr), PropertyAttribute::CustomValue | 0);
     consoleObject->putDirectCustomAccessor(vm, Identifier::fromString(vm, "_stdout"_s), CustomGetterSetter::create(vm, getConsoleStdout, nullptr), PropertyAttribute::DontEnum | PropertyAttribute::CustomValue | 0);
     consoleObject->putDirectCustomAccessor(vm, Identifier::fromString(vm, "_stderr"_s), CustomGetterSetter::create(vm, getConsoleStderr, nullptr), PropertyAttribute::DontEnum | PropertyAttribute::CustomValue | 0);
+
+    // ----- Symbol.freeVariables (experimental) -----
+    // Exposes a closure's captured (free) variables as `fn[Symbol.freeVariables]`,
+    // returning a plain object mapping variable name -> current value. The symbol
+    // and the Function.prototype accessor are keyed by the same registered symbol
+    // so `fn[Symbol.freeVariables]` resolves to the accessor below.
+    {
+        const auto freeVariablesKey = "Symbol.freeVariables"_s;
+        this->functionPrototype()->putDirectCustomAccessor(vm,
+            JSC::Identifier::fromUid(vm.symbolRegistry().symbolForKey(freeVariablesKey)),
+            JSC::CustomGetterSetter::create(vm, functionFreeVariablesGetter, nullptr),
+            PropertyAttribute::DontEnum | PropertyAttribute::ReadOnly | PropertyAttribute::CustomAccessor | 0);
+
+        JSC::JSValue symbolConstructorValue = this->get(this, JSC::Identifier::fromString(vm, "Symbol"_s));
+        RETURN_IF_EXCEPTION(scope, );
+        if (JSC::JSObject* symbolConstructor = symbolConstructorValue.getObject()) {
+            symbolConstructor->putDirect(vm, JSC::Identifier::fromString(vm, "freeVariables"_s),
+                JSC::Symbol::create(vm, vm.symbolRegistry().symbolForKey(freeVariablesKey)),
+                PropertyAttribute::DontEnum | PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly | 0);
+        }
+    }
 }
 
 // ===================== start conditional builtin globals =====================

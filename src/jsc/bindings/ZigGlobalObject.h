@@ -37,6 +37,7 @@ class NapiHandleScopeImpl;
 class JSNextTickQueue;
 class Process;
 class SecureContextCache;
+class FreeVariableIdTable;
 } // namespace Bun
 
 namespace v8 {
@@ -774,6 +775,11 @@ public:
     // config digest. WeakGCMap self-registers with the heap, so no
     // visitChildren wiring needed (and it must NOT keep its values alive).
     std::unique_ptr<Bun::SecureContextCache> m_secureContextCache;
+
+    // Lazily-created table backing `fn[Symbol.freeVariables]` ids. Self-prunes
+    // via GC finalizers, so no visitChildren wiring is needed.
+    std::unique_ptr<Bun::FreeVariableIdTable> m_freeVariableIdTable;
+    Bun::FreeVariableIdTable& freeVariableIdTable();
 
     WTF::Vector<WTF::Ref<NapiEnv>> m_napiEnvs;
     Ref<NapiEnv> makeNapiEnv(const napi_module&);
