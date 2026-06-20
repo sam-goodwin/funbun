@@ -4402,3 +4402,41 @@ describe("ALS rich: adversarial & concurrency", () => {
     expect(reified()).toBe(42);
   });
 });
+
+describe("ALS rich: root-shape limits (graceful, no context restoration)", () => {
+  // A generator's body runs lazily after run() returns, and wrapping a class
+  // breaks `new` — so for these root shapes the ALS reconstructs but the captured
+  // context is NOT restored. They still reconstruct and work; getStore() is just
+  // undefined unless the consumer establishes a context.
+  test("a generator root captured in a context reconstructs (context not restored)", async () => {
+    const als = new AsyncLocalStorage<number>();
+    const code = als.run(7, () =>
+      serialize(function* () {
+        yield als.getStore() ?? "none";
+        yield als.getStore() ?? "none";
+      }),
+    );
+    const genFn = await reify<() => Generator>(code);
+    expect([...genFn()]).toEqual(["none", "none"]); // works as a generator; no context
+    // the consumer CAN establish context themselves:
+    // (a generator-specific run() at iteration time would be needed for context)
+  });
+
+  test("a class root captured in a context reconstructs constructable (context not restored)", async () => {
+    const als = new AsyncLocalStorage<string>();
+    const code = als.run("ctx", () =>
+      serialize(
+        class Svc {
+          role() {
+            return als.getStore() ?? "none";
+          }
+        },
+      ),
+    );
+    const Svc = await reify<any>(code);
+    const inst = new Svc(); // must still be constructable
+    expect(inst.role()).toBe("none");
+    // but a fresh run on the reconstructed ALS works (instance method reads it):
+    // (requires the consumer to run() around the call)
+  });
+});

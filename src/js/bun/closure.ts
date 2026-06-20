@@ -100,6 +100,23 @@ interface SourceBlock {
   lineCount: number;
 }
 
+// The ALS context-restoration wrapper turns the root into an arrow `(...args) =>
+// als.run(store, () => root(...args))`. That only preserves behavior for plain
+// and async functions — it breaks `new` on a class and doesn't cover a
+// generator's lazily-iterated body. Skip wrapping (reconstruct without context)
+// for those.
+function rootSupportsAlsWrap(fn: Function): boolean {
+  const ctorName = (fn as any)?.constructor?.name;
+  if (ctorName === "GeneratorFunction" || ctorName === "AsyncGeneratorFunction") return false;
+  let source: string;
+  try {
+    source = fn.toString();
+  } catch {
+    return false;
+  }
+  return !source.trimStart().startsWith("class");
+}
+
 function serialize(fn: Function, replacer?: Replacer): string {
   if (typeof fn !== "function") {
     throw new TypeError("serialize() expects a function");
@@ -161,8 +178,13 @@ function serialize(fn: Function, replacer?: Replacer): string {
   // Re-establish the captured AsyncLocalStorage context(s): wrap the root so each
   // call runs inside `als.run(store, ...)`, restoring `als.getStore()`. The
   // wrapper is single-line, so the function body's source-map lines are unchanged.
-  for (const { name, storeExpr } of ctx.alsContexts) {
-    exportExpr = `(...__alsArgs) => ${name}.run(${storeExpr}, () => (${exportExpr})(...__alsArgs))`;
+  // Only applies to plain/async functions: wrapping a class breaks `new`, and a
+  // generator's body runs lazily after `run` returns (the context wouldn't be
+  // active during iteration) — those reconstruct without context restoration.
+  if (rootSupportsAlsWrap(fn)) {
+    for (const { name, storeExpr } of ctx.alsContexts) {
+      exportExpr = `(...__alsArgs) => ${name}.run(${storeExpr}, () => (${exportExpr})(...__alsArgs))`;
+    }
   }
 
   const prelude = ctx.module.length ? ctx.module.join("\n") + "\n" : "";
