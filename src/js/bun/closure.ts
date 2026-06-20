@@ -4,11 +4,14 @@
 // reconstruction of `fn`. Built incrementally:
 //
 //   Step 1: functions with no free variables.
-//   Step 2: reconstruct captured PRIMITIVE free variables as module bindings.
-//   Step 3 (this): reference graph — captured objects/arrays are hoisted as
-//   `const` declarations, deduplicated by identity (shared references emitted
-//   once) with cycles handled by declare-then-fill. Functions/Proxies/bound
-//   functions/built-ins and source maps come in later steps.
+//   Step 2: reconstruct captured PRIMITIVE free variables.
+//   Step 3: reference graph — objects/arrays, hoisted + deduplicated, cycles.
+//   Step 4a (this): nested functions. A captured value that is itself a
+//   function is reconstructed recursively. Each function's captured variables
+//   are reconstructed inside an IIFE so its scope is isolated — two functions
+//   that capture different variables of the same name don't collide. Shared
+//   OBJECTS are still deduplicated by identity (so mutating shared object state
+//   works); shared mutable PRIMITIVE cells across functions come in step 4b.
 
 type Replacer = (key: string, value: unknown) => unknown;
 
@@ -25,7 +28,9 @@ interface FreeVariable {
 const REF_PREFIX = "__bunClosure$";
 
 interface Context {
-  statements: string[];
+  // Module-level hoisted declarations (object refs, nested function refs).
+  module: string[];
+  // Identity -> hoisted variable name, for objects and functions.
   refs: Map<object, string>;
   counter: number;
 }
@@ -35,26 +40,35 @@ function serialize(fn: Function, _replacer?: Replacer): string {
     throw new TypeError("serialize() expects a function");
   }
 
+  const ctx: Context = { module: [], refs: new Map(), counter: 0 };
+  const exportExpr = reconstructFunctionExpr(fn, ctx);
+
+  const prelude = ctx.module.length ? ctx.module.join("\n") + "\n" : "";
+  return `${prelude}export default ${exportExpr};\n`;
+}
+
+// Returns an expression that evaluates to a reconstruction of `fn`, wrapping its
+// captured variables in an IIFE scope when it has any.
+function reconstructFunctionExpr(fn: Function, ctx: Context): string {
   const source = fn.toString();
   if (isNativeFunctionSource(source)) {
     throw new TypeError("Cannot serialize a native function (no JavaScript source is available)");
   }
 
-  const ctx: Context = { statements: [], refs: new Map(), counter: 0 };
   const freeVariables = (fn as any)[Symbol.freeVariables] as FreeVariable[];
-
-  for (const variable of freeVariables) {
-    const expr = emitValue(variable.value, ctx);
-    ctx.statements.push(`${variable.kind} ${variable.name} = ${expr};`);
+  if (freeVariables.length === 0) {
+    return `(${source})`;
   }
 
-  const prelude = ctx.statements.length ? ctx.statements.join("\n") + "\n" : "";
-  // Parenthesize so the source is always an expression position.
-  return `${prelude}export default (${source});\n`;
+  const bindings: string[] = [];
+  for (const variable of freeVariables) {
+    bindings.push(`${variable.kind} ${variable.name} = ${emitValue(variable.value, ctx)};`);
+  }
+  return `(function () {\n${bindings.join("\n")}\nreturn (${source});\n})()`;
 }
 
-// Returns a JS expression for `value`, appending any hoisted construction
-// statements (for objects) to `ctx`.
+// Returns a JS expression for `value`, appending any hoisted declarations to
+// `ctx.module` (for objects and nested functions).
 function emitValue(value: unknown, ctx: Context): string {
   switch (typeof value) {
     case "string":
@@ -71,7 +85,7 @@ function emitValue(value: unknown, ctx: Context): string {
       if (value === null) return "null";
       return emitObject(value as object, ctx);
     case "function":
-      throw new TypeError("Cannot serialize function free variables yet");
+      return emitFunction(value as Function, ctx);
     default:
       throw new TypeError(`Cannot serialize a free variable of type ${typeof value}`);
   }
@@ -86,19 +100,30 @@ function emitObject(value: object, ctx: Context): string {
   ctx.refs.set(value, name);
 
   if (Array.isArray(value)) {
-    ctx.statements.push(`const ${name} = [];`);
+    ctx.module.push(`const ${name} = [];`);
     for (let i = 0; i < value.length; i++) {
       if (i in value) {
-        ctx.statements.push(`${name}[${i}] = ${emitValue(value[i], ctx)};`);
+        ctx.module.push(`${name}[${i}] = ${emitValue(value[i], ctx)};`);
       }
     }
   } else {
-    ctx.statements.push(`const ${name} = {};`);
+    ctx.module.push(`const ${name} = {};`);
     for (const key of Object.keys(value)) {
-      ctx.statements.push(`${name}[${JSON.stringify(key)}] = ${emitValue((value as any)[key], ctx)};`);
+      ctx.module.push(`${name}[${JSON.stringify(key)}] = ${emitValue((value as any)[key], ctx)};`);
     }
   }
 
+  return name;
+}
+
+function emitFunction(fn: Function, ctx: Context): string {
+  const existing = ctx.refs.get(fn);
+  if (existing !== undefined) return existing;
+
+  const name = REF_PREFIX + ctx.counter++;
+  ctx.refs.set(fn, name);
+  const expr = reconstructFunctionExpr(fn, ctx);
+  ctx.module.push(`const ${name} = ${expr};`);
   return name;
 }
 

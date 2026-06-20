@@ -132,9 +132,42 @@ test("shared object reference is emitted once (identity preserved)", async () =>
   expect(x.v).toBe(1);
 });
 
-test("still throws on function free variables (next step)", () => {
-  const captured = () => 1;
-  const inner = { captured };
-  void inner;
-  expect(() => serialize(() => inner)).toThrow("Cannot serialize function free variables yet");
+test("reconstructs a captured (nested) function", async () => {
+  let g = (x: number) => x * 3;
+  void g;
+  const fn = await roundtrip(() => g(7));
+  expect(fn()).toBe(21);
+});
+
+test("reconstructs a function captured inside an object", async () => {
+  let o = { fn: (x: number) => x + 1, base: 10 };
+  void o;
+  const fn = await roundtrip(() => o.fn(o.base));
+  expect(fn()).toBe(11);
+});
+
+test("nested functions keep isolated scopes (same-named captures don't collide)", async () => {
+  // `a` and `b` each capture a different `x`.
+  let a = (() => {
+    let x = 1;
+    return () => x;
+  })();
+  let b = (() => {
+    let x = 2;
+    return () => x;
+  })();
+  void [a, b];
+  const fn = await roundtrip(() => [a(), b()]);
+  expect(fn()).toEqual([1, 2]);
+});
+
+test("a captured function that itself captures an object shares that object", async () => {
+  let shared = { hits: 0 };
+  let bump = () => ++shared.hits;
+  void [shared, bump];
+  const fn = await roundtrip(() => {
+    bump();
+    return shared.hits;
+  });
+  expect(fn()).toBe(1);
 });
