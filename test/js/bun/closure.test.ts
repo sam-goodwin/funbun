@@ -4089,3 +4089,53 @@ describe("ALS rich: module-scope capture", () => {
     expect(reified()).toBe("[X]");
   });
 });
+
+describe("ALS rich: nesting", () => {
+  test("nested run at serialize time captures the INNERMOST store", async () => {
+    const als = new AsyncLocalStorage<number>();
+    const code = als.run(1, () => als.run(2, () => als.run(3, () => serialize(() => als.getStore()))));
+    const reified = await reify<() => number>(code);
+    expect(reified()).toBe(3); // innermost active context wins
+  });
+
+  test("reified closure restores captured context AND can shadow it internally", async () => {
+    const als = new AsyncLocalStorage<string>();
+    const code = als.run("outer", () =>
+      serialize(() => {
+        const captured = als.getStore(); // should be "outer"
+        const shadowed = als.run("inner", () => als.getStore()); // "inner"
+        const restored = als.getStore(); // back to "outer"
+        return [captured, shadowed, restored];
+      }),
+    );
+    const reified = await reify<() => string[]>(code);
+    expect(reified()).toEqual(["outer", "inner", "outer"]);
+  });
+
+  test("two different ALS instances, nested at serialize time, both captured", async () => {
+    const a = new AsyncLocalStorage<string>();
+    const b = new AsyncLocalStorage<string>();
+    const code = a.run("a1", () => b.run("b1", () => serialize(() => `${a.getStore()}/${b.getStore()}`)));
+    const reified = await reify<() => string>(code);
+    expect(reified()).toBe("a1/b1");
+  });
+
+  test("same ALS, two closures serialized in different nested contexts, stay independent", async () => {
+    const als = new AsyncLocalStorage<number>();
+    const codeOuter = als.run(10, () => serialize(() => als.getStore()));
+    const codeInner = als.run(10, () => als.run(20, () => serialize(() => als.getStore())));
+    const [outer, inner] = await Promise.all([reify<() => number>(codeOuter), reify<() => number>(codeInner)]);
+    expect(outer()).toBe(10);
+    expect(inner()).toBe(20);
+  });
+
+  test("a reified closure that itself serializes inside its own run is not double-wrapped", async () => {
+    const als = new AsyncLocalStorage<string>();
+    // outer captured context "L1"; the body opens "L2" and reads it.
+    const code = als.run("L1", () =>
+      serialize(() => als.run("L2", () => `${als.getStore()}`).concat("|").concat(als.getStore()!)),
+    );
+    const reified = await reify<() => string>(code);
+    expect(reified()).toBe("L2|L1");
+  });
+});
