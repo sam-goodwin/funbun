@@ -1399,6 +1399,91 @@ impl JSTranspiler {
         )
     }
 
+    /// Parse `code` and return its AST as a tree of plain JS objects. Each node
+    /// is `{ type, start, ... }`; unsupported node kinds surface as
+    /// `{ type: "Unsupported", node: "<tag>", start }` so the walk is total.
+    #[bun_jsc::host_fn(method)]
+    pub fn ast(&self, global: &JSGlobalObject, callframe: &CallFrame) -> JsResult<JSValue> {
+        jsc::mark_binding();
+        let arguments = callframe.arguments_old::<2>();
+        // SAFETY: bun_vm() returns the live VM singleton on this thread.
+        let vm = global.bun_vm();
+        let mut args = ArgumentsSlice::init(vm, arguments.slice());
+        let Some(code_arg) = args.next() else {
+            return Err(global.throw_invalid_argument_type("ast", "code", "string or Uint8Array"));
+        };
+        let Some(code_holder) = StringOrBuffer::from_js(global, code_arg)? else {
+            return Err(global.throw_invalid_argument_type("ast", "code", "string or Uint8Array"));
+        };
+        let code = code_holder.slice();
+        args.eat();
+
+        let loader: Option<Loader> = 'brk: {
+            if let Some(arg) = args.next() {
+                args.eat();
+                break 'brk loader_from_js(global, arg)?;
+            }
+            break 'brk None;
+        };
+
+        if global.has_exception() {
+            return Ok(JSValue::ZERO);
+        }
+
+        let arena = Arena::new();
+        let mut log = bun_ast::Log::init();
+        // SAFETY: mirrors `scan` — `arena`/`log` outlive every use through
+        // `self.transpiler`; `_restore` (dropped first) restores prior state.
+        let arena_ref: &'static Arena = unsafe { bun_ptr::detach_lifetime_ref(&arena) };
+        // Force a faithful parse regardless of how the Transpiler was configured:
+        // dead-code elimination, syntax minification, and tree-shaking all mutate
+        // the AST (e.g. dropping pure unused statements, folding constants), which
+        // we don't want for an AST view. Saved and restored around the parse.
+        let (prev_arena, prev_opts) = self.transpiler.with_mut(|t| {
+            let prev = t.arena;
+            t.set_arena(arena_ref);
+            t.set_log(&raw mut log);
+            let opts = (
+                t.options.dead_code_elimination,
+                t.options.minify_syntax,
+                t.options.tree_shaking,
+            );
+            t.options.dead_code_elimination = false;
+            t.options.minify_syntax = false;
+            t.options.tree_shaking = false;
+            (prev, opts)
+        });
+        let _restore = TranspilerStateGuard {
+            transpiler: self.transpiler.as_ptr(),
+            prev_arena,
+            restore_log: self.config_log_ptr(),
+            prev_macro_context: None,
+        };
+
+        let mut ast_memory_allocator = bun_ast::ASTMemoryAllocator::borrowing(&arena);
+        let _ast_scope = ast_memory_allocator.enter();
+
+        let parse_result = self.get_parse_result(arena_ref, code, loader, MacroJSCtx::ZERO);
+        self.transpiler.with_mut(|t| {
+            t.options.dead_code_elimination = prev_opts.0;
+            t.options.minify_syntax = prev_opts.1;
+            t.options.tree_shaking = prev_opts.2;
+        });
+        let log_ref = self.transpiler.get().log_mut();
+        let Some(parse_result) = parse_result else {
+            if (log_ref.warnings + log_ref.errors) > 0 {
+                return Err(global.throw_value(log_ref.to_js(global, "Parse error")?));
+            }
+            return Err(global.throw(format_args!("Failed to parse")));
+        };
+        if (log_ref.warnings + log_ref.errors) > 0 {
+            return Err(global.throw_value(log_ref.to_js(global, "Parse error")?));
+        }
+
+        let converter = AstJsConverter { global, ast: &parse_result.ast };
+        converter.program()
+    }
+
     #[bun_jsc::host_fn(method)]
     pub fn transform(&self, global: &JSGlobalObject, callframe: &CallFrame) -> JsResult<JSValue> {
         jsc::mark_binding();
@@ -1672,6 +1757,487 @@ fn named_imports_to_js(
     }
 
     Ok(array)
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// AST → JS-object conversion (`Bun.Transpiler.prototype.ast`)
+//
+// Walks a freshly parsed `bun_ast::Ast` and builds a tree of plain JS objects.
+// Node shape is ESTree-flavoured but Bun-faithful: `{ type, start, ...fields }`.
+// Every value the AST owns (identifier names, property names) is copied into a
+// JS value *before* the parse arena is released by the caller. Node kinds not
+// yet mapped fall through to `{ type: "Unsupported", node, start }` so the walk
+// never panics on an unhandled variant — coverage grows incrementally.
+// ───────────────────────────────────────────────────────────────────────────
+
+struct AstJsConverter<'a> {
+    global: &'a JSGlobalObject,
+    ast: &'a bun_ast::Ast<'a>,
+}
+
+fn local_kind_str(k: bun_ast::s::Kind) -> &'static str {
+    use bun_ast::s::Kind;
+    match k {
+        Kind::KVar => "var",
+        Kind::KLet => "let",
+        Kind::KConst => "const",
+        Kind::KUsing => "using",
+        Kind::KAwaitUsing => "await using",
+    }
+}
+
+impl<'a> AstJsConverter<'a> {
+    #[inline]
+    fn str(&self, bytes: &[u8]) -> JsResult<JSValue> {
+        BunString::clone_utf8(bytes).to_js(self.global)
+    }
+
+    fn estring_value(&self, s: &bun_ast::e::EString) -> JsResult<JSValue> {
+        // `slice8`/`slice16` return the first rope segment; folded literals
+        // (rare for keys) would truncate — acceptable for the JS-level AST.
+        if s.is_utf16 {
+            BunString::clone_utf16(s.slice16()).to_js(self.global)
+        } else {
+            BunString::clone_latin1(s.slice8()).to_js(self.global)
+        }
+    }
+
+    fn node(&self, ty: &str, start: i32) -> JsResult<JSValue> {
+        let obj = JSValue::create_empty_object(self.global, 6);
+        let ty_val = self.str(ty.as_bytes())?;
+        obj.put(self.global, "type", ty_val);
+        obj.put(self.global, "start", JSValue::js_number(start as f64));
+        Ok(obj)
+    }
+
+    fn name_of(&self, ref_: bun_ast::Ref) -> JsResult<JSValue> {
+        // `ast.symbols` is this source's symbol table; an identifier's `Ref`
+        // indexes it by `inner_index`. Out-of-range / `Ref::NONE` → empty name.
+        match self.ast.symbols.get(ref_.inner_index() as usize) {
+            Some(sym) => self.str(sym.original_name.slice()),
+            None => self.str(b""),
+        }
+    }
+
+    fn exprs(&self, items: &[Expr]) -> JsResult<JSValue> {
+        let arr = JSValue::create_empty_array(self.global, items.len())?;
+        for (i, e) in items.iter().enumerate() {
+            let v = self.expr(e)?;
+            arr.put_index(self.global, i as u32, v)?;
+        }
+        Ok(arr)
+    }
+
+    fn stmts(&self, items: &[bun_ast::Stmt]) -> JsResult<JSValue> {
+        let arr = JSValue::create_empty_array(self.global, items.len())?;
+        for (i, st) in items.iter().enumerate() {
+            let v = self.stmt(st)?;
+            arr.put_index(self.global, i as u32, v)?;
+        }
+        Ok(arr)
+    }
+
+    fn program(&self) -> JsResult<JSValue> {
+        let mut total = 0usize;
+        for part in self.ast.parts.iter() {
+            total += part.stmts.slice().len();
+        }
+        let body = JSValue::create_empty_array(self.global, total)?;
+        let mut i: u32 = 0;
+        for part in self.ast.parts.iter() {
+            for st in part.stmts.slice() {
+                let v = self.stmt(st)?;
+                body.put_index(self.global, i, v)?;
+                i += 1;
+            }
+        }
+        let node = self.node("Program", 0)?;
+        node.put(self.global, "body", body);
+        Ok(node)
+    }
+
+    fn binding(&self, b: &bun_ast::Binding) -> JsResult<JSValue> {
+        use bun_ast::b::B;
+        match b.data {
+            B::BIdentifier(id) => {
+                let node = self.node("Identifier", b.loc.start)?;
+                let nm = self.name_of(id.r#ref)?;
+                node.put(self.global, "name", nm);
+                Ok(node)
+            }
+            _ => self.node("UnsupportedBinding", b.loc.start),
+        }
+    }
+
+    fn params(&self, args: &[bun_ast::g::Arg]) -> JsResult<JSValue> {
+        let arr = JSValue::create_empty_array(self.global, args.len())?;
+        for (i, a) in args.iter().enumerate() {
+            let mut p = self.binding(&a.binding)?;
+            if let Some(default) = a.default {
+                let node = self.node("AssignmentPattern", a.binding.loc.start)?;
+                node.put(self.global, "left", p);
+                let r = self.expr(&default)?;
+                node.put(self.global, "right", r);
+                p = node;
+            }
+            arr.put_index(self.global, i as u32, p)?;
+        }
+        Ok(arr)
+    }
+
+    fn function_node(&self, ty: &str, func: &bun_ast::g::Fn, start: i32) -> JsResult<JSValue> {
+        use bun_ast::flags;
+        let node = self.node(ty, start)?;
+        match func.name {
+            Some(locref) => {
+                let id = self.node("Identifier", locref.loc.start)?;
+                let nm = self.name_of(locref.ref_)?;
+                id.put(self.global, "name", nm);
+                node.put(self.global, "id", id);
+            }
+            None => node.put(self.global, "id", JSValue::NULL),
+        }
+        let params = self.params(func.args.slice())?;
+        node.put(self.global, "params", params);
+        let body = self.stmts(func.body.stmts.slice())?;
+        node.put(self.global, "body", body);
+        let is_async = func.flags.contains(flags::Function::IsAsync);
+        let is_gen = func.flags.contains(flags::Function::IsGenerator);
+        node.put(self.global, "async", JSValue::js_boolean(is_async));
+        node.put(self.global, "generator", JSValue::js_boolean(is_gen));
+        Ok(node)
+    }
+
+    fn class_member(&self, p: &bun_ast::g::Property) -> JsResult<JSValue> {
+        use bun_ast::flags;
+        use bun_ast::g::PropertyKind;
+        if p.kind == PropertyKind::ClassStaticBlock {
+            let node = self.node("StaticBlock", 0)?;
+            if let Some(block) = p.class_static_block_ref() {
+                let body = self.stmts(block.stmts.as_slice())?;
+                node.put(self.global, "body", body);
+            }
+            let kind = self.str(b"staticBlock")?;
+            node.put(self.global, "kind", kind);
+            return Ok(node);
+        }
+        let is_method = p.flags.contains(flags::Property::IsMethod);
+        let is_static = p.flags.contains(flags::Property::IsStatic);
+        let computed = p.flags.contains(flags::Property::IsComputed);
+        let kind_str = match p.kind {
+            PropertyKind::Get => "get",
+            PropertyKind::Set => "set",
+            PropertyKind::AutoAccessor => "accessor",
+            _ if is_method => "method",
+            _ => "field",
+        };
+        let ty = if is_method || matches!(p.kind, PropertyKind::Get | PropertyKind::Set) {
+            "MethodDefinition"
+        } else {
+            "PropertyDefinition"
+        };
+        let node = self.node(ty, 0)?;
+        if let Some(key) = p.key {
+            let k = self.expr(&key)?;
+            node.put(self.global, "key", k);
+        }
+        // Methods carry their function in `value`; class fields in `initializer`.
+        let value = if p.value.is_some() { p.value } else { p.initializer };
+        let v = match value {
+            Some(v) => self.expr(&v)?,
+            None => JSValue::NULL,
+        };
+        node.put(self.global, "value", v);
+        let kind = self.str(kind_str.as_bytes())?;
+        node.put(self.global, "kind", kind);
+        node.put(self.global, "static", JSValue::js_boolean(is_static));
+        node.put(self.global, "computed", JSValue::js_boolean(computed));
+        Ok(node)
+    }
+
+    fn class_node(&self, ty: &str, class: &bun_ast::g::Class, start: i32) -> JsResult<JSValue> {
+        let node = self.node(ty, start)?;
+        match class.class_name {
+            Some(locref) => {
+                let id = self.node("Identifier", locref.loc.start)?;
+                let nm = self.name_of(locref.ref_)?;
+                id.put(self.global, "name", nm);
+                node.put(self.global, "id", id);
+            }
+            None => node.put(self.global, "id", JSValue::NULL),
+        }
+        let superclass = match class.extends {
+            Some(e) => self.expr(&e)?,
+            None => JSValue::NULL,
+        };
+        node.put(self.global, "superClass", superclass);
+        let members = class.properties.slice();
+        let arr = JSValue::create_empty_array(self.global, members.len())?;
+        for (i, p) in members.iter().enumerate() {
+            let m = self.class_member(p)?;
+            arr.put_index(self.global, i as u32, m)?;
+        }
+        let body = self.node("ClassBody", class.body_loc.start)?;
+        body.put(self.global, "body", arr);
+        node.put(self.global, "body", body);
+        Ok(node)
+    }
+
+    fn property(&self, p: &bun_ast::g::Property) -> JsResult<JSValue> {
+        use bun_ast::flags;
+        use bun_ast::g::PropertyKind;
+        if p.kind == PropertyKind::Spread {
+            let node = self.node("SpreadElement", 0)?;
+            if let Some(val) = p.value {
+                let v = self.expr(&val)?;
+                node.put(self.global, "argument", v);
+            }
+            return Ok(node);
+        }
+        let node = self.node("Property", 0)?;
+        if let Some(key) = p.key {
+            let k = self.expr(&key)?;
+            node.put(self.global, "key", k);
+        }
+        if let Some(val) = p.value {
+            let v = self.expr(&val)?;
+            node.put(self.global, "value", v);
+        }
+        let computed = p.flags.contains(flags::Property::IsComputed);
+        let method = p.flags.contains(flags::Property::IsMethod);
+        let shorthand = p.flags.contains(flags::Property::WasShorthand);
+        node.put(self.global, "computed", JSValue::js_boolean(computed));
+        node.put(self.global, "method", JSValue::js_boolean(method));
+        node.put(self.global, "shorthand", JSValue::js_boolean(shorthand));
+        let kind = self.str(<&'static str>::from(p.kind).as_bytes())?;
+        node.put(self.global, "kind", kind);
+        Ok(node)
+    }
+
+    fn properties(&self, props: &[bun_ast::g::Property]) -> JsResult<JSValue> {
+        let arr = JSValue::create_empty_array(self.global, props.len())?;
+        for (i, p) in props.iter().enumerate() {
+            let v = self.property(p)?;
+            arr.put_index(self.global, i as u32, v)?;
+        }
+        Ok(arr)
+    }
+
+    fn expr(&self, e: &Expr) -> JsResult<JSValue> {
+        use bun_ast::expr::Data as D;
+        let start = e.loc.start;
+        match e.data {
+            D::EIdentifier(id) => {
+                let node = self.node("Identifier", start)?;
+                let nm = self.name_of(id.ref_)?;
+                node.put(self.global, "name", nm);
+                Ok(node)
+            }
+            D::ENumber(n) => {
+                let node = self.node("NumericLiteral", start)?;
+                node.put(self.global, "value", JSValue::js_number(n.value()));
+                Ok(node)
+            }
+            D::EBoolean(b) | D::EBranchBoolean(b) => {
+                let node = self.node("BooleanLiteral", start)?;
+                node.put(self.global, "value", JSValue::js_boolean(b.value));
+                Ok(node)
+            }
+            D::EString(s) => {
+                let node = self.node("StringLiteral", start)?;
+                let v = self.estring_value(&s)?;
+                node.put(self.global, "value", v);
+                Ok(node)
+            }
+            D::EPrivateIdentifier(p) => {
+                let node = self.node("PrivateIdentifier", start)?;
+                let nm = self.name_of(p.ref_)?;
+                node.put(self.global, "name", nm);
+                Ok(node)
+            }
+            D::ENull(_) => self.node("NullLiteral", start),
+            D::EUndefined(_) => self.node("UndefinedLiteral", start),
+            D::EThis(_) => self.node("ThisExpression", start),
+            D::ESuper(_) => self.node("Super", start),
+            D::EArray(a) => {
+                let node = self.node("ArrayExpression", start)?;
+                let els = self.exprs(&a.items)?;
+                node.put(self.global, "elements", els);
+                Ok(node)
+            }
+            D::EObject(o) => {
+                let node = self.node("ObjectExpression", start)?;
+                let props = self.properties(&o.properties)?;
+                node.put(self.global, "properties", props);
+                Ok(node)
+            }
+            D::ECall(c) => {
+                let node = self.node("CallExpression", start)?;
+                let callee = self.expr(&c.target)?;
+                node.put(self.global, "callee", callee);
+                let a = self.exprs(&c.args)?;
+                node.put(self.global, "arguments", a);
+                Ok(node)
+            }
+            D::ENew(c) => {
+                let node = self.node("NewExpression", start)?;
+                let callee = self.expr(&c.target)?;
+                node.put(self.global, "callee", callee);
+                let a = self.exprs(&c.args)?;
+                node.put(self.global, "arguments", a);
+                Ok(node)
+            }
+            D::EDot(d) => {
+                let node = self.node("MemberExpression", start)?;
+                let obj = self.expr(&d.target)?;
+                node.put(self.global, "object", obj);
+                let prop = self.node("Identifier", d.name_loc.start)?;
+                let nm = self.str(d.name.slice())?;
+                prop.put(self.global, "name", nm);
+                node.put(self.global, "property", prop);
+                node.put(self.global, "computed", JSValue::js_boolean(false));
+                Ok(node)
+            }
+            D::EIndex(ix) => {
+                let node = self.node("MemberExpression", start)?;
+                let obj = self.expr(&ix.target)?;
+                node.put(self.global, "object", obj);
+                let prop = self.expr(&ix.index)?;
+                node.put(self.global, "property", prop);
+                node.put(self.global, "computed", JSValue::js_boolean(true));
+                Ok(node)
+            }
+            D::EBinary(b) => {
+                let node = self.node("BinaryExpression", start)?;
+                let op = self.str(bun_ast::op::TABLE.get(b.op).text)?;
+                node.put(self.global, "operator", op);
+                let l = self.expr(&b.left)?;
+                node.put(self.global, "left", l);
+                let r = self.expr(&b.right)?;
+                node.put(self.global, "right", r);
+                Ok(node)
+            }
+            D::EUnary(u) => {
+                let node = self.node("UnaryExpression", start)?;
+                let op = self.str(bun_ast::op::TABLE.get(u.op).text)?;
+                node.put(self.global, "operator", op);
+                let v = self.expr(&u.value)?;
+                node.put(self.global, "argument", v);
+                Ok(node)
+            }
+            D::EIf(c) => {
+                let node = self.node("ConditionalExpression", start)?;
+                let t = self.expr(&c.test_)?;
+                node.put(self.global, "test", t);
+                let y = self.expr(&c.yes)?;
+                node.put(self.global, "consequent", y);
+                let n = self.expr(&c.no)?;
+                node.put(self.global, "alternate", n);
+                Ok(node)
+            }
+            D::ESpread(s) => {
+                let node = self.node("SpreadElement", start)?;
+                let v = self.expr(&s.value)?;
+                node.put(self.global, "argument", v);
+                Ok(node)
+            }
+            D::EArrow(a) => {
+                let node = self.node("ArrowFunctionExpression", start)?;
+                let params = self.params(a.args.slice())?;
+                node.put(self.global, "params", params);
+                let body = self.stmts(a.body.stmts.slice())?;
+                node.put(self.global, "body", body);
+                node.put(self.global, "async", JSValue::js_boolean(a.is_async));
+                Ok(node)
+            }
+            D::EFunction(f) => self.function_node("FunctionExpression", &f.func, start),
+            D::EClass(c) => self.class_node("ClassExpression", &c, start),
+            _ => {
+                let node = self.node("Unsupported", start)?;
+                let nm = self.str(e.data.tag_name().as_bytes())?;
+                node.put(self.global, "node", nm);
+                Ok(node)
+            }
+        }
+    }
+
+    fn stmt(&self, st: &bun_ast::Stmt) -> JsResult<JSValue> {
+        use bun_ast::stmt::Data as D;
+        let start = st.loc.start;
+        match st.data {
+            D::SExpr(s) => {
+                let node = self.node("ExpressionStatement", start)?;
+                let v = self.expr(&s.value)?;
+                node.put(self.global, "expression", v);
+                Ok(node)
+            }
+            D::SReturn(s) => {
+                let node = self.node("ReturnStatement", start)?;
+                let arg = match s.value {
+                    Some(v) => self.expr(&v)?,
+                    None => JSValue::NULL,
+                };
+                node.put(self.global, "argument", arg);
+                Ok(node)
+            }
+            D::SThrow(s) => {
+                let node = self.node("ThrowStatement", start)?;
+                let v = self.expr(&s.value)?;
+                node.put(self.global, "argument", v);
+                Ok(node)
+            }
+            D::SBlock(s) => {
+                let node = self.node("BlockStatement", start)?;
+                let body = self.stmts(s.stmts.slice())?;
+                node.put(self.global, "body", body);
+                Ok(node)
+            }
+            D::SIf(s) => {
+                let node = self.node("IfStatement", start)?;
+                let t = self.expr(&s.test_)?;
+                node.put(self.global, "test", t);
+                let cons = self.stmt(&s.yes)?;
+                node.put(self.global, "consequent", cons);
+                let alt = match s.no {
+                    Some(n) => self.stmt(&n)?,
+                    None => JSValue::NULL,
+                };
+                node.put(self.global, "alternate", alt);
+                Ok(node)
+            }
+            D::SLocal(s) => {
+                let node = self.node("VariableDeclaration", start)?;
+                let kind = self.str(local_kind_str(s.kind).as_bytes())?;
+                node.put(self.global, "kind", kind);
+                let decls = JSValue::create_empty_array(self.global, s.decls.len())?;
+                for (i, d) in s.decls.iter().enumerate() {
+                    let dn = self.node("VariableDeclarator", d.binding.loc.start)?;
+                    let id = self.binding(&d.binding)?;
+                    dn.put(self.global, "id", id);
+                    let init = match d.value {
+                        Some(v) => self.expr(&v)?,
+                        None => JSValue::NULL,
+                    };
+                    dn.put(self.global, "init", init);
+                    decls.put_index(self.global, i as u32, dn)?;
+                }
+                node.put(self.global, "declarations", decls);
+                Ok(node)
+            }
+            D::SFunction(s) => self.function_node("FunctionDeclaration", &s.func, start),
+            D::SClass(s) => self.class_node("ClassDeclaration", &s.class, start),
+            D::SBreak(_) => self.node("BreakStatement", start),
+            D::SContinue(_) => self.node("ContinueStatement", start),
+            D::SEmpty(_) => self.node("EmptyStatement", start),
+            D::SDebugger(_) => self.node("DebuggerStatement", start),
+            _ => {
+                let node = self.node("Unsupported", start)?;
+                let nm = self.str(<&'static str>::from(st.data.tag()).as_bytes())?;
+                node.put(self.global, "node", nm);
+                Ok(node)
+            }
+        }
+    }
 }
 
 impl JSTranspiler {
