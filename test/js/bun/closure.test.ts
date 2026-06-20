@@ -1,6 +1,7 @@
 import { test, expect, describe, beforeAll } from "bun:test";
 import { serialize } from "bun:closure";
 import { tempDir, bunExe, bunEnv } from "harness";
+import { AsyncLocalStorage } from "node:async_hooks";
 
 // Round-trip: serialize a function, write the resulting module, dynamic-import
 // it, and return its default export so we can exercise it.
@@ -3962,5 +3963,29 @@ describe("interactions: exotic corners", () => {
     expect(Number.isNaN(out.arr[0])).toBe(true);
     expect(1 / out.arr[1]).toBe(-Infinity);
     expect(out.arr[2]).toBe(Infinity);
+  });
+});
+
+describe("AsyncLocalStorage", () => {
+  // A store VALUE captured inside run() is just data and round-trips directly.
+  test("captures a store value (inside run)", async () => {
+    const als = new AsyncLocalStorage<{ user: string }>();
+    const out = await als.run({ user: "alice" }, async () => {
+      const store = als.getStore();
+      void store;
+      return (await roundtrip(() => store))();
+    });
+    expect(out).toEqual({ user: "alice" });
+  });
+
+  // KNOWN LIMITATION: capturing the ALS INSTANCE itself fails — Bun implements
+  // AsyncLocalStorage as a Proxy over native cleanup internals (jsCleanupLater),
+  // which have no serializable source. Its active store is also ambient async-
+  // context state, not part of the closure. Workaround: capture the store VALUE
+  // (above), or re-create the ALS in the reconstructed module.
+  test("known limitation: capturing the ALS instance throws", () => {
+    const als = new AsyncLocalStorage<{ v: number }>();
+    void als;
+    expect(() => serialize(() => als)).toThrow(/native function/);
   });
 });

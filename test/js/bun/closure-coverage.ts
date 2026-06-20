@@ -702,6 +702,17 @@ export const CATEGORIES: CoverageCategory[] = [
       ),
     ],
   },
+  {
+    name: "AsyncLocalStorage",
+    items: [
+      S("als.store-value", "store value captured inside run()", "captures a store value (inside run)"),
+      L(
+        "als.instance",
+        "ALS instance capture (Proxy over native internals)",
+        "known limitation: capturing the ALS instance throws",
+      ),
+    ],
+  },
 ];
 
 // ---------------------------------------------------------------------------
