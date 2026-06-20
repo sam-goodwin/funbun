@@ -37,6 +37,18 @@ interface Context {
   // scope under their original name, skipped in per-function IIFEs.
   sharedIds: Set<number>;
   replacer: Replacer | undefined;
+  // Records, for source-map generation, where each reconstructed function's
+  // verbatim source lands. `moduleIndex` indexes into `module` (or -1 for the
+  // default-export expression).
+  sourceBlocks: SourceBlock[];
+}
+
+interface SourceBlock {
+  moduleIndex: number;
+  lineOffset: number;
+  url: string;
+  line: number;
+  lineCount: number;
 }
 
 function serialize(fn: Function, replacer?: Replacer): string {
@@ -51,6 +63,7 @@ function serialize(fn: Function, replacer?: Replacer): string {
     counter: 0,
     sharedIds,
     replacer: typeof replacer === "function" ? replacer : undefined,
+    sourceBlocks: [],
   };
 
   // Emit shared cells at module scope (deduped by id) before any function that
@@ -69,10 +82,124 @@ function serialize(fn: Function, replacer?: Replacer): string {
 
   // A bound (or already-hoisted) root is emitted via the value path and
   // exported by reference; otherwise reconstruct it inline.
-  const exportExpr =
-    (fn as any)[Symbol.boundFunction] !== undefined ? emitFunction(fn, ctx) : reconstructFunctionExpr(fn, ctx);
+  let exportExpr: string;
+  let exportReconstructed: ReconstructedFunction | undefined;
+  if ((fn as any)[Symbol.boundFunction] !== undefined) {
+    exportExpr = emitFunction(fn, ctx);
+  } else {
+    exportReconstructed = reconstructFunctionExpr(fn, ctx);
+    exportExpr = exportReconstructed.expr;
+  }
+
   const prelude = ctx.module.length ? ctx.module.join("\n") + "\n" : "";
-  return `${prelude}export default ${exportExpr};\n`;
+  const moduleStartLines = computeStartLines(ctx.module);
+  const preludeLineCount = prelude === "" ? 0 : countLines(prelude.slice(0, -1)) + 1;
+
+  // `export default ` adds no newlines, so the export expression's source offset
+  // is relative to the line the export statement begins on.
+  if (exportReconstructed !== undefined && exportReconstructed.location && exportReconstructed.location.url) {
+    ctx.sourceBlocks.push({
+      moduleIndex: -1,
+      lineOffset: exportReconstructed.sourceLineOffset,
+      url: exportReconstructed.location.url,
+      line: exportReconstructed.location.line,
+      lineCount: exportReconstructed.sourceLineCount,
+    });
+  }
+
+  let output = `${prelude}export default ${exportExpr};\n`;
+  const sourceMap = buildSourceMap(ctx.sourceBlocks, moduleStartLines, preludeLineCount);
+  if (sourceMap !== undefined) {
+    const { Buffer } = require("node:buffer");
+    const base64 = Buffer.from(sourceMap, "utf8").toString("base64");
+    output += `//# sourceMappingURL=data:application/json;charset=utf-8;base64,${base64}\n`;
+  }
+  return output;
+}
+
+const BASE64_DIGITS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+function vlqEncode(value: number): string {
+  let vlq = value < 0 ? (-value << 1) | 1 : value << 1;
+  let out = "";
+  do {
+    let digit = vlq & 31;
+    vlq >>>= 5;
+    if (vlq > 0) digit |= 32;
+    out += BASE64_DIGITS[digit];
+  } while (vlq > 0);
+  return out;
+}
+
+// Builds a v3 source map (as a JSON string) mapping the generated module's lines
+// back to the original source files at line granularity, or undefined if there
+// is nothing to map. Column information is coarse (every mapped line points at
+// column 0), which is enough for stack traces to name the right file and line.
+function buildSourceMap(
+  blocks: SourceBlock[],
+  moduleStartLines: number[],
+  preludeLineCount: number,
+): string | undefined {
+  if (blocks.length === 0) return undefined;
+
+  const sources: string[] = [];
+  const sourceIndexByUrl = new Map<string, number>();
+  const mapped = new Map<number, [number, number]>(); // genLine -> [sourceIndex, srcLine0]
+  let maxLine = 0;
+
+  for (const block of blocks) {
+    let sourceIndex = sourceIndexByUrl.get(block.url);
+    if (sourceIndex === undefined) {
+      sourceIndex = sources.length;
+      sources.push(block.url);
+      sourceIndexByUrl.set(block.url, sourceIndex);
+    }
+    const genStart =
+      (block.moduleIndex === -1 ? preludeLineCount : moduleStartLines[block.moduleIndex]) + block.lineOffset;
+    for (let k = 0; k < block.lineCount; k++) {
+      const genLine = genStart + k;
+      mapped.set(genLine, [sourceIndex, block.line - 1 + k]);
+      if (genLine > maxLine) maxLine = genLine;
+    }
+  }
+
+  let prevSource = 0;
+  let prevSrcLine = 0;
+  const lines: string[] = [];
+  for (let g = 0; g <= maxLine; g++) {
+    const entry = mapped.get(g);
+    if (entry === undefined) {
+      lines.push("");
+      continue;
+    }
+    const sourceIndex = entry[0];
+    const srcLine = entry[1];
+    // [generatedColumn=0, sourceIndexDelta, sourceLineDelta, sourceColumn=0]
+    lines.push(vlqEncode(0) + vlqEncode(sourceIndex - prevSource) + vlqEncode(srcLine - prevSrcLine) + vlqEncode(0));
+    prevSource = sourceIndex;
+    prevSrcLine = srcLine;
+  }
+
+  return JSON.stringify({ version: 3, sources, names: [], mappings: lines.join(";") });
+}
+
+function countLines(text: string): number {
+  let count = 1;
+  for (let i = 0; i < text.length; i++) {
+    if (text.charCodeAt(i) === 10) count++;
+  }
+  return count;
+}
+
+// Start line (0-based) of each entry in `module` once joined by "\n".
+function computeStartLines(module: string[]): number[] {
+  const starts: number[] = [];
+  let line = 0;
+  for (let i = 0; i < module.length; i++) {
+    starts.push(line);
+    line += countLines(module[i]);
+  }
+  return starts;
 }
 
 // Walks the function graph reachable from `root` and finds cells referenced by
@@ -143,15 +270,26 @@ function analyzeSharedCells(root: Function): { sharedIds: Set<number>; cellInfo:
   return { sharedIds, cellInfo };
 }
 
+interface ReconstructedFunction {
+  expr: string;
+  // Where the original `fn` source begins within `expr`, in lines (the source is
+  // always emitted verbatim, so it maps line-for-line onto the original file).
+  sourceLineOffset: number;
+  sourceLineCount: number;
+  location: { url: string; line: number; column: number } | undefined;
+}
+
 // Returns an expression that evaluates to a reconstruction of `fn`, wrapping its
 // captured variables in an IIFE scope when it has any.
-function reconstructFunctionExpr(fn: Function, ctx: Context): string {
+function reconstructFunctionExpr(fn: Function, ctx: Context): ReconstructedFunction {
   const source = fn.toString();
   if (isNativeFunctionSource(source)) {
     throw new TypeError("Cannot serialize a native function (no JavaScript source is available)");
   }
 
   const freeVariables = (fn as any)[Symbol.freeVariables] as FreeVariable[];
+  const location = (fn as any)[Symbol.sourceLocation] as ReconstructedFunction["location"];
+  const sourceLineCount = source.split("\n").length;
 
   const bindings: string[] = [];
   for (const variable of freeVariables) {
@@ -162,11 +300,20 @@ function reconstructFunctionExpr(fn: Function, ctx: Context): string {
     bindings.push(`${variable.kind} ${variable.name} = ${emitValue(value, ctx)};`);
   }
 
+  // functionSourceToExpression always places the original source on its own
+  // first line, so the only vertical offset comes from the IIFE wrapper.
   const fnExpr = functionSourceToExpression(source, (fn as any).name);
   if (bindings.length === 0) {
-    return fnExpr;
+    return { expr: fnExpr, sourceLineOffset: 0, sourceLineCount, location };
   }
-  return `(function () {\n${bindings.join("\n")}\nreturn ${fnExpr};\n})()`;
+  // (function () {\n  <bindings...>\n  return <fnExpr>;\n})()
+  // The `return` line is at offset 1 (header) + bindings.length.
+  return {
+    expr: `(function () {\n${bindings.join("\n")}\nreturn ${fnExpr};\n})()`,
+    sourceLineOffset: 1 + bindings.length,
+    sourceLineCount,
+    location,
+  };
 }
 
 // Applies the replacer (if any) to a value before it is serialized. `holder` is
@@ -344,9 +491,24 @@ function emitFunction(fn: Function, ctx: Context): string {
     return name;
   }
 
-  const expr = reconstructFunctionExpr(fn, ctx);
-  ctx.module.push(`const ${name} = ${expr};`);
+  const reconstructed = reconstructFunctionExpr(fn, ctx);
+  // `const <name> = ` adds no newlines, so the source offset within the entry is
+  // the offset within the expression.
+  ctx.module.push(`const ${name} = ${reconstructed.expr};`);
+  recordSourceBlock(ctx, ctx.module.length - 1, reconstructed);
   return name;
+}
+
+function recordSourceBlock(ctx: Context, moduleIndex: number, reconstructed: ReconstructedFunction): void {
+  const location = reconstructed.location;
+  if (location === undefined || !location.url) return;
+  ctx.sourceBlocks.push({
+    moduleIndex,
+    lineOffset: reconstructed.sourceLineOffset,
+    url: location.url,
+    line: location.line,
+    lineCount: reconstructed.sourceLineCount,
+  });
 }
 
 function serializeNumber(value: number): string {

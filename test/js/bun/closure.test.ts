@@ -372,3 +372,27 @@ test("Symbol.sourceLocation reports a function's definition site", () => {
   expect(typeof loc.column).toBe("number");
   expect((Math.max as any)[Symbol.sourceLocation]).toBeUndefined();
 });
+
+test("emits an inline source map", () => {
+  const code = serialize(function boom() {
+    throw new Error("x");
+  });
+  expect(code).toContain("//# sourceMappingURL=data:application/json");
+});
+
+test("source map remaps a thrown error to the original file", async () => {
+  function boom() {
+    throw new Error("kaboom");
+  }
+  const code = serialize(boom);
+  using dir = tempDir("closure-srcmap", { "mod.mjs": code });
+  const { default: fn } = await import(`${String(dir)}/mod.mjs`);
+  let caught: any;
+  try {
+    fn();
+  } catch (e) {
+    caught = e;
+  }
+  expect(caught?.message).toBe("kaboom");
+  expect(caught?.stack).toContain("closure.test");
+});
