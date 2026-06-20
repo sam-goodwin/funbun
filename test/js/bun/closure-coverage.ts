@@ -197,7 +197,11 @@ export const CATEGORIES: CoverageCategory[] = [
         "a Map object key shared with another capture keeps identity",
       ),
       S("val.weakref", "WeakRef (live referent snapshot)", "a WeakRef round-trips its live referent"),
-      L("val.finalization-registry", "FinalizationRegistry (clear error)", "FinalizationRegistry throws a clear error"),
+      S(
+        "val.finalization-registry",
+        "FinalizationRegistry (native registration snapshot)",
+        "a FinalizationRegistry round-trips its callback + live registrations",
+      ),
       S("val.shared-arraybuffer", "SharedArrayBuffer + shared view", "SharedArrayBuffer and a view over it round-trip"),
       S(
         "val.own-accessor-instance",

@@ -152,6 +152,12 @@ declare function $resolveClosureBinding(fn: Function, name: string): { found: bo
  */
 declare function $weakCollectionSnapshot(value: object): unknown[];
 /**
+ * Snapshots a FinalizationRegistry's callback + live registrations into
+ * `{ callback, flat: [target, heldValue, unregisterToken, ...] }` (token is
+ * `undefined` when none). Used by the closure serializer to reconstruct it.
+ */
+declare function $finalizationRegistrySnapshot(value: object): { callback: Function; flat: unknown[] } | null;
+/**
  * Marks a promise as handled so it doesn't fire the unhandled-rejection
  * tracker. Equivalent to JSC's `JSPromise::markAsHandled()`.
  */

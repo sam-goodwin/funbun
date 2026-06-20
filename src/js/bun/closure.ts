@@ -1124,9 +1124,6 @@ function emitObject(value: object, ctx: Context): string {
         "Await it first, or serialize the settled value.",
     );
   }
-  if (typeof FinalizationRegistry !== "undefined" && value instanceof FinalizationRegistry) {
-    throw new TypeError("Cannot serialize a FinalizationRegistry (its registrations are not reproducible)");
-  }
   // Generator / async-generator objects and built-in iterator objects hold
   // suspended execution state (the yield point and local frame) in engine slots
   // that aren't reachable via reflection and can't be expressed as source.
@@ -1479,6 +1476,22 @@ function emitBuiltin(value: object, name: string, ctx: Context): object | null {
     ctx.module.push(`const ${name} = new WeakSet();`);
     for (const element of snap) ctx.module.push(`${name}.add(${emitValue(element, ctx)});`);
     return WeakSet.prototype;
+  }
+  // FinalizationRegistry: its registrations aren't JS-enumerable, but a native
+  // snapshot exposes the callback + live { target, heldValue, unregisterToken }.
+  // Reconstruct as a fresh registry with those registrations (snapshot of the
+  // targets alive at serialize time).
+  if (typeof FinalizationRegistry !== "undefined" && value instanceof FinalizationRegistry) {
+    const snap = $finalizationRegistrySnapshot(value); // { callback, flat: [t, h, tok, ...] }
+    if (snap === null) return null;
+    ctx.module.push(`const ${name} = new FinalizationRegistry(${emitValue(snap.callback, ctx)});`);
+    const flat = snap.flat;
+    for (let i = 0; i + 2 < flat.length; i += 3) {
+      const token = flat[i + 2];
+      const tokenArg = token === undefined ? "" : `, ${emitValue(token, ctx)}`;
+      ctx.module.push(`${name}.register(${emitValue(flat[i], ctx)}, ${emitValue(flat[i + 1], ctx)}${tokenArg});`);
+    }
+    return FinalizationRegistry.prototype;
   }
   return null;
 }

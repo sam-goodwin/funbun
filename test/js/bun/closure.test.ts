@@ -3082,10 +3082,30 @@ describe("frontier: collection key identity & guards", () => {
     expect(out.r.deref()).toBe(out.target); // same object identity
   });
 
-  test("FinalizationRegistry throws a clear error", () => {
+  test("a FinalizationRegistry round-trips its callback + live registrations", async () => {
+    const sink: string[] = [];
+    const cleanup = (held: string) => sink.push("HELD_MARKER:" + held);
+    const reg = new FinalizationRegistry(cleanup);
+    const target = { id: 1 };
+    reg.register(target, "held-value");
+    void [sink, cleanup, reg, target];
+
+    const code = serialize(() => reg);
+    // The callback and the held value were captured from the registry's internals.
+    expect(code).toContain("HELD_MARKER");
+    expect(code).toContain("held-value");
+    expect(code).toMatch(/new FinalizationRegistry\(/);
+    expect(code).toMatch(/\.register\(/);
+
+    const out = (await roundtrip(() => reg))();
+    expect(out).toBeInstanceOf(FinalizationRegistry);
+  });
+
+  test("an empty FinalizationRegistry round-trips", async () => {
     const reg = new FinalizationRegistry(() => {});
     void reg;
-    expect(() => serialize(() => reg)).toThrow(/FinalizationRegistry/i);
+    const out = (await roundtrip(() => reg))();
+    expect(out).toBeInstanceOf(FinalizationRegistry);
   });
 });
 

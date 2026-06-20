@@ -50,6 +50,7 @@
 #include "JavaScriptCore/JSString.h"
 #include "JavaScriptCore/JSWeakMap.h"
 #include "JavaScriptCore/JSWeakSet.h"
+#include "JavaScriptCore/JSFinalizationRegistry.h"
 #include "JavaScriptCore/WeakMapImpl.h"
 #include "JavaScriptCore/WeakMapImplInlines.h"
 #include "JavaScriptCore/LazyClassStructure.h"
@@ -3096,6 +3097,43 @@ JSC_DEFINE_HOST_FUNCTION(functionWeakCollectionSnapshot, (JSC::JSGlobalObject * 
     return JSC::JSValue::encode(result);
 }
 
+// Snapshots a FinalizationRegistry's callback + live registrations into
+// { callback, flat: [target, heldValue, unregisterToken, ...] } (token is
+// undefined when none). Used by the closure serializer to reconstruct it.
+JSC_DEFINE_HOST_FUNCTION(functionFinalizationRegistrySnapshot, (JSC::JSGlobalObject * globalObject, JSC::CallFrame* callFrame))
+{
+    JSC::VM& vm = JSC::getVM(globalObject);
+    auto scope = DECLARE_THROW_SCOPE(vm);
+
+    auto* registry = dynamicDowncast<JSC::JSFinalizationRegistry>(callFrame->argument(0));
+    if (!registry)
+        return JSC::JSValue::encode(JSC::jsNull());
+
+    // Root targets/held values/tokens while we build the JS arrays (targets are
+    // only weakly held by the registry).
+    JSC::MarkedArgumentBuffer rooted;
+    {
+        WTF::Locker locker { registry->cellLock() };
+        auto registrations = registry->liveRegistrations(locker);
+        for (const auto& reg : registrations) {
+            rooted.append(reg.target);
+            rooted.append(reg.heldValue);
+            rooted.append(reg.unregisterToken ? JSC::JSValue(reg.unregisterToken) : JSC::jsUndefined());
+        }
+    }
+
+    JSC::JSArray* flat = JSC::constructEmptyArray(globalObject, nullptr, rooted.size());
+    RETURN_IF_EXCEPTION(scope, {});
+    for (unsigned i = 0; i < rooted.size(); ++i) {
+        flat->putDirectIndex(globalObject, i, rooted.at(i));
+        RETURN_IF_EXCEPTION(scope, {});
+    }
+    JSC::JSObject* result = JSC::constructEmptyObject(globalObject);
+    result->putDirect(vm, JSC::Identifier::fromString(vm, "callback"_s), registry->callback(), 0);
+    result->putDirect(vm, JSC::Identifier::fromString(vm, "flat"_s), flat, 0);
+    return JSC::JSValue::encode(result);
+}
+
 JSC_DEFINE_CUSTOM_GETTER(functionFreeVariablesGetter, (JSC::JSGlobalObject * globalObject, JSC::EncodedJSValue thisValue, JSC::PropertyName))
 {
     JSC::VM& vm = JSC::getVM(globalObject);
@@ -3489,6 +3527,7 @@ void GlobalObject::addBuiltinGlobals(JSC::VM& vm)
         GlobalPropertyInfo(builtinNames.pokePromiseAsHandledPrivateName(), JSFunction::create(vm, this, 1, String(), jsBunPokePromiseAsHandled, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
         GlobalPropertyInfo(builtinNames.resolveClosureBindingPrivateName(), JSFunction::create(vm, this, 2, String(), functionResolveClosureBinding, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
         GlobalPropertyInfo(builtinNames.weakCollectionSnapshotPrivateName(), JSFunction::create(vm, this, 1, String(), functionWeakCollectionSnapshot, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
+        GlobalPropertyInfo(builtinNames.finalizationRegistrySnapshotPrivateName(), JSFunction::create(vm, this, 1, String(), functionFinalizationRegistrySnapshot, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
         GlobalPropertyInfo(builtinNames.getInternalWritableStreamPrivateName(), JSFunction::create(vm, this, 1, String(), getInternalWritableStream, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
         GlobalPropertyInfo(builtinNames.createWritableStreamFromInternalPrivateName(), JSFunction::create(vm, this, 1, String(), createWritableStreamFromInternal, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
         GlobalPropertyInfo(builtinNames.fulfillModuleSyncPrivateName(), JSFunction::create(vm, this, 1, String(), functionFulfillModuleSync, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
