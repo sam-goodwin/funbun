@@ -17,5 +17,6 @@ expectType(captured).is<FreeVariableDescriptor[]>();
 const [first] = captured;
 expectType(first!.name).is<string>();
 expectType(first!.id).is<number>();
+expectType(first!.scopeId).is<number>();
 expectType(first!.value).is<any>();
 expectType(first!.kind).is<"const" | "let">();

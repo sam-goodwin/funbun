@@ -1060,6 +1060,12 @@ interface FreeVariableDescriptor {
    * a shared mutable binding once and have both closures reference it.
    */
   id: number;
+  /**
+   * A stable id for the *scope* (environment instance) the variable lives in.
+   * Cells from the same scope share a `scopeId`, so they can be grouped to
+   * reconstruct a shared environment.
+   */
+  scopeId: number;
   /** The variable's current value. */
   value: any;
   /**
@@ -1075,12 +1081,12 @@ interface SymbolConstructor {
    * closure captures.
    *
    * Accessing `fn[Symbol.freeVariables]` returns an array of
-   * {@link FreeVariableDescriptor} objects describing the variables `fn` closes
-   * over. This reflects the mutable heap-allocated captured state of the
-   * closure:
+   * {@link FreeVariableDescriptor} objects describing the variables `fn` — or
+   * any closure nested within it — captures from an enclosing scope:
    *
-   * - `let`/`var` bindings, function parameters, captured object and closure
-   *   references, and `const` bindings with computed initializers are included.
+   * - Variables the closure transitively references (function-local or
+   *   module-level) are included; unrelated bindings in the same scope are not.
+   * - True globals (e.g. `console`) and module imports are ambient and excluded.
    * - `const` bindings whose initializer is a compile-time constant are folded
    *   into the function's code and therefore do not appear.
    *
@@ -1090,14 +1096,11 @@ interface SymbolConstructor {
    *
    * @example
    * ```ts
-   * function makeCounter() {
-   *   let n = 0;
-   *   return () => ++n;
-   * }
-   * const counter = makeCounter();
-   * counter();
-   * counter[Symbol.freeVariables];
-   * // [{ name: "n", id: 1048576, value: 1, kind: "let" }]
+   * let count = 0;
+   * const increment = () => { count += 1 };
+   * increment();
+   * increment[Symbol.freeVariables];
+   * // [{ name: "count", id: 1048576, scopeId: 1, value: 1, kind: "let" }]
    * ```
    */
   readonly freeVariables: unique symbol;

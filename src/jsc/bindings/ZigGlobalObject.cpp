@@ -67,6 +67,11 @@
 #include "JavaScriptCore/JSGlobalLexicalEnvironment.h"
 #include "JavaScriptCore/Symbol.h"
 #include "JavaScriptCore/SymbolInlines.h"
+#include "JavaScriptCore/FunctionExecutable.h"
+#include "JavaScriptCore/UnlinkedFunctionExecutable.h"
+#include "JavaScriptCore/UnlinkedFunctionCodeBlock.h"
+#include "JavaScriptCore/UnlinkedCodeBlock.h"
+#include "JavaScriptCore/ParserError.h"
 #include "AddEventListenerOptions.h"
 #include "AsyncContextFrame.h"
 #include "BunClientData.h"
@@ -2926,96 +2931,81 @@ JSValue GlobalObject_getGlobalThis(VM& vm, JSObject* globalObject)
 
 // ===================== Symbol.freeVariables (experimental) =====================
 // Returns the variables a closure captures as an array of descriptors:
-//   [{ name: string, id: number, value: any, kind: "const" | "let" }]
+//   [{ name: string, id: number, scopeId: number, value: any, kind: "const" | "let" }]
 //
-// JSC only heap-allocates a variable into a scope environment when some nested
-// function closes over it, so the union of every environment in a function's
-// scope chain is the set of free variables reachable from that closure.
+// "Captured" means *transitively referenced*: a variable is included if the
+// function — or any closure nested within it, at any depth — names it. We gather
+// the identifiers appearing in the function's unlinked code (recursing through
+// nested functions), then resolve each against the function's live scope chain.
+// Names that resolve to a true global, or that are not present as a slot in the
+// chain below the global object (module imports resolve to the exporting
+// module's environment, not this one), are ambient and excluded.
 //
-// `id` identifies the underlying variable *cell*, which is (environment
-// instance, scope offset). Two closures that close over the same variable share
-// the same environment instance, so they observe the same id — that is what lets
-// a serializer represent a shared mutable binding once and have both closures
-// reference it. Ids come from a GC-aware per-global table.
+// The identifier set is the function's identifier table rather than only its
+// scope-access operands (the per-opcode structs aren't available in this build's
+// headers). The scope-chain resolution filters it down to real captured cells,
+// so unrelated module bindings and sibling captures are excluded. The remaining
+// imprecision is over-inclusion: a name used solely as a property access (e.g.
+// `obj.x`) that happens to collide with a captured variable named `x` will be
+// reported. That is the safe direction for serialization.
 //
-// This reflects the *mutable captured state*: `const` bindings whose initializer
-// is a compile-time constant are folded into the bytecode and never get a scope
-// slot, so they do not appear (they travel with the function's code). `kind` is
-// "const" for read-only bindings and "let" otherwise — `var`/parameters are not
-// distinguished from `let` after compilation.
+// `id` identifies the variable *cell* — (environment instance, scope offset).
+// Two closures over the same variable share the environment instance, so they
+// observe the same id. `scopeId` is the environment instance's id alone, so
+// cells of the same scope can be grouped. Both come from a GC-aware per-global
+// table.
 //
-// EnvType is JSLexicalEnvironment (function/block activations); it exposes
-// symbolTable()/variableAt()/isValidScopeOffset(). `seen` makes inner scopes
-// shadow outer ones (the chain is walked innermost-first).
-template<typename EnvType>
-static void collectFreeVariablesFrom(JSC::JSGlobalObject* globalObject, JSC::VM& vm, EnvType* env, JSC::JSArray* result, unsigned& nextIndex, WTF::HashSet<WTF::UniquedStringImpl*>& seen, Bun::FreeVariableIdTable& idTable, JSC::ThrowScope& scope)
+// `kind` is "const" for read-only bindings, "let" otherwise (`var`/parameters
+// are not distinguished from `let`). `const` bindings folded to a compile-time
+// constant never get a cell and so do not appear.
+
+static constexpr unsigned freeVariablesMaxRecursionDepth = 64;
+
+// Collect, in first-seen order, the identifiers appearing in `unlinkedExecutable`
+// or any function nested within it.
+static void collectReferencedIdentifiers(JSC::VM& vm, JSC::UnlinkedFunctionExecutable* unlinkedExecutable, const JSC::SourceCode& source, WTF::HashSet<RefPtr<WTF::UniquedStringImpl>>& seen, WTF::Vector<RefPtr<WTF::UniquedStringImpl>>& ordered, unsigned depth)
 {
-    struct CapturedSlot {
-        RefPtr<WTF::UniquedStringImpl> name;
-        JSC::ScopeOffset offset;
-        bool isReadOnly;
-    };
+    if (depth > freeVariablesMaxRecursionDepth)
+        return;
 
-    JSC::SymbolTable* symbolTable = env->symbolTable();
+    JSC::ParserError parserError;
+    JSC::UnlinkedFunctionCodeBlock* codeBlock = unlinkedExecutable->unlinkedCodeBlockFor(vm, source, JSC::CodeSpecializationKind::CodeForCall, {}, parserError, unlinkedExecutable->parseMode());
+    if (!codeBlock)
+        return;
 
-    // Snapshot captured names/offsets while holding the symbol table lock. The
-    // plain ConcurrentJSLocker establishes an AssertNoGC scope (holding the lock
-    // across a GC would deadlock the collector, which also locks symbol tables),
-    // so we must not allocate until it is released.
-    WTF::Vector<CapturedSlot> captured;
-    {
-        JSC::ConcurrentJSLocker locker(symbolTable->m_lock);
-        for (auto iter = symbolTable->begin(locker), end = symbolTable->end(locker); iter != end; ++iter) {
-            const JSC::SymbolTableEntry& entry = iter->value;
-            if (entry.isNull())
-                continue;
-            JSC::VarOffset varOffset = entry.varOffset();
-            // Only scope-allocated variables have a slot to read; locals/args
-            // that weren't captured live in registers and aren't present here.
-            if (!varOffset.isScope())
-                continue;
-            JSC::ScopeOffset offset = entry.scopeOffset();
-            if (!env->isValidScopeOffset(offset))
-                continue;
-            WTF::UniquedStringImpl* uid = iter->key.get();
-            if (!uid || uid->isSymbol())
-                continue;
-            captured.append(CapturedSlot { iter->key, offset, entry.isReadOnly() });
-        }
+    size_t identifierCount = codeBlock->numberOfIdentifiers();
+    for (size_t i = 0; i < identifierCount; ++i) {
+        const JSC::Identifier& identifier = codeBlock->identifier(i);
+        WTF::UniquedStringImpl* uid = identifier.impl();
+        if (!uid || identifier.isSymbol())
+            continue;
+        if (seen.add(RefPtr { uid }).isNewEntry)
+            ordered.append(uid);
     }
 
-    uint64_t environmentId = 0;
-    bool haveEnvironmentId = false;
-
-    for (const auto& slot : captured) {
-        // The variable slots stay alive via the environment (reachable from the
-        // function this getter was called on), so reading them here is safe.
-        JSC::JSValue value = env->variableAt(slot.offset).get();
-        // Empty means the binding is in its temporal dead zone / not yet
-        // initialized — skip rather than expose the JSC empty sentinel.
-        if (!value || value.isEmpty())
-            continue;
-        if (!seen.add(slot.name.get()).isNewEntry)
-            continue;
-
-        if (!haveEnvironmentId) {
-            environmentId = idTable.idForEnvironment(env);
-            haveEnvironmentId = true;
-        }
-        // Pack (environmentId, offset) into one stable, JS-safe-integer id.
-        // Scope offsets are small; 20 bits is far more than any real function.
-        ASSERT(slot.offset.offset() < (1u << 20));
-        double cellId = static_cast<double>(environmentId) * (1u << 20) + slot.offset.offset();
-
-        JSC::JSObject* descriptor = JSC::constructEmptyObject(globalObject);
-        descriptor->putDirect(vm, JSC::Identifier::fromString(vm, "name"_s), JSC::jsString(vm, WTF::String { static_cast<WTF::StringImpl*>(slot.name.get()) }), 0);
-        descriptor->putDirect(vm, JSC::Identifier::fromString(vm, "id"_s), JSC::jsNumber(cellId), 0);
-        descriptor->putDirect(vm, JSC::Identifier::fromString(vm, "value"_s), value, 0);
-        descriptor->putDirect(vm, JSC::Identifier::fromString(vm, "kind"_s), JSC::jsString(vm, String(slot.isReadOnly ? "const"_s : "let"_s)), 0);
-
-        result->putDirectIndex(globalObject, nextIndex++, descriptor);
-        RETURN_IF_EXCEPTION(scope, );
+    for (size_t i = 0; i < codeBlock->numberOfFunctionDecls(); ++i) {
+        auto* nested = codeBlock->functionDecl(i);
+        collectReferencedIdentifiers(vm, nested, nested->linkedSourceCode(source), seen, ordered, depth + 1);
     }
+    for (size_t i = 0; i < codeBlock->numberOfFunctionExprs(); ++i) {
+        auto* nested = codeBlock->functionExpr(i);
+        collectReferencedIdentifiers(vm, nested, nested->linkedSourceCode(source), seen, ordered, depth + 1);
+    }
+}
+
+static JSC::JSValue readEnvironmentVariable(JSC::JSCell* environment, JSC::ScopeOffset offset)
+{
+    if (auto* env = dynamicDowncast<JSC::JSLexicalEnvironment>(environment)) {
+        if (!env->isValidScopeOffset(offset))
+            return {};
+        return env->variableAt(offset).get();
+    }
+    if (auto* env = dynamicDowncast<JSC::JSModuleEnvironment>(environment)) {
+        if (!env->isValidScopeOffset(offset))
+            return {};
+        return env->variableAt(offset).get();
+    }
+    return {};
 }
 
 JSC_DEFINE_CUSTOM_GETTER(functionFreeVariablesGetter, (JSC::JSGlobalObject * globalObject, JSC::EncodedJSValue thisValue, JSC::PropertyName))
@@ -3027,28 +3017,77 @@ JSC_DEFINE_CUSTOM_GETTER(functionFreeVariablesGetter, (JSC::JSGlobalObject * glo
     RETURN_IF_EXCEPTION(scope, {});
 
     JSC::JSFunction* function = dynamicDowncast<JSC::JSFunction>(JSC::JSValue::decode(thisValue));
-    if (!function)
+    if (!function || function->isHostFunction())
         return JSC::JSValue::encode(result);
 
+    JSC::FunctionExecutable* executable = function->jsExecutable();
+    if (!executable)
+        return JSC::JSValue::encode(result);
+
+    // 1. Statically collect the identifiers this closure transitively references
+    //    from enclosing scopes.
+    WTF::HashSet<RefPtr<WTF::UniquedStringImpl>> seen;
+    WTF::Vector<RefPtr<WTF::UniquedStringImpl>> referenced;
+    collectReferencedIdentifiers(vm, executable->unlinkedExecutable(), executable->source(), seen, referenced, 0);
+
+    // 2. Resolve each against the live scope chain and emit a descriptor for the
+    //    ones that land in a captured (non-global) environment.
     Bun::FreeVariableIdTable& idTable = defaultGlobalObject(globalObject)->freeVariableIdTable();
-
     unsigned nextIndex = 0;
-    WTF::HashSet<WTF::UniquedStringImpl*> seen;
-    for (JSC::JSScope* current = function->scope(); current; current = current->next()) {
-        // Stop at module/global scope. Those bindings (module-level consts,
-        // imports, globals) are ambient — available wherever the closure is
-        // re-instantiated — not part of its captured activation state, and the
-        // module environment otherwise pulls in every top-level binding rather
-        // than just the ones this closure reaches.
-        if (current->inherits<JSC::JSGlobalObject>()
-            || current->inherits<JSC::JSGlobalLexicalEnvironment>()
-            || current->inherits<JSC::JSModuleEnvironment>())
-            break;
+    for (const auto& nameImpl : referenced) {
+        JSC::JSCell* foundEnvironment = nullptr;
+        JSC::ScopeOffset offset;
+        bool isReadOnly = false;
 
-        if (auto* env = dynamicDowncast<JSC::JSLexicalEnvironment>(current)) {
-            collectFreeVariablesFrom(globalObject, vm, env, result, nextIndex, seen, idTable, scope);
-            RETURN_IF_EXCEPTION(scope, {});
+        for (JSC::JSScope* current = function->scope(); current; current = current->next()) {
+            // Reaching module/global scope means the name is ambient (a global or
+            // import) — stop without emitting.
+            if (current->inherits<JSC::JSGlobalObject>() || current->inherits<JSC::JSGlobalLexicalEnvironment>())
+                break;
+            auto* symbolTableObject = dynamicDowncast<JSC::JSSymbolTableObject>(current);
+            if (!symbolTableObject)
+                continue;
+
+            JSC::SymbolTable* symbolTable = symbolTableObject->symbolTable();
+            JSC::ConcurrentJSLocker locker(symbolTable->m_lock);
+            auto iter = symbolTable->find(locker, nameImpl.get());
+            if (iter == symbolTable->end(locker))
+                continue;
+            const JSC::SymbolTableEntry& entry = iter->value;
+            // The nearest scope that declares the name wins (shadowing). If it
+            // isn't a readable scope slot, the name is still shadowed here.
+            if (!entry.isNull() && entry.varOffset().isScope()) {
+                offset = entry.scopeOffset();
+                isReadOnly = entry.isReadOnly();
+                foundEnvironment = current;
+            }
+            break;
         }
+
+        if (!foundEnvironment)
+            continue;
+
+        JSC::JSValue value = readEnvironmentVariable(foundEnvironment, offset);
+        // Empty means the binding is in its temporal dead zone / not yet
+        // initialized — skip rather than expose the JSC empty sentinel.
+        if (!value || value.isEmpty())
+            continue;
+
+        uint64_t scopeId = idTable.idForEnvironment(foundEnvironment);
+        // Pack (scopeId, offset) into one stable, JS-safe-integer cell id.
+        // Scope offsets are small; 20 bits is far more than any real function.
+        ASSERT(offset.offset() < (1u << 20));
+        double cellId = static_cast<double>(scopeId) * (1u << 20) + offset.offset();
+
+        JSC::JSObject* descriptor = JSC::constructEmptyObject(globalObject);
+        descriptor->putDirect(vm, JSC::Identifier::fromString(vm, "name"_s), JSC::jsString(vm, WTF::String { static_cast<WTF::StringImpl*>(nameImpl.get()) }), 0);
+        descriptor->putDirect(vm, JSC::Identifier::fromString(vm, "id"_s), JSC::jsNumber(cellId), 0);
+        descriptor->putDirect(vm, JSC::Identifier::fromString(vm, "scopeId"_s), JSC::jsNumber(static_cast<double>(scopeId)), 0);
+        descriptor->putDirect(vm, JSC::Identifier::fromString(vm, "value"_s), value, 0);
+        descriptor->putDirect(vm, JSC::Identifier::fromString(vm, "kind"_s), JSC::jsString(vm, String(isReadOnly ? "const"_s : "let"_s)), 0);
+
+        result->putDirectIndex(globalObject, nextIndex++, descriptor);
+        RETURN_IF_EXCEPTION(scope, {});
     }
 
     RELEASE_AND_RETURN(scope, JSC::JSValue::encode(result));

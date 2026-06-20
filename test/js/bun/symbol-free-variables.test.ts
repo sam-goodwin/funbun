@@ -1,17 +1,16 @@
 import { test, expect } from "bun:test";
+import { bunEnv, bunExe, tempDir } from "harness";
 
 // Experimental primitive: `fn[Symbol.freeVariables]` returns an array of
-// descriptors — { name, id, value, kind } — for the variables a closure
-// captures. It reflects the *mutable heap-allocated captured state*: JSC only
-// allocates a captured variable into a scope environment when a nested function
-// closes over it, so that environment is exactly what this exposes.
-//
-// `id` identifies the underlying variable cell (environment instance + slot);
-// two closures over the same variable observe the same id. `const` bindings
-// folded to a compile-time constant never get a cell and so do not appear.
+// descriptors — { name, id, scopeId, value, kind } — for the variables a
+// closure (or any closure nested within it) transitively captures from an
+// enclosing scope. `id` identifies the underlying variable cell (environment
+// instance + slot); two closures over the same variable observe the same id.
+// `const` bindings folded to a compile-time constant never get a cell and so do
+// not appear; true globals and module imports are excluded.
 const freeVariables = Symbol.freeVariables;
 
-type Descriptor = { name: string; id: number; value: any; kind: "const" | "let" };
+type Descriptor = { name: string; id: number; scopeId: number; value: any; kind: "const" | "let" };
 
 function byName(fn: Function): Record<string, Descriptor> {
   const out: Record<string, Descriptor> = {};
@@ -24,7 +23,7 @@ test("Symbol.freeVariables is a symbol exposed on the Symbol constructor", () =>
   expect(String(freeVariables)).toBe("Symbol(Symbol.freeVariables)");
 });
 
-test("returns an array of {name, id, value, kind} descriptors", () => {
+test("returns an array of {name, id, scopeId, value, kind} descriptors", () => {
   function make() {
     let x = 42;
     return () => x;
@@ -32,7 +31,37 @@ test("returns an array of {name, id, value, kind} descriptors", () => {
   const captured = (make() as any)[freeVariables] as Descriptor[];
   expect(Array.isArray(captured)).toBe(true);
   expect(captured).toHaveLength(1);
-  expect(captured[0]).toEqual({ name: "x", id: expect.any(Number), value: 42, kind: "let" });
+  expect(captured[0]).toEqual({
+    name: "x",
+    id: expect.any(Number),
+    scopeId: expect.any(Number),
+    value: 42,
+    kind: "let",
+  });
+});
+
+test("only transitively-referenced variables are captured (siblings excluded)", () => {
+  function make() {
+    let a = 1;
+    let b = 2; // captured by sibling `other`, but NOT referenced by the returned closure
+    const other = () => b;
+    void other;
+    return () => a;
+  }
+  const vars = byName(make());
+  expect(vars.a.value).toBe(1);
+  expect(vars.b).toBeUndefined();
+});
+
+test("cells in the same scope share a scopeId; id packs it", () => {
+  function make() {
+    let a = 1;
+    let b = 2;
+    return () => a + b;
+  }
+  const vars = byName(make());
+  expect(vars.a.scopeId).toBe(vars.b.scopeId);
+  expect(vars.a.id).not.toBe(vars.b.id);
 });
 
 test("kind reflects const vs non-const", () => {
@@ -140,4 +169,36 @@ test("captures variables transitively used by a nested closure", () => {
 
 test("native functions have no free variables", () => {
   expect((Math.max as any)[freeVariables]).toEqual([]);
+});
+
+test("module-level captured variables are included; imports and globals are excluded", async () => {
+  using dir = tempDir("free-vars-module", {
+    "dep.js": `export const imported = "IMPORTED";`,
+    "main.js": `
+      import { imported } from "./dep.js";
+      let i = 0;
+      let unused = "nope";
+      const fn = () => { i += 1; return imported; };
+      fn();
+      fn();
+      const vars = fn[Symbol.freeVariables];
+      console.log(JSON.stringify(vars.map(d => ({ name: d.name, value: d.value, kind: d.kind }))));
+      console.log(JSON.stringify(typeof vars[0]?.scopeId));
+    `,
+  });
+
+  await using proc = Bun.spawn({
+    cmd: [bunExe(), String(dir) + "/main.js"],
+    env: { ...bunEnv, BUN_DEBUG_QUIET_LOGS: "1" },
+    stderr: "pipe",
+    stdout: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+  const lines = stdout.trim().split("\n");
+
+  // `i` is a referenced module-level variable; `unused` (not referenced), the
+  // `imported` import, and the `console`/`return` globals are all excluded.
+  expect(JSON.parse(lines[0])).toEqual([{ name: "i", value: 2, kind: "let" }]);
+  expect(JSON.parse(lines[1])).toBe("number");
+  expect({ stderr, exitCode }).toEqual({ stderr: expect.any(String), exitCode: 0 });
 });
