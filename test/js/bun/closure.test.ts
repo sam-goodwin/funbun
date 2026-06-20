@@ -233,3 +233,57 @@ test("replacer omits object properties it returns undefined for", async () => {
   const { default: fn } = await import(`${String(dir)}/mod.mjs`);
   expect(fn()).toEqual({ keep: 1 });
 });
+
+test("reconstructs a captured Date", async () => {
+  let d = new Date("2020-01-02T03:04:05.678Z");
+  void d;
+  const fn = await roundtrip(() => d);
+  expect(fn().getTime()).toBe(new Date("2020-01-02T03:04:05.678Z").getTime());
+});
+
+test("reconstructs a captured RegExp", async () => {
+  let re = /ab+c/gi;
+  void re;
+  const fn = await roundtrip(() => re);
+  const out = fn();
+  expect(out.source).toBe("ab+c");
+  expect(out.flags).toBe("gi");
+  expect(out.test("xxABBBCyy")).toBe(true);
+});
+
+test("reconstructs a captured Map (with object values)", async () => {
+  let m = new Map<string, unknown>([
+    ["a", 1],
+    ["b", { nested: true }],
+  ]);
+  void m;
+  const fn = await roundtrip(() => m);
+  const out = fn();
+  expect(out.get("a")).toBe(1);
+  expect(out.get("b")).toEqual({ nested: true });
+});
+
+test("reconstructs a captured Set", async () => {
+  let s = new Set([1, 2, 3]);
+  void s;
+  const fn = await roundtrip(() => s);
+  expect([...fn()]).toEqual([1, 2, 3]);
+});
+
+test("reconstructs a captured typed array", async () => {
+  let bytes = new Uint8Array([1, 2, 255]);
+  void bytes;
+  const fn = await roundtrip(() => bytes);
+  const out = fn();
+  expect(out).toBeInstanceOf(Uint8Array);
+  expect([...out]).toEqual([1, 2, 255]);
+});
+
+test("reconstructs a captured Error with its type and message", async () => {
+  let err = new TypeError("boom");
+  void err;
+  const fn = await roundtrip(() => err);
+  const out = fn();
+  expect(out).toBeInstanceOf(TypeError);
+  expect(out.message).toBe("boom");
+});

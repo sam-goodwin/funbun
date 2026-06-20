@@ -183,6 +183,10 @@ function emitObject(value: object, ctx: Context): string {
   // Record BEFORE recursing so a self-reference resolves to `name`.
   ctx.refs.set(value, name);
 
+  if (emitBuiltin(value, name, ctx)) {
+    return name;
+  }
+
   if (Array.isArray(value)) {
     ctx.module.push(`const ${name} = [];`);
     for (let i = 0; i < value.length; i++) {
@@ -202,6 +206,67 @@ function emitObject(value: object, ctx: Context): string {
   }
 
   return name;
+}
+
+const ERROR_TYPES = new Set([
+  "Error",
+  "TypeError",
+  "RangeError",
+  "SyntaxError",
+  "ReferenceError",
+  "EvalError",
+  "URIError",
+  "AggregateError",
+]);
+
+// Reconstructs common built-in object types. Returns true (and appends the
+// construction to ctx.module under `name`) if `value` is a recognized built-in;
+// returns false for plain objects/arrays, which the caller handles.
+function emitBuiltin(value: object, name: string, ctx: Context): boolean {
+  if (value instanceof Date) {
+    ctx.module.push(`const ${name} = new Date(${(value as Date).getTime()});`);
+    return true;
+  }
+  if (value instanceof RegExp) {
+    const re = value as RegExp;
+    ctx.module.push(`const ${name} = new RegExp(${JSON.stringify(re.source)}, ${JSON.stringify(re.flags)});`);
+    return true;
+  }
+  if (value instanceof Map) {
+    ctx.module.push(`const ${name} = new Map();`);
+    for (const entry of value as Map<unknown, unknown>) {
+      ctx.module.push(`${name}.set(${emitValue(entry[0], ctx)}, ${emitValue(entry[1], ctx)});`);
+    }
+    return true;
+  }
+  if (value instanceof Set) {
+    ctx.module.push(`const ${name} = new Set();`);
+    for (const element of value as Set<unknown>) {
+      ctx.module.push(`${name}.add(${emitValue(element, ctx)});`);
+    }
+    return true;
+  }
+  if (ArrayBuffer.isView(value) && !(value instanceof DataView)) {
+    const view = value as unknown as { length: number; constructor: { name: string }; [i: number]: unknown };
+    const elements: string[] = [];
+    for (let i = 0; i < view.length; i++) {
+      elements.push(emitValue(view[i], ctx));
+    }
+    ctx.module.push(`const ${name} = new ${view.constructor.name}([${elements.join(", ")}]);`);
+    return true;
+  }
+  if (value instanceof Error) {
+    const err = value as Error;
+    const ctorName = ERROR_TYPES.has((err.constructor && err.constructor.name) as string)
+      ? err.constructor.name
+      : "Error";
+    ctx.module.push(`const ${name} = new ${ctorName}(${JSON.stringify(err.message)});`);
+    if (err.name !== ctorName) {
+      ctx.module.push(`${name}.name = ${JSON.stringify(err.name)};`);
+    }
+    return true;
+  }
+  return false;
 }
 
 function emitFunction(fn: Function, ctx: Context): string {
