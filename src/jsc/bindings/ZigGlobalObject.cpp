@@ -40,6 +40,7 @@
 #include "JavaScriptCore/ModuleRegistryEntry.h"
 #include "JavaScriptCore/JSModuleNamespaceObject.h"
 #include "JavaScriptCore/JSModuleNamespaceObjectInlines.h"
+#include "JavaScriptCore/AbstractModuleRecord.h"
 #include "JavaScriptCore/JSModuleRecord.h"
 #include "JavaScriptCore/JSNativeStdFunction.h"
 #include "JavaScriptCore/JSObject.h"
@@ -86,6 +87,7 @@
 #include "BunProcess.h"
 #include "BunSecureContextCache.h"
 #include "BunFreeVariableIdTable.h"
+#include "isBuiltinModule.h"
 #include "ProcessIdentifier.h"
 #include "BunWorkerGlobalScope.h"
 #include "CallSite.h"
@@ -3043,6 +3045,14 @@ JSC_DEFINE_CUSTOM_GETTER(functionFreeVariablesGetter, (JSC::JSGlobalObject * glo
         JSC::ScopeOffset offset;
         bool isReadOnly = false;
 
+        // Import metadata, populated only when the name resolves to a
+        // named/default ES-module import rather than a local captured binding.
+        bool isImport = false;
+        bool importExternal = true;
+        WTF::String importSpecifier;
+        WTF::String importExportedName;
+        WTF::String importKind;
+
         for (JSC::JSScope* current = function->scope(); current; current = current->next()) {
             // Reaching module/global scope means the name is ambient (a global or
             // import) — stop without emitting.
@@ -3052,43 +3062,141 @@ JSC_DEFINE_CUSTOM_GETTER(functionFreeVariablesGetter, (JSC::JSGlobalObject * glo
             if (!symbolTableObject)
                 continue;
 
-            JSC::SymbolTable* symbolTable = symbolTableObject->symbolTable();
-            JSC::ConcurrentJSLocker locker(symbolTable->m_lock);
-            auto iter = symbolTable->find(locker, nameImpl.get());
-            if (iter == symbolTable->end(locker))
-                continue;
-            const JSC::SymbolTableEntry& entry = iter->value;
-            // The nearest scope that declares the name wins (shadowing). If it
-            // isn't a readable scope slot, the name is still shadowed here.
-            if (!entry.isNull() && entry.varOffset().isScope()) {
-                offset = entry.scopeOffset();
-                isReadOnly = entry.isReadOnly();
-                foundEnvironment = current;
+            // First, look for the name as a local scope slot of `current`.
+            {
+                JSC::SymbolTable* symbolTable = symbolTableObject->symbolTable();
+                JSC::ConcurrentJSLocker locker(symbolTable->m_lock);
+                auto iter = symbolTable->find(locker, nameImpl.get());
+                if (iter != symbolTable->end(locker)) {
+                    const JSC::SymbolTableEntry& entry = iter->value;
+                    // The nearest scope that declares the name wins (shadowing). If it
+                    // isn't a readable scope slot, the name is still shadowed here.
+                    if (!entry.isNull() && entry.varOffset().isScope()) {
+                        offset = entry.scopeOffset();
+                        isReadOnly = entry.isReadOnly();
+                        foundEnvironment = current;
+                    }
+                    // Found locally (or shadowed) — stop walking. A's lock is
+                    // released as this scope exits.
+                    break;
+                }
             }
+
+            // Not a local slot. If `current` is a module environment, the name
+            // may be a named/default import binding — resolve it against the
+            // exporting module and capture its value + import metadata.
+            auto* moduleEnv = dynamicDowncast<JSC::JSModuleEnvironment>(current);
+            if (!moduleEnv)
+                continue;
+
+            JSC::AbstractModuleRecord* recordA = moduleEnv->moduleRecord();
+            if (!recordA)
+                break;
+
+            std::optional<JSC::AbstractModuleRecord::ImportEntry> importEntry = recordA->tryGetImportEntry(nameImpl.get());
+            if (!importEntry) {
+                // Not an import declared by this module — keep walking outward.
+                continue;
+            }
+
+            // Namespace imports (`import * as ns`) are already captured as a
+            // local scope slot above; never double-handle them here.
+            if (importEntry->type == JSC::AbstractModuleRecord::ImportEntryType::Namespace)
+                break;
+
+            importSpecifier = importEntry->moduleRequest.string();
+            if (importEntry->importName == vm.propertyNames->defaultKeyword) {
+                importKind = "default"_s;
+                importExportedName = "default"_s;
+            } else {
+                importKind = "named"_s;
+                importExportedName = importEntry->importName.string();
+            }
+            isImport = true;
+
+            // Resolve the binding through any re-export / star chains to the
+            // terminal module + local name. For an already-evaluated module (the
+            // closure is running) this is a pure lookup and does not throw.
+            JSC::AbstractModuleRecord::Resolution res = recordA->resolveImport(globalObject, JSC::Identifier::fromUid(vm, nameImpl.get()));
+            if (res.type == JSC::AbstractModuleRecord::Resolution::Type::Resolved
+                && res.localName.impl() != vm.propertyNames->starNamespacePrivateName.impl()) {
+                if (JSC::JSModuleEnvironment* mEnv = res.moduleRecord->moduleEnvironmentMayBeNull()) {
+                    JSC::SymbolTable* mTable = mEnv->symbolTable();
+                    JSC::ConcurrentJSLocker mLocker(mTable->m_lock);
+                    auto mIter = mTable->find(mLocker, res.localName.impl());
+                    if (mIter != mTable->end(mLocker)) {
+                        const JSC::SymbolTableEntry& mEntry = mIter->value;
+                        if (!mEntry.isNull() && mEntry.varOffset().isScope()) {
+                            offset = mEntry.scopeOffset();
+                            isReadOnly = mEntry.isReadOnly();
+                            // The value (and its cell identity) lives in M's env.
+                            foundEnvironment = mEnv;
+                        }
+                    }
+                }
+            }
+
+            // Classify the import source as external (re-emit the import
+            // statement) vs inlinable (a user JS file we can serialize from).
+            importExternal = true;
+            JSC::AbstractModuleRecord* srcRecord = recordA->hostResolveImportedModule(globalObject, importEntry->moduleRequest);
+            if (srcRecord) {
+                auto* jsmod = dynamicDowncast<JSC::JSModuleRecord>(srcRecord);
+                importExternal = !jsmod || Bun::isBuiltinModule(srcRecord->moduleKey().string());
+            }
+
+            // Import resolved — stop walking. M's lock (if taken) was released
+            // above. A's lock was already released before this point.
             break;
         }
 
-        if (!foundEnvironment)
+        if (!foundEnvironment && !isImport)
             continue;
 
-        JSC::JSValue value = readEnvironmentVariable(foundEnvironment, offset);
-        // Empty means the binding is in its temporal dead zone / not yet
-        // initialized — skip rather than expose the JSC empty sentinel.
-        if (!value || value.isEmpty())
-            continue;
+        JSC::JSValue value;
+        if (foundEnvironment) {
+            value = readEnvironmentVariable(foundEnvironment, offset);
+            // Empty means the binding is in its temporal dead zone / not yet
+            // initialized — skip rather than expose the JSC empty sentinel.
+            if (!value || value.isEmpty())
+                value = {};
+        }
 
-        uint64_t scopeId = idTable.idForEnvironment(foundEnvironment);
-        // Pack (scopeId, offset) into one stable, JS-safe-integer cell id.
-        // Scope offsets are small; 20 bits is far more than any real function.
-        ASSERT(offset.offset() < (1u << 20));
-        double cellId = static_cast<double>(scopeId) * (1u << 20) + offset.offset();
+        // For non-import free vars (and inlinable imports) a missing/empty value
+        // means there is nothing to capture — skip. External imports still emit
+        // a descriptor (with value: undefined) so the JS side can re-emit the
+        // import statement.
+        if (!value || value.isEmpty()) {
+            if (!(isImport && importExternal))
+                continue;
+        }
+
+        double cellId = 0;
+        double scopeIdNumber = 0;
+        if (foundEnvironment) {
+            uint64_t scopeId = idTable.idForEnvironment(foundEnvironment);
+            // Pack (scopeId, offset) into one stable, JS-safe-integer cell id.
+            // Scope offsets are small; 20 bits is far more than any real function.
+            ASSERT(offset.offset() < (1u << 20));
+            cellId = static_cast<double>(scopeId) * (1u << 20) + offset.offset();
+            scopeIdNumber = static_cast<double>(scopeId);
+        }
 
         JSC::JSObject* descriptor = JSC::constructEmptyObject(globalObject);
         descriptor->putDirect(vm, JSC::Identifier::fromString(vm, "name"_s), JSC::jsString(vm, WTF::String { static_cast<WTF::StringImpl*>(nameImpl.get()) }), 0);
         descriptor->putDirect(vm, JSC::Identifier::fromString(vm, "id"_s), JSC::jsNumber(cellId), 0);
-        descriptor->putDirect(vm, JSC::Identifier::fromString(vm, "scopeId"_s), JSC::jsNumber(static_cast<double>(scopeId)), 0);
-        descriptor->putDirect(vm, JSC::Identifier::fromString(vm, "value"_s), value, 0);
+        descriptor->putDirect(vm, JSC::Identifier::fromString(vm, "scopeId"_s), JSC::jsNumber(scopeIdNumber), 0);
+        descriptor->putDirect(vm, JSC::Identifier::fromString(vm, "value"_s), (value && !value.isEmpty()) ? value : JSC::jsUndefined(), 0);
         descriptor->putDirect(vm, JSC::Identifier::fromString(vm, "kind"_s), JSC::jsString(vm, String(isReadOnly ? "const"_s : "let"_s)), 0);
+
+        if (isImport) {
+            JSC::JSObject* importInfo = JSC::constructEmptyObject(globalObject);
+            importInfo->putDirect(vm, JSC::Identifier::fromString(vm, "source"_s), JSC::jsString(vm, importSpecifier), 0);
+            importInfo->putDirect(vm, JSC::Identifier::fromString(vm, "importedName"_s), JSC::jsString(vm, importExportedName), 0);
+            importInfo->putDirect(vm, JSC::Identifier::fromString(vm, "kind"_s), JSC::jsString(vm, importKind), 0);
+            importInfo->putDirect(vm, JSC::Identifier::fromString(vm, "external"_s), JSC::jsBoolean(importExternal), 0);
+            descriptor->putDirect(vm, JSC::Identifier::fromString(vm, "import"_s), importInfo, 0);
+        }
 
         result->putDirectIndex(globalObject, nextIndex++, descriptor);
         RETURN_IF_EXCEPTION(scope, {});

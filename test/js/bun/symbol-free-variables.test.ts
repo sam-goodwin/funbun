@@ -196,7 +196,7 @@ test("over-includes a captured name used only as a property access (documented l
   expect((control() as any)[freeVariables]).toEqual([]);
 });
 
-test("module-level captured variables are included; imports and globals are excluded", async () => {
+test("module-level variables and imports are captured (with import metadata); globals excluded", async () => {
   using dir = tempDir("free-vars-module", {
     "dep.js": `export const imported = "IMPORTED";`,
     "main.js": `
@@ -207,7 +207,7 @@ test("module-level captured variables are included; imports and globals are excl
       fn();
       fn();
       const vars = fn[Symbol.freeVariables];
-      console.log(JSON.stringify(vars.map(d => ({ name: d.name, value: d.value, kind: d.kind }))));
+      console.log(JSON.stringify(vars.map(d => ({ name: d.name, value: d.value, kind: d.kind, import: d.import }))));
       console.log(JSON.stringify(typeof vars[0]?.scopeId));
     `,
   });
@@ -221,9 +221,19 @@ test("module-level captured variables are included; imports and globals are excl
   const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
   const lines = stdout.trim().split("\n");
 
-  // `i` is a referenced module-level variable; `unused` (not referenced), the
-  // `imported` import, and the `console`/`return` globals are all excluded.
-  expect(JSON.parse(lines[0])).toEqual([{ name: "i", value: 2, kind: "let" }]);
+  // `i` is a referenced module-level variable; `imported` is a named import,
+  // now captured WITH import metadata (so a serializer can inline it or keep the
+  // import). `unused` (not referenced) and the `console`/`return` globals are
+  // excluded.
+  expect(JSON.parse(lines[0])).toEqual([
+    { name: "i", value: 2, kind: "let" },
+    {
+      name: "imported",
+      value: "IMPORTED",
+      kind: "const",
+      import: { source: "./dep.js", importedName: "imported", kind: "named", external: false },
+    },
+  ]);
   expect(JSON.parse(lines[1])).toBe("number");
   expect({ stderr, exitCode }).toEqual({ stderr: expect.any(String), exitCode: 0 });
 });

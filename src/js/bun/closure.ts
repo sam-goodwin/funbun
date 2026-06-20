@@ -25,17 +25,40 @@
 
 type Replacer = (key: string, value: unknown) => unknown;
 
+interface ImportInfo {
+  source: string;
+  importedName: string;
+  kind: "named" | "default" | "namespace";
+  external: boolean;
+}
+
 interface FreeVariable {
   name: string;
   id: number;
   scopeId: number;
   value: unknown;
   kind: "const" | "let";
+  // Present when this binding is an ES-module import. `external` imports (native
+  // / node:* / builtins) can't be inlined and are re-emitted as `import`
+  // statements; inlinable ones (user modules) serialize their value like any
+  // captured value.
+  import?: ImportInfo;
 }
 
 // Prefix for hoisted reference variables. Must not collide with a captured
 // variable name; chosen to be extremely unlikely in user code.
 const REF_PREFIX = "__bunClosure$";
+
+// An `import` statement re-creating an external import binding (native / node:*
+// / builtin) that can't be inlined.
+function importStatement(variable: FreeVariable): string {
+  const info = variable.import!;
+  const src = JSON.stringify(info.source);
+  if (info.kind === "default") return `import ${variable.name} from ${src};`;
+  if (info.kind === "namespace") return `import * as ${variable.name} from ${src};`;
+  const spec = info.importedName === variable.name ? variable.name : `${info.importedName} as ${variable.name}`;
+  return `import { ${spec} } from ${src};`;
+}
 
 interface Context {
   // Module-level hoisted declarations (shared cells, object refs, function refs).
@@ -46,6 +69,9 @@ interface Context {
   // Cell ids (Symbol.freeVariables id) shared by 2+ functions: hoisted to module
   // scope under their original name, skipped in per-function IIFEs.
   sharedIds: Set<number>;
+  // External imports (node:*, builtins) re-emitted as `import` statements at the
+  // top of the module instead of inlined. Deduplicated.
+  imports: Set<string>;
   replacer: Replacer | undefined;
   // Records, for source-map generation, where each reconstructed function's
   // verbatim source lands. `moduleIndex` indexes into `module` (or -1 for the
@@ -76,6 +102,7 @@ function serialize(fn: Function, replacer?: Replacer): string {
     refs: new Map(),
     counter: 0,
     sharedIds,
+    imports: new Set(),
     replacer: typeof replacer === "function" ? replacer : undefined,
     sourceBlocks: [],
     keepSets: computeKeepSets(fn),
@@ -86,6 +113,11 @@ function serialize(fn: Function, replacer?: Replacer): string {
   const namesById = new Map<string, number>();
   for (const id of sharedIds) {
     const cell = cellInfo.get(id)!;
+    // External imports are re-emitted as `import` statements, not inlined.
+    if (cell.import?.external) {
+      ctx.imports.add(importStatement(cell));
+      continue;
+    }
     const claimed = namesById.get(cell.name);
     if (claimed !== undefined && claimed !== id) {
       throw new TypeError(`Cannot serialize: two distinct shared variables are both named "${cell.name}"`);
@@ -122,8 +154,13 @@ function serialize(fn: Function, replacer?: Replacer): string {
     });
   }
 
-  let output = `${prelude}export default ${exportExpr};\n`;
-  const sourceMap = buildSourceMap(ctx.sourceBlocks, moduleStartLines, preludeLineCount);
+  // External imports are re-emitted at the very top; they shift every generated
+  // line down, so the source map is offset by their count to stay correct.
+  const importBlock = ctx.imports.size > 0 ? [...ctx.imports].join("\n") + "\n" : "";
+  const leadingLines = ctx.imports.size;
+
+  let output = `${importBlock}${prelude}export default ${exportExpr};\n`;
+  const sourceMap = buildSourceMap(ctx.sourceBlocks, moduleStartLines, preludeLineCount, leadingLines);
   if (sourceMap !== undefined) {
     const { Buffer } = require("node:buffer");
     const base64 = Buffer.from(sourceMap, "utf8").toString("base64");
@@ -154,6 +191,7 @@ function buildSourceMap(
   blocks: SourceBlock[],
   moduleStartLines: number[],
   preludeLineCount: number,
+  leadingLines: number = 0,
 ): string | undefined {
   if (blocks.length === 0) return undefined;
 
@@ -170,7 +208,9 @@ function buildSourceMap(
       sourceIndexByUrl.set(block.url, sourceIndex);
     }
     const genStart =
-      (block.moduleIndex === -1 ? preludeLineCount : moduleStartLines[block.moduleIndex]) + block.lineOffset;
+      leadingLines +
+      (block.moduleIndex === -1 ? preludeLineCount : moduleStartLines[block.moduleIndex]) +
+      block.lineOffset;
     for (let k = 0; k < block.lineCount; k++) {
       const genLine = genStart + k;
       mapped.set(genLine, [sourceIndex, block.line - 1 + k]);
@@ -715,6 +755,12 @@ function reconstructFunctionExpr(fn: Function, ctx: Context): ReconstructedFunct
     // Shared cells are declared once at module scope; the source resolves to
     // them by name, so don't shadow them with a private binding here.
     if (ctx.sharedIds.has(variable.id)) continue;
+    // External imports (native / node:* / builtins) can't be inlined — re-emit
+    // them as `import` statements at module scope; the source resolves to them.
+    if (variable.import?.external) {
+      ctx.imports.add(importStatement(variable));
+      continue;
+    }
     const value = transform(undefined, variable.name, variable.value, ctx);
     bindings.push(`${variable.kind} ${variable.name} = ${emitValue(value, ctx)};`);
   }
@@ -1413,6 +1459,7 @@ async function bundle(fn: Function, replacer?: Replacer): Promise<string> {
     refs: new Map(),
     counter: 0,
     sharedIds,
+    imports: new Set(),
     replacer: typeof replacer === "function" ? replacer : undefined,
     sourceBlocks: [],
     keepSets: computeKeepSets(fn),

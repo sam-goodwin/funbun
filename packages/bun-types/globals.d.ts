@@ -1073,6 +1073,21 @@ interface FreeVariableDescriptor {
    * are not distinguished from `let` after compilation.
    */
   kind: "const" | "let";
+  /**
+   * Present when the variable is an ES-module import. `value` holds the imported
+   * value. A serializer can inline that value, or — when `external` is `true`
+   * (`node:*` / builtin / native bindings, which have no serializable source) —
+   * re-emit an `import` statement instead.
+   */
+  import?: {
+    /** The module specifier as written, e.g. `"./util.ts"` or `"node:fs"`. */
+    source: string;
+    /** The exported name in the source module (`"default"` for default imports). */
+    importedName: string;
+    kind: "named" | "default" | "namespace";
+    /** Whether the source module is external/native (can't be inlined). */
+    external: boolean;
+  };
 }
 
 interface SymbolConstructor {

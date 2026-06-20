@@ -1113,6 +1113,45 @@ describe("access-path pruning", () => {
     expect(lines.find(l => l.startsWith("RESULT:"))).toBe("RESULT:1:ALPHA");
     expect({ stderr, exitCode }).toEqual({ stderr: expect.any(String), exitCode: 0 });
   });
+
+  // Named/default imports from user modules are captured as free variables and
+  // inlined (tree-shaking the rest); external (node:*) imports are re-emitted as
+  // `import` statements. All via serialize() — sync, no bundler.
+  test("inlines user-module imports and keeps external (node:*) imports", async () => {
+    using dir = tempDir(`closure-imports-${counter++}`, {
+      "m.mjs": `
+        export function alpha() { return "ALPHA"; }
+        export function unused() { return "UNUSED_MARKER"; }
+      `,
+      "main.mjs": `
+        import { serialize } from "bun:closure";
+        import { writeFileSync } from "node:fs";
+        import { alpha } from "./m.mjs";
+        import { basename } from "node:path";
+        const out = serialize(p => alpha() + ":" + basename(p));
+        writeFileSync(new URL("./out.mjs", import.meta.url), out);
+        console.log(JSON.stringify({
+          alphaInlined: out.includes("function alpha"),
+          unusedTreeShaken: !out.includes("UNUSED_MARKER"),
+          keptNodeImport: /import\\s*\\{\\s*basename\\s*\\}\\s*from\\s*"node:path"/.test(out),
+        }));
+        console.log("RESULT:" + (await import(new URL("./out.mjs", import.meta.url).href)).default("/a/b/c.txt"));
+      `,
+    });
+
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), String(dir) + "/main.mjs"],
+      env: { ...bunEnv, BUN_DEBUG_QUIET_LOGS: "1" },
+      stderr: "pipe",
+      stdout: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    const lines = stdout.trim().split("\n");
+
+    expect(JSON.parse(lines[0])).toEqual({ alphaInlined: true, unusedTreeShaken: true, keptNodeImport: true });
+    expect(lines.find(l => l.startsWith("RESULT:"))).toBe("RESULT:ALPHA:c.txt");
+    expect({ stderr, exitCode }).toEqual({ stderr: expect.any(String), exitCode: 0 });
+  });
 });
 
 describe("bundle (bundler-backed)", () => {
