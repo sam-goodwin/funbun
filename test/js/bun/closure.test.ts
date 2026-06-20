@@ -4348,3 +4348,57 @@ describe("ALS rich: edge cases", () => {
     expect(reified()).toBe("ok");
   });
 });
+
+describe("ALS rich: adversarial & concurrency", () => {
+  test("concurrent reified closures with different captured contexts stay independent", async () => {
+    const als = new AsyncLocalStorage<string>();
+    const codes = ["c1", "c2", "c3"].map(c => als.run(c, () => serialize(() => als.getStore())));
+    const fns = await Promise.all(codes.map(c => reify<() => string>(c)));
+    // run them interleaved
+    const results = await Promise.all(
+      fns.map(async f => {
+        await new Promise<void>(r => setTimeout(r, 0));
+        return f();
+      }),
+    );
+    expect(results).toEqual(["c1", "c2", "c3"]);
+  });
+
+  test("the store itself contains another ALS instance (nested ALS), reconstructed", async () => {
+    const outer = new AsyncLocalStorage<{ inner: AsyncLocalStorage<number> }>();
+    const inner = new AsyncLocalStorage<number>();
+    const code = outer.run({ inner }, () =>
+      serialize(() => {
+        const innerAls = outer.getStore()!.inner;
+        return innerAls.run(99, () => innerAls.getStore());
+      }),
+    );
+    const reified = await reify<() => number>(code);
+    expect(reified()).toBe(99);
+  });
+
+  test("a reified async closure that opens its OWN run after an await", async () => {
+    const a = new AsyncLocalStorage<string>();
+    const b = new AsyncLocalStorage<string>();
+    const code = a.run("A", () =>
+      serialize(async () => {
+        await new Promise<void>(r => setTimeout(r, 0));
+        const fromA = a.getStore(); // captured context survives await
+        const fromB = b.run("B", () => b.getStore()); // own run
+        return `${fromA}+${fromB}`;
+      }),
+    );
+    const reified = await reify<() => Promise<string>>(code);
+    await expect(reified()).resolves.toBe("A+B");
+  });
+
+  test("captured context where the store is also closed over by a nested helper", async () => {
+    const als = new AsyncLocalStorage<{ n: number }>();
+    const code = als.run({ n: 21 }, () => {
+      const helper = () => als.getStore()!.n * 2;
+      return serialize(() => helper());
+    });
+    const reified = await reify<() => number>(code);
+    expect(reified()).toBe(42);
+  });
+});
