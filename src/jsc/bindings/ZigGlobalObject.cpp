@@ -3052,6 +3052,10 @@ JSC_DEFINE_CUSTOM_GETTER(functionFreeVariablesGetter, (JSC::JSGlobalObject * glo
         WTF::String importSpecifier;
         WTF::String importExportedName;
         WTF::String importKind;
+        // Set when a named import resolves to a re-exported namespace
+        // (`export * as ns`): its value is the target module's namespace object,
+        // captured directly (there is no scope slot to read from).
+        JSC::JSValue importNamespaceValue;
 
         for (JSC::JSScope* current = function->scope(); current; current = current->next()) {
             // Reaching module/global scope means the name is ambient (a global or
@@ -3065,19 +3069,54 @@ JSC_DEFINE_CUSTOM_GETTER(functionFreeVariablesGetter, (JSC::JSGlobalObject * glo
             // First, look for the name as a local scope slot of `current`.
             {
                 JSC::SymbolTable* symbolTable = symbolTableObject->symbolTable();
-                JSC::ConcurrentJSLocker locker(symbolTable->m_lock);
-                auto iter = symbolTable->find(locker, nameImpl.get());
-                if (iter != symbolTable->end(locker)) {
-                    const JSC::SymbolTableEntry& entry = iter->value;
-                    // The nearest scope that declares the name wins (shadowing). If it
-                    // isn't a readable scope slot, the name is still shadowed here.
-                    if (!entry.isNull() && entry.varOffset().isScope()) {
-                        offset = entry.scopeOffset();
-                        isReadOnly = entry.isReadOnly();
-                        foundEnvironment = current;
+                bool foundHere = false;
+                {
+                    JSC::ConcurrentJSLocker locker(symbolTable->m_lock);
+                    auto iter = symbolTable->find(locker, nameImpl.get());
+                    if (iter != symbolTable->end(locker)) {
+                        const JSC::SymbolTableEntry& entry = iter->value;
+                        // The nearest scope that declares the name wins (shadowing). If it
+                        // isn't a readable scope slot, the name is still shadowed here.
+                        if (!entry.isNull() && entry.varOffset().isScope()) {
+                            offset = entry.scopeOffset();
+                            isReadOnly = entry.isReadOnly();
+                            foundEnvironment = current;
+                        }
+                        foundHere = true;
                     }
-                    // Found locally (or shadowed) — stop walking. A's lock is
-                    // released as this scope exits.
+                }
+                if (foundHere) {
+                    // A namespace import (`import * as ns`) is captured as a local
+                    // slot. If its source is external (node:* / builtin / non-JS),
+                    // it can't be value-walked (members are native) — re-emit it as
+                    // an `import * as` statement. User-module namespaces are left to
+                    // be inlined + member-pruned by the JS side.
+                    if (foundEnvironment) {
+                        if (auto* nsModuleEnv = dynamicDowncast<JSC::JSModuleEnvironment>(current)) {
+                            if (JSC::AbstractModuleRecord* nsRecord = nsModuleEnv->moduleRecord()) {
+                                auto nsEntry = nsRecord->tryGetImportEntry(nameImpl.get());
+                                if (nsEntry && nsEntry->type == JSC::AbstractModuleRecord::ImportEntryType::Namespace) {
+                                    JSC::AbstractModuleRecord* nsSrc = nsRecord->hostResolveImportedModule(globalObject, nsEntry->moduleRequest);
+                                    RETURN_IF_EXCEPTION(scope, {});
+                                    bool nsExternal = true;
+                                    if (nsSrc) {
+                                        auto* jsmod = dynamicDowncast<JSC::JSModuleRecord>(nsSrc);
+                                        nsExternal = !jsmod || Bun::isBuiltinModule(nsSrc->moduleKey().string());
+                                    }
+                                    if (nsExternal) {
+                                        isImport = true;
+                                        importKind = "namespace"_s;
+                                        importSpecifier = nsEntry->moduleRequest.string();
+                                        importExportedName = "*"_s;
+                                        importExternal = true;
+                                        // Re-emit the import; don't read the value.
+                                        foundEnvironment = nullptr;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Found locally (or shadowed) — stop walking.
                     break;
                 }
             }
@@ -3118,9 +3157,15 @@ JSC_DEFINE_CUSTOM_GETTER(functionFreeVariablesGetter, (JSC::JSGlobalObject * glo
             // terminal module + local name. For an already-evaluated module (the
             // closure is running) this is a pure lookup and does not throw.
             JSC::AbstractModuleRecord::Resolution res = recordA->resolveImport(globalObject, JSC::Identifier::fromUid(vm, nameImpl.get()));
-            if (res.type == JSC::AbstractModuleRecord::Resolution::Type::Resolved
-                && res.localName.impl() != vm.propertyNames->starNamespacePrivateName.impl()) {
-                if (JSC::JSModuleEnvironment* mEnv = res.moduleRecord->moduleEnvironmentMayBeNull()) {
+            if (res.type == JSC::AbstractModuleRecord::Resolution::Type::Resolved && res.moduleRecord) {
+                if (res.localName.impl() == vm.propertyNames->starNamespacePrivateName.impl()) {
+                    // Re-exported namespace (`export * as ns from "..."`): the
+                    // binding's value is the target module's namespace object.
+                    // Capture it directly so the JS side inlines + prunes its
+                    // referenced members, like a direct `import * as ns`.
+                    importNamespaceValue = res.moduleRecord->getModuleNamespace(globalObject, false);
+                    RETURN_IF_EXCEPTION(scope, {});
+                } else if (JSC::JSModuleEnvironment* mEnv = res.moduleRecord->moduleEnvironmentMayBeNull()) {
                     JSC::SymbolTable* mTable = mEnv->symbolTable();
                     JSC::ConcurrentJSLocker mLocker(mTable->m_lock);
                     auto mIter = mTable->find(mLocker, res.localName.impl());
@@ -3160,6 +3205,11 @@ JSC_DEFINE_CUSTOM_GETTER(functionFreeVariablesGetter, (JSC::JSGlobalObject * glo
             // initialized — skip rather than expose the JSC empty sentinel.
             if (!value || value.isEmpty())
                 value = {};
+        } else if (importNamespaceValue) {
+            // Re-exported namespace value captured directly; inline it (the
+            // target module is a real JS file we can serialize from).
+            value = importNamespaceValue;
+            importExternal = false;
         }
 
         // For non-import free vars (and inlinable imports) a missing/empty value

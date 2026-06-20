@@ -321,6 +321,79 @@ The remaining work for `fn[Symbol.ast]`: take a function/method/class value,
 re-parse its own source (form-aware), and attach each node's original-source
 position via the same source map.
 
+### 7.3 Landed: more AST coverage — imports and destructuring
+
+`AstJsConverter` gained two node families the serializer needs:
+
+- **`ImportDeclaration`** — `{ source, specifiers: [{ type: "ImportSpecifier",
+  local, imported } | "ImportDefaultSpecifier" | "ImportNamespaceSpecifier" ] }`.
+  `local` is the binding, `imported` the exported name (matching how the printer
+  emits `<alias> as <local>`). Used to recover a closure module's import bindings.
+- **Destructuring patterns** — `ArrayPattern` / `ObjectPattern` (with
+  `AssignmentPattern` for `= default`), so params and declarators like
+  `({ a, b: c }, [x]) => …` and `const [x, y] = …` are represented instead of
+  `UnsupportedBinding`. (Without this, the serializer's reference scan
+  mis-classified destructured names as unresolved.)
+
+### 7.4 Landed: access-path pruning
+
+`serialize()` now serializes only the members of a captured object the closure
+actually references. `computeKeepSets` (in `closure.ts`) parses each reachable
+function via `Bun.Transpiler.ast`, builds a per-free-variable **access tree**
+(which property paths are read, whether the variable escapes), **follows `this`**
+into invoked methods (`foo.m()` → whatever `m` reads via `this` is kept), and maps
+that onto values → a `keepSet` consumed by `emitOwnProperties`.
+
+Sound by construction: any use that can't be proven a clean static read — a bare
+reference, computed `foo[x]`, passing/returning/destructuring, or a method using
+`this` opaquely — falls back to serializing the whole value, and keep-all
+propagates transitively so an escaped object's contents are never pruned by a
+nested closure's narrower view. So `() => foo.method()` serializes only
+`foo.method` (plus what the method reads via `this`), not all of `foo`.
+
+### 7.5 Landed: imports — the runtime-inline serializer
+
+The largest addition, and the one that retires most of the open problems above.
+Originally `serialize()` **dropped imports**: a closure referencing an imported
+binding produced a module that threw `"x is not defined"`. Two approaches were
+explored:
+
+- A **bundler-backed `bundle()`** (async) routing the closure through `Bun.build`
+  to resolve / inline / tree-shake imports. It works and is committed, but
+  inherits the static bundler's limits — notably that `export * as` namespace
+  re-exports aren't member-tree-shaken (characterized by tests in
+  `test/bundler/bundler_barrel.test.ts`).
+- The chosen approach: **runtime-inline.** At runtime we hold the *actual values*
+  and the *actual access paths*, which is finer than any static tree-shaker — and
+  makes the entire barrel / `export *` / namespace-materialization problem moot,
+  because we read values rather than bundling modules.
+
+**Native enabler** (`functionFreeVariablesGetter`, `ZigGlobalObject.cpp`): a
+named/default import has *no slot* in the importing module's environment — JSC
+resolves it to read from the *exporting* module. So when a referenced name in a
+`JSModuleEnvironment` isn't a local slot, the resolver now follows
+`moduleRecord()->resolveImport()` (which chases re-export/star chains to the
+terminal binding), reads the value from the exporting module's environment
+(TDZ-guarded), and emits the descriptor tagged with
+`import: { source, importedName, kind, external }`. `external` (node:* / builtin /
+synthetic — classified via `JSModuleRecord` + `Bun::isBuiltinModule`) marks
+bindings with no serializable source. Namespace imports (`import * as ns`) keep
+flowing through the existing local-slot path; `emitObject` detects a
+`[object Module]` namespace and emits only its access-path-pruned members,
+skipping the exotic prototype (which otherwise reaches native built-ins).
+
+**JS side** (`closure.ts`): inlinable imports serialize their value like any
+captured variable (so §7.4 pruning applies — `a.b` keeps `b`, not `a`); `external`
+imports are re-emitted as `import` statements at the top of the module, with the
+source map offset by the leading lines so it stays correct.
+
+Net result — all in **sync `serialize()`, no bundler, source maps intact**:
+`serialize(p => alpha() + basename(p))` (with `alpha` from a user module and
+`basename` from `node:path`) inlines `alpha`, tree-shakes the module's unused
+exports, keeps `import { basename } from "node:path"`, and round-trips. This makes
+`bundle()` largely redundant and makes the `export *` namespace-tree-shaking
+linker work unnecessary for the serializer.
+
 ---
 
 ## 8. File map

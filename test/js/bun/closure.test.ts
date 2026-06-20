@@ -1,4 +1,4 @@
-import { test, expect, describe } from "bun:test";
+import { test, expect, describe, beforeAll } from "bun:test";
 import { serialize } from "bun:closure";
 import { tempDir, bunExe, bunEnv } from "harness";
 
@@ -1281,5 +1281,229 @@ describe("bundle (bundler-backed)", () => {
     const { bundle } = (await import("bun:closure")) as any;
     await expect(bundle(Math.max)).rejects.toThrow("Cannot bundle a native function");
     await expect(bundle((() => {}).bind(null))).rejects.toThrow("Cannot bundle a bound function");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ESM import spec: every standard import/re-export form, asserted on two axes —
+//   (1) correctness:  the reconstructed module produces the right value.
+//   (2) optimality:   only the referenced bindings/members survive; everything
+//                      unused is tree-shaken (its UNUSED_* marker is absent).
+//
+// Import capture is a property of the *module environment* (a free variable that
+// is an import resolves to its exporting module), so these can't be exercised
+// inline — each closure lives in its own ES-module fixture. To stay fast, ONE
+// subprocess serializes every case and emits a single JSON report; the tests
+// below assert against that report.
+// ---------------------------------------------------------------------------
+describe("ESM import spec", () => {
+  type CaseReport = { name: string; code?: string; result?: unknown; error?: string };
+  const report = new Map<string, CaseReport>();
+
+  // Each subject module exports `fn` (the closure to serialize) and, optionally,
+  // `input` (args to call the reconstructed default export with).
+  const deps: Record<string, string> = {
+    "deps/math.mjs": `
+      export function used() { return "USED_math"; }
+      export function unusedMath() { return "UNUSED_math"; }
+      export const KONST = 42;
+    `,
+    "deps/defaultexp.mjs": `
+      export default function greet() { return "DEFAULT_val"; }
+      export function sideUnused() { return "UNUSED_default"; }
+    `,
+    "deps/shape.mjs": `
+      export class Point { constructor(x) { this.x = x; } get() { return this.x; } }
+      export class UnusedShape { constructor() { this.marker = "UNUSED_shape"; } }
+    `,
+    "deps/transit.mjs": `
+      const secret = "TRANSIT_secret";
+      function helper() { return secret; }
+      export function pub() { return helper(); }
+      export function unusedPub() { return "UNUSED_transit"; }
+    `,
+    "deps/impl.mjs": `
+      export function one() { return "BARREL_one"; }
+      export function two() { return "UNUSED_barrel_two"; }
+      export function three() { return "UNUSED_barrel_three"; }
+    `,
+    "deps/barrel.mjs": `export { one, two, three } from "./impl.mjs";`,
+    "deps/barrel_rename.mjs": `export { one as uno } from "./impl.mjs";`,
+    "deps/starsrc.mjs": `
+      export function alpha() { return "STAR_alpha"; }
+      export function unusedStar() { return "UNUSED_star"; }
+    `,
+    "deps/star.mjs": `export * from "./starsrc.mjs";`,
+    "deps/nsre.mjs": `export * as inner from "./starsrc.mjs";`,
+    "deps/defaultexp2.mjs": `export default function origin() { return "DEFRE_val"; }`,
+    "deps/defre.mjs": `export { default } from "./defaultexp2.mjs";`,
+    "deps/mixed.mjs": `
+      export default function () { return "MIXED_default"; }
+      export function named() { return "MIXED_named"; }
+      export function unusedMixed() { return "UNUSED_mixed"; }
+    `,
+  };
+
+  const subjects: Record<string, string> = {
+    named: `import { used } from "../deps/math.mjs"; export const fn = () => used();`,
+    alias: `import { used as u } from "../deps/math.mjs"; export const fn = () => u();`,
+    namespace: `import * as ns from "../deps/math.mjs"; export const fn = () => ns.used();`,
+    konst: `import { KONST } from "../deps/math.mjs"; export const fn = () => KONST;`,
+    default: `import d from "../deps/defaultexp.mjs"; export const fn = () => d();`,
+    klass: `import { Point } from "../deps/shape.mjs"; export const fn = () => new Point(7).get();`,
+    transit: `import { pub } from "../deps/transit.mjs"; export const fn = () => pub();`,
+    barrel: `import { one } from "../deps/barrel.mjs"; export const fn = () => one();`,
+    barrelRename: `import { uno } from "../deps/barrel_rename.mjs"; export const fn = () => uno();`,
+    starReexport: `import { alpha } from "../deps/star.mjs"; export const fn = () => alpha();`,
+    nsReexport: `import { inner } from "../deps/nsre.mjs"; export const fn = () => inner.alpha();`,
+    defaultReexport: `import d from "../deps/defre.mjs"; export const fn = () => d();`,
+    mixedImport: `import def, { named } from "../deps/mixed.mjs"; export const fn = () => def() + ":" + named();`,
+    nodeNamed: `import { basename } from "node:path"; export const fn = (p) => basename(p); export const input = ["/a/b/c.txt"];`,
+    nodeDefault: `import path from "node:path"; export const fn = (p) => path.basename(p); export const input = ["/a/b/c.txt"];`,
+    nodeNamespace: `import * as path from "node:path"; export const fn = (p) => path.basename(p); export const input = ["/a/b/c.txt"];`,
+    multiExternal: `import { basename } from "node:path"; import { EOL } from "node:os"; export const fn = (p) => basename(p); export const input = ["/a/b/c.txt"];`,
+    userPlusExternal: `import { used } from "../deps/math.mjs"; import { basename } from "node:path"; export const fn = (p) => used() + ":" + basename(p); export const input = ["/a/b/c.txt"];`,
+  };
+
+  // One driver serializes every subject, round-trips it, and reports code+result.
+  const subjectImports = Object.keys(subjects)
+    .map(name => `import * as case_${name} from "./subjects/${name}.mjs";`)
+    .join("\n");
+  const subjectList = Object.keys(subjects)
+    .map(name => `["${name}", case_${name}]`)
+    .join(", ");
+  const runner = `
+    import { serialize } from "bun:closure";
+    import { writeFileSync, mkdirSync } from "node:fs";
+    ${subjectImports}
+    mkdirSync(new URL("./out/", import.meta.url), { recursive: true });
+    const cases = [${subjectList}];
+    const report = [];
+    for (const [name, mod] of cases) {
+      try {
+        const code = serialize(mod.fn);
+        const url = new URL("./out/" + name + ".mjs", import.meta.url);
+        writeFileSync(url, code);
+        const ns = await import(url.href);
+        const result = await ns.default(...(mod.input || []));
+        report.push({ name, code, result });
+      } catch (e) {
+        report.push({ name, error: String((e && e.message) || e) });
+      }
+    }
+    process.stdout.write("REPORT:" + JSON.stringify(report) + "\\n");
+  `;
+
+  const files: Record<string, string> = { ...deps, "runner.mjs": runner };
+  for (const [name, src] of Object.entries(subjects)) files[`subjects/${name}.mjs`] = src;
+
+  beforeAll(async () => {
+    using dir = tempDir("closure-esm-spec", files);
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), String(dir) + "/runner.mjs"],
+      env: { ...bunEnv, BUN_DEBUG_QUIET_LOGS: "1" },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    const line = stdout.split("\n").find(l => l.startsWith("REPORT:"));
+    if (!line) {
+      throw new Error(
+        `driver produced no report (exit ${exitCode})\n--- stdout ---\n${stdout}\n--- stderr ---\n${stderr}`,
+      );
+    }
+    for (const entry of JSON.parse(line.slice("REPORT:".length)) as CaseReport[]) report.set(entry.name, entry);
+  });
+
+  // Look up a case, asserting it serialized without error.
+  function ok(name: string): { code: string; result: unknown } {
+    const c = report.get(name);
+    expect(c, `case "${name}" missing from report`).toBeDefined();
+    expect(c!.error, `case "${name}" failed to serialize`).toBeUndefined();
+    return { code: c!.code!, result: c!.result };
+  }
+
+  describe("correctness — every form round-trips", () => {
+    test.each([
+      ["named", "USED_math"],
+      ["alias", "USED_math"],
+      ["namespace", "USED_math"],
+      ["konst", 42],
+      ["default", "DEFAULT_val"],
+      ["klass", 7],
+      ["transit", "TRANSIT_secret"],
+      ["barrel", "BARREL_one"],
+      ["barrelRename", "BARREL_one"],
+      ["starReexport", "STAR_alpha"],
+      ["nsReexport", "STAR_alpha"],
+      ["defaultReexport", "DEFRE_val"],
+      ["mixedImport", "MIXED_default:MIXED_named"],
+      ["nodeNamed", "c.txt"],
+      ["nodeDefault", "c.txt"],
+      ["nodeNamespace", "c.txt"],
+      ["multiExternal", "c.txt"],
+      ["userPlusExternal", "USED_math:c.txt"],
+    ])("%s round-trips to the expected value", (name, expected) => {
+      expect(ok(name).result).toEqual(expected);
+    });
+  });
+
+  describe("optimality — unused bindings are tree-shaken", () => {
+    test("named import does not pull in sibling exports", () => {
+      expect(ok("named").code).not.toContain("UNUSED_math");
+    });
+    test("namespace import keeps only the accessed member", () => {
+      expect(ok("namespace").code).not.toContain("UNUSED_math");
+    });
+    test("default import does not pull in sibling exports", () => {
+      expect(ok("default").code).not.toContain("UNUSED_default");
+    });
+    test("class import does not pull in sibling classes", () => {
+      expect(ok("klass").code).not.toContain("UNUSED_shape");
+    });
+    test("inlining a function pulls its module-private deps but shakes unused exports", () => {
+      const { code } = ok("transit");
+      expect(code).toContain("TRANSIT_secret"); // transitive private dep inlined
+      expect(code).not.toContain("UNUSED_transit"); // unused sibling export shaken
+    });
+    test("barrel (export { ... } from) keeps only the re-export actually used", () => {
+      const { code } = ok("barrel");
+      expect(code).not.toContain("UNUSED_barrel_two");
+      expect(code).not.toContain("UNUSED_barrel_three");
+    });
+    test("export * re-export keeps only the used binding", () => {
+      expect(ok("starReexport").code).not.toContain("UNUSED_star");
+    });
+    test("export * as ns re-export keeps only the accessed member", () => {
+      // The historically-hard static case: runtime visibility makes it tractable.
+      expect(ok("nsReexport").code).not.toContain("UNUSED_star");
+    });
+    test("mixed default+named import shakes the module's unused export", () => {
+      expect(ok("mixedImport").code).not.toContain("UNUSED_mixed");
+    });
+  });
+
+  describe("external (node:*) imports are re-emitted, not inlined", () => {
+    test("named builtin import stays an import statement", () => {
+      expect(ok("nodeNamed").code).toMatch(/import\s*\{\s*basename\s*\}\s*from\s*["']node:path["']/);
+    });
+    test("default builtin import stays an import statement", () => {
+      expect(ok("nodeDefault").code).toMatch(/import\s+path\s+from\s*["']node:path["']/);
+    });
+    test("namespace builtin import stays an `import * as` statement", () => {
+      // A builtin namespace can't be value-walked (members are native), so it is
+      // re-emitted as an import rather than inlined.
+      expect(ok("nodeNamespace").code).toMatch(/import\s*\*\s*as\s+path\s+from\s*["']node:path["']/);
+    });
+    test("an unused external import is not emitted at all", () => {
+      const { code } = ok("multiExternal");
+      expect(code).toMatch(/from\s*["']node:path["']/);
+      expect(code).not.toContain("node:os"); // EOL never referenced → no import for it
+    });
+    test("a user import is inlined while an external import is kept, in one closure", () => {
+      const { code } = ok("userPlusExternal");
+      expect(code).toContain("USED_math"); // user fn inlined
+      expect(code).toMatch(/from\s*["']node:path["']/); // builtin kept as import
+    });
   });
 });
