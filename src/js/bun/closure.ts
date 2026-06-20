@@ -269,6 +269,12 @@ function analyzeSharedCells(root: Function): { sharedIds: Set<number>; cellInfo:
     const privateFields = (o as any)[Symbol.privateFields] as Array<{ value: unknown }> | undefined;
     if (privateFields) for (const field of privateFields) visitValue(field.value);
   }
+  // Function -> the functions it captures (free-var values that are functions).
+  const fnEdges = new Map<Function, Set<Function>>();
+  // Cell id -> its value, when that value is a function. Used to hoist cells
+  // whose function participates in a reference cycle.
+  const cellValueFn = new Map<number, Function>();
+
   function visitFn(fn: Function): void {
     if (seenFns.has(fn)) return;
     seenFns.add(fn);
@@ -278,6 +284,8 @@ function analyzeSharedCells(root: Function): { sharedIds: Set<number>; cellInfo:
     } catch {
       return;
     }
+    const edges = new Set<Function>();
+    fnEdges.set(fn, edges);
     const freeVariables = allFreeVariables(fn, source);
     for (const variable of freeVariables) {
       let set = cellFunctions.get(variable.id);
@@ -287,6 +295,10 @@ function analyzeSharedCells(root: Function): { sharedIds: Set<number>; cellInfo:
         cellInfo.set(variable.id, variable);
       }
       set.add(fn);
+      if (typeof variable.value === "function") {
+        edges.add(variable.value as Function);
+        cellValueFn.set(variable.id, variable.value as Function);
+      }
       visitValue(variable.value);
     }
     // A class's superclass is reconstructed too, so analyze it.
@@ -298,11 +310,39 @@ function analyzeSharedCells(root: Function): { sharedIds: Set<number>; cellInfo:
 
   visitFn(root);
 
+  const cyclic = findCyclicFunctions(fnEdges);
+
   const sharedIds = new Set<number>();
   for (const [id, fns] of cellFunctions) {
-    if (fns.size >= 2) sharedIds.add(id);
+    // A cell is hoisted to module scope (referenced live by name) if it is
+    // shared by 2+ functions, OR if its value is a function in a reference
+    // cycle (self-recursion or mutual recursion) — an IIFE-`const` binding
+    // can't forward-reference a cycle.
+    if (fns.size >= 2 || cyclic.has(cellValueFn.get(id) as Function)) sharedIds.add(id);
   }
   return { sharedIds, cellInfo };
+}
+
+// Returns the set of functions that can reach themselves through the capture
+// graph (self-loops and longer cycles).
+function findCyclicFunctions(edges: Map<Function, Set<Function>>): Set<Function> {
+  const cyclic = new Set<Function>();
+  for (const start of edges.keys()) {
+    const stack = [...(edges.get(start) ?? [])];
+    const seen = new Set<Function>();
+    while (stack.length > 0) {
+      const node = stack.pop()!;
+      if (node === start) {
+        cyclic.add(start);
+        break;
+      }
+      if (seen.has(node)) continue;
+      seen.add(node);
+      const next = edges.get(node);
+      if (next) for (const f of next) stack.push(f);
+    }
+  }
+  return cyclic;
 }
 
 interface ReconstructedFunction {

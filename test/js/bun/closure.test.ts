@@ -752,3 +752,34 @@ test("round-trips an extracted method that captures a free variable", async () =
   expect(read()).toBe(7);
   expect(bump()).toBe(8);
 });
+
+describe("recursion topologies", () => {
+  test("self-recursion via the function's own (declaration) name", async () => {
+    function fact(n: number): number {
+      return n <= 1 ? 1 : n * fact(n - 1);
+    }
+    void fact;
+    const f = await roundtrip(fact);
+    expect(f(5)).toBe(120);
+  });
+
+  test("self-recursion via a captured const arrow", async () => {
+    const fib = (n: number): number => (n < 2 ? n : fib(n - 1) + fib(n - 2));
+    void fib;
+    const f = await roundtrip(fib);
+    expect(f(7)).toBe(13);
+  });
+
+  test("mutual recursion (two functions calling each other)", async () => {
+    function isEven(n: number): boolean {
+      return n === 0 || isOdd(n - 1);
+    }
+    function isOdd(n: number): boolean {
+      return n !== 0 && isEven(n - 1);
+    }
+    void [isEven, isOdd];
+    const f = await roundtrip(isEven);
+    expect(f(10)).toBe(true);
+    expect(f(7)).toBe(false);
+  });
+});
