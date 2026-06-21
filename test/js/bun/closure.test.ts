@@ -3959,6 +3959,93 @@ describe("genuine #private reification", () => {
     expect(out()).toBe(6);
     expect(out()).toBe(7);
   });
+
+  // GP2a: a whole user-class hierarchy is reconstructed genuinely — the leaf instance is
+  // built through `new Derived()` so every level's constructor installs its own brand.
+  test("an inheritance chain reifies privates at every level genuinely", async () => {
+    class Animal {
+      #species: string;
+      constructor(s: string) {
+        this.#species = s;
+      }
+      describe() {
+        return `a ${this.#species}`;
+      }
+    }
+    class Dog extends Animal {
+      #name: string;
+      constructor(name: string) {
+        super("dog");
+        this.#name = name;
+      }
+      intro() {
+        return `${this.#name} is ${this.describe()}`;
+      }
+    }
+    const d = new Dog("Rex");
+    void d;
+
+    const code = serialize(() => d);
+    expect(code).toContain("_reify");
+    expect(code).not.toContain("$bunClosurePrivate$"); // genuine, both levels
+
+    const out = (await roundtrip(() => d))();
+    expect(out.intro()).toBe("Rex is a dog"); // derived #name + base #species (via inherited method)
+    expect(out.describe()).toBe("a dog"); // base private through an inherited method
+    const Leaf = Object.getPrototypeOf(out).constructor;
+    const Basecls = Object.getPrototypeOf(Object.getPrototypeOf(out)).constructor;
+    expect(out).toBeInstanceOf(Leaf);
+    expect(out).toBeInstanceOf(Basecls); // instanceof up the chain
+    expect(Object.getOwnPropertyNames(out).filter(k => k.includes("Private"))).toEqual([]);
+  });
+
+  test("a class extending a builtin still falls back to mangling and round-trips", async () => {
+    class TaggedMap extends Map<string, number> {
+      #tag = "m";
+      getTag() {
+        return this.#tag;
+      }
+    }
+    const m = new TaggedMap();
+    m.set("a", 1);
+    void m;
+
+    const code = serialize(() => m);
+    // Builtin base ⇒ can't inject a reify branch into Map ⇒ mangled fallback.
+    expect(code).toContain("$bunClosurePrivate$");
+    const out = (await roundtrip(() => m))();
+    expect(out.getTag()).toBe("m");
+    expect(out.get("a")).toBe(1);
+    expect(out).toBeInstanceOf(Map);
+  });
+
+  // The instance-leaf fixpoint: a base shared with a disqualified subclass usage (here a
+  // bound base method) must itself fall back, so every access style stays consistent.
+  test("a shared base is disqualified when a bound method of it is also captured", async () => {
+    class Shape {
+      #sides: number;
+      constructor(n: number) {
+        this.#sides = n;
+      }
+      sides() {
+        return this.#sides;
+      }
+    }
+    class Tri extends Shape {
+      constructor() {
+        super(3);
+      }
+    }
+    const tri = new Tri();
+    const bound = tri.sides.bind(tri);
+    void [tri, bound];
+
+    const code = serialize(() => ({ tri, run: bound }));
+    expect(code).toContain("$bunClosurePrivate$"); // bound base method ⇒ whole chain mangles
+    const out = (await roundtrip(() => ({ tri, run: bound })))();
+    expect(out.tri.sides()).toBe(3);
+    expect(out.run()).toBe(3);
+  });
 });
 
 describe("interactions: guards fire when nested", () => {

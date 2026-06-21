@@ -572,13 +572,13 @@ const REIFY_SLOT = "$bunClosureReify$";
 // fields, return those field names plus the parse offset; else null. This is the
 // STRUCTURAL eligibility check; whether genuine reconstruction is actually safe in
 // the captured graph is decided separately by the reachability gate (ctx.genuineClasses).
-function genuinePrivateClassInfo(source: string): { fields: string[]; node: any; offset: number } | null {
+type ClassStructure = { fields: string[]; isDerived: boolean; node: any; offset: number };
+function classStructure(source: string): ClassStructure | null {
   if (!source.trimStart().startsWith("class")) return null;
   const parsed = parseWithOffset(source);
   if (parsed === null) return null;
   const { node, offset } = parsed;
   if (node.type !== "ClassExpression" && node.type !== "ClassDeclaration") return null;
-  if (node.superClass != null) return null; // heritage → not yet handled (GP2/GP3)
   const members = node.body?.body;
   if (!$isJSArray(members)) return null;
   const fields: string[] = [];
@@ -593,18 +593,19 @@ function genuinePrivateClassInfo(source: string): { fields: string[]; node: any;
       fields.push(m.key.name);
     }
   }
-  if (fields.length === 0) return null;
-  return { fields, node, offset };
+  return { fields, isDerived: node.superClass != null, node, offset };
 }
 
 // Inject a guarded reify branch at the top of the class's constructor body:
-//   constructor(...) { if (REIFY_SLOT !== null) { this.#x = REIFY_SLOT["#x"]; ...; return; } <orig> }
-// The branch is a single line inserted right after the body `{`, so the original
-// body's lines (and thus source maps) are unchanged.
-function injectReifyConstructor(source: string, info: { fields: string[]; node: any; offset: number }): string {
-  const { fields, node, offset } = info;
+//   constructor(...) { if (REIFY_SLOT !== null) { super(); this.#x = REIFY_SLOT["#x"]; ...; return; } <orig> }
+// A derived class calls super() first (its base's own injected branch installs the base
+// privates from the same slot). The branch is a single line inserted right after the body
+// `{`, so the original body's lines (and thus source maps) are unchanged.
+function injectReifyConstructor(source: string, info: ClassStructure): string {
+  const { fields, isDerived, node, offset } = info;
   const branch =
     `if(${REIFY_SLOT}!==null){` +
+    (isDerived ? "super();" : "") +
     fields.map(f => `this.${f}=${REIFY_SLOT}[${JSON.stringify(f)}];`).join("") +
     `return;}`;
 
@@ -628,19 +629,20 @@ function injectReifyConstructor(source: string, info: { fields: string[]; node: 
     return source.slice(0, i + 1) + branch + source.slice(i + 1);
   }
 
-  // No explicit constructor: synthesize one right after the class body `{` (the first
-  // `{` in the source, since a base class has no heritage to contain one).
+  // No explicit constructor: synthesize one right after the class body `{`. A derived
+  // class's NORMAL path must forward super(...args) — an explicit empty derived
+  // constructor would otherwise never call super and throw.
   const brace = source.indexOf("{");
-  return source.slice(0, brace + 1) + `constructor(){${branch}}` + source.slice(brace + 1);
+  const synthesized = isDerived ? `constructor(...a){${branch}super(...a);}` : `constructor(){${branch}}`;
+  return source.slice(0, brace + 1) + synthesized + source.slice(brace + 1);
 }
 
-// The reachability GATE. Genuine `#private` reconstruction only works in a closed
-// world: instances come from the real constructor and the code reading `#x` lives on
-// the class prototype. So a class qualifies only if NOTHING reachable from the root
-// would need its privates elsewhere. We over-approximate reachability (more mangling
-// fallback is always safe) and disqualify a structurally-eligible class when the graph
-// contains a subclass instance, a bound/extracted method of it, or an escaped closure
-// that textually references one of its private fields.
+// The reachability GATE. Genuine `#private` reconstruction only works in a closed world:
+// every instance comes from the real constructor chain (so each level's brand installs)
+// and the code reading `#x` lives on the class prototype. We over-approximate reachability
+// (more mangling fallback is always safe) and clear a class for genuine reconstruction
+// only when its whole hierarchy is reconstructable and nothing in the graph would need its
+// privates elsewhere.
 function computeGenuineClasses(root: unknown): Set<Function> {
   const funcs = new Set<Function>();
   const objs = new Set<object>();
@@ -671,8 +673,6 @@ function computeGenuineClasses(root: unknown): Set<Function> {
       // Intentionally NOT reading Symbol.privateFields here: it's only needed to push
       // values hidden inside private fields (a rare disqualifier source), and reading it
       // on an object with a private accessor (`get #x`) trips a native assertion.
-      // Disqualifiers (subclass instances, bound/extracted methods, escaped closures) are
-      // reachable via ordinary properties, free variables, and prototypes — which we walk.
     }
     // Own DATA properties only — reading an accessor could fire a getter (side effect).
     for (const key of Reflect.ownKeys(v as object)) {
@@ -682,18 +682,86 @@ function computeGenuineClasses(root: unknown): Set<Function> {
     push(Object.getPrototypeOf(v as object));
   }
 
-  const genuine = new Set<Function>();
-  for (const f of funcs) {
-    let info: ReturnType<typeof genuinePrivateClassInfo>;
-    try {
-      info = genuinePrivateClassInfo(f.toString());
-    } catch {
-      continue;
+  // Cache each reachable class's parsed structure.
+  const structure = new Map<Function, ClassStructure | null>();
+  const structOf = (C: Function): ClassStructure | null => {
+    if (!structure.has(C)) {
+      let s: ClassStructure | null = null;
+      try {
+        s = classStructure(C.toString());
+      } catch {}
+      structure.set(C, s);
     }
-    if (info === null) continue;
-    if (!isClassDisqualified(f, info.fields, funcs, objs)) genuine.add(f);
+    return structure.get(C)!;
+  };
+
+  // Structural candidates: every class in a hierarchy that (a) reaches Object through
+  // parseable user classes only (no builtin base), (b) has at least one private field
+  // somewhere in the chain, (c) has no same-name private collision across the chain, and
+  // (d) has no chain member with a bound/extracted method or escaped `#x` closure reachable.
+  const candidate = new Set<Function>();
+  for (const f of funcs) {
+    const chain = genuineChain(f, structOf, funcs);
+    if (chain) for (const c of chain) candidate.add(c);
   }
-  return genuine;
+
+  // Instance-leaf fixpoint: a genuine class is safe only if EVERY reachable instance with
+  // it in its prototype chain is constructed by a genuine class (so the full constructor
+  // chain installs every brand). If an instance's chain includes a non-candidate class, it
+  // would be rebuilt via Object.create — unable to brand a genuine ancestor — so none of
+  // its chain classes can be genuine; remove them all and repeat until stable.
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const o of objs) {
+      const chainClasses = instanceChainClasses(o);
+      if (chainClasses.length === 0) continue;
+      if (chainClasses.some(C => !candidate.has(C))) {
+        for (const C of chainClasses) if (candidate.delete(C)) changed = true;
+      }
+    }
+  }
+  return candidate;
+}
+
+// Walk `C` and its superclass chain up to Object. Returns the chain (leaf-first) if every
+// member is a parseable user class, there is ≥1 private field and no same-name private
+// collision across the chain, and no member has a per-class disqualifier; else null.
+function genuineChain(
+  C: Function,
+  structOf: (C: Function) => ClassStructure | null,
+  funcs: Set<Function>,
+): Function[] | null {
+  const chain: Function[] = [];
+  const names = new Set<string>();
+  let hasField = false;
+  let cur: any = C;
+  while (typeof cur === "function" && cur !== Function.prototype) {
+    const s = structOf(cur);
+    if (s === null) return null; // a builtin/native base in the chain → not genuine
+    for (const f of s.fields) {
+      if (names.has(f)) return null; // same-name private collision across the chain
+      names.add(f);
+    }
+    if (s.fields.length > 0) hasField = true;
+    if (perClassDisqualified(cur, s.fields, funcs)) return null;
+    chain.push(cur);
+    cur = Object.getPrototypeOf(cur);
+  }
+  return hasField ? chain : null;
+}
+
+// The classes whose `.prototype` lies on `o`'s prototype chain (leaf-first) — i.e. the
+// constructor chain that built `o`.
+function instanceChainClasses(o: object): Function[] {
+  const classes: Function[] = [];
+  let p = Object.getPrototypeOf(o);
+  while (p !== null && p !== Object.prototype) {
+    const c = (p as any).constructor;
+    if (typeof c === "function" && c.prototype === p) classes.push(c);
+    p = Object.getPrototypeOf(p);
+  }
+  return classes;
 }
 
 // The own (prototype + static) method/accessor function identities of class `C`.
@@ -710,27 +778,15 @@ function classOwnMethods(C: Function): Set<Function> {
   return methods;
 }
 
-function isClassDisqualified(C: Function, fields: string[], funcs: Set<Function>, objs: Set<object>): boolean {
-  const proto = C.prototype;
-  // A subclass instance can't get C's genuine brand (built via Object.create, no ctor).
-  for (const o of objs) {
-    let p = Object.getPrototypeOf(o);
-    let direct = true;
-    while (p !== null) {
-      if (p === proto) {
-        if (!direct) return true;
-        break;
-      }
-      direct = false;
-      p = Object.getPrototypeOf(p);
-    }
-  }
+// True if some reachable function — other than C's own methods — is a bound C method or an
+// escaped closure that textually references one of C's private fields. Both need C's
+// privates outside a closed world, which genuine reconstruction can't serve yet.
+function perClassDisqualified(C: Function, fields: string[], funcs: Set<Function>): boolean {
   const ownMethods = classOwnMethods(C);
   for (const g of funcs) {
     if (g === C || ownMethods.has(g)) continue;
     const bound = (g as any)[Symbol.boundFunction] as BoundDetails | undefined;
     if (bound !== undefined && typeof bound.target === "function" && ownMethods.has(bound.target)) return true;
-    // An escaped closure that reads one of C's privates can't be hosted yet (GP-host).
     let src: string;
     try {
       src = g.toString();
@@ -1091,7 +1147,7 @@ function reconstructFunctionExpr(fn: Function, ctx: Context): ReconstructedFunct
   // `#private` into a public field. Both keep lines intact so source maps stay correct.
   let source: string;
   let genuinePrivate: { fields: string[] } | undefined;
-  const gpInfo = ctx.genuineClasses.has(fn) ? genuinePrivateClassInfo(original) : null;
+  const gpInfo = ctx.genuineClasses.has(fn) ? classStructure(original) : null;
   if (gpInfo !== null) {
     source = injectReifyConstructor(original, gpInfo);
     genuinePrivate = { fields: gpInfo.fields };
