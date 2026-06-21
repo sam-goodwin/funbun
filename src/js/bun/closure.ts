@@ -1844,7 +1844,56 @@ function mangledPrivateName(hashName: string): string {
   return PRIVATE_PREFIX + hashName.slice(1);
 }
 
+// Rewrite every `#private` member reference to its mangled public name. Prefers
+// the AST — a parseable source (a class) gives exact `PrivateIdentifier`
+// positions, so strings/comments/templates/regex literals are excluded
+// structurally. Falls back to the scanner for sources the parser rejects (a
+// method extracted from a class whose `this.#x` is invalid standalone — the
+// very reason this rewrite exists).
 function rewritePrivateMembers(source: string): string {
+  if (source.indexOf("#") === -1) return source;
+  const parsed = parseWithOffset(source);
+  if (parsed !== null) {
+    const edits: Array<{ start: number; end: number; text: string }> = [];
+    const handled = new Set<number>();
+    // Replace the `#name` at a PrivateIdentifier's position. A brand check
+    // (`#x in obj`) becomes `"mangled" in obj` — string property membership, not
+    // a bare (undefined) identifier; every other position is the bare name.
+    const pushPid = (pid: any, quoted: boolean): void => {
+      if (typeof pid.name !== "string" || typeof pid.start !== "number") return;
+      const start = pid.start - parsed.offset;
+      const end = start + pid.name.length;
+      // Sanity: the bytes at the mapped position must be the `#name` itself.
+      if (start < 0 || end > source.length || source.slice(start, end) !== pid.name) return;
+      const mangled = mangledPrivateName(pid.name);
+      edits.push({ start, end, text: quoted ? JSON.stringify(mangled) : mangled });
+    };
+    (function walk(node: any): void {
+      if ($isJSArray(node)) {
+        for (const x of node) walk(x);
+        return;
+      }
+      if (!node || typeof node !== "object") return;
+      if (node.type === "BinaryExpression" && node.operator === "in" && node.left?.type === "PrivateIdentifier") {
+        pushPid(node.left, true);
+        if (typeof node.left.start === "number") handled.add(node.left.start);
+      }
+      if (node.type === "PrivateIdentifier" && typeof node.start === "number" && !handled.has(node.start)) {
+        pushPid(node, false);
+      }
+      for (const k of Object.keys(node)) if (k !== "type") walk(node[k]);
+    })(parsed.node);
+    if (edits.length === 0) return source;
+    // Apply right-to-left so earlier edits don't shift later positions.
+    edits.sort((a, b) => b.start - a.start);
+    let out = source;
+    for (const e of edits) out = out.slice(0, e.start) + e.text + out.slice(e.end);
+    return out;
+  }
+  return rewritePrivateMembersScanner(source);
+}
+
+function rewritePrivateMembersScanner(source: string): string {
   if (source.indexOf("#") === -1) return source;
   let i = 0;
   const n = source.length;
