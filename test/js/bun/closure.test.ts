@@ -1263,6 +1263,32 @@ describe("exotic body syntax survives transforms", () => {
 });
 
 describe("captured value types", () => {
+  // Regression (found by fuzzing): an own property whose value is `undefined` must be
+  // preserved (key present), not dropped like JSON.stringify does. A replacer that returns
+  // undefined still omits (tested separately in the replacer suite).
+  test("own properties with undefined values are preserved (key kept)", async () => {
+    const o = { a: undefined, b: 1, c: undefined, d: null };
+    void o;
+    const out = (await roundtrip(() => o))();
+    expect(Object.keys(out)).toEqual(["a", "b", "c", "d"]);
+    expect("a" in out).toBe(true);
+    expect(out.a).toBeUndefined();
+    expect(out.b).toBe(1);
+    expect(out.d).toBeNull();
+  });
+
+  test("an array with explicit undefined elements (not holes) preserves them", async () => {
+    const arr = [1, undefined, 3];
+    delete arr[0]; // arr is now [hole, undefined, 3]
+    void arr;
+    const out = (await roundtrip(() => arr))();
+    expect(0 in out).toBe(false); // hole stays a hole
+    expect(1 in out).toBe(true); // explicit undefined stays present
+    expect(out[1]).toBeUndefined();
+    expect(out[2]).toBe(3);
+    expect(out.length).toBe(3);
+  });
+
   test("registered symbol value (Symbol.for)", async () => {
     let s = Symbol.for("bun.closure.test.sym");
     void s;
@@ -4410,6 +4436,40 @@ describe("genuine #private reification", () => {
 // (arbitrary nesting), and interaction with other JS features (containers, identity,
 // cycles, private methods/accessors, async/generator methods, hosted arrows).
 describe("genuine #private: general permutations", () => {
+  // Regression (found by fuzzing): a genuine class whose heritage is an INLINE class
+  // expression (`extends class A {…}`) — the class-body brace must be located via the AST
+  // (node.body.start), not `indexOf("{")` which would find the inline base's brace and
+  // inject the patch method into the wrong class. Combined here with a same-name collision.
+  test("a genuine class extending an inline class expression (with collision) round-trips", async () => {
+    class Coll extends class A {
+      #x: number;
+      constructor(v: number) {
+        this.#x = v;
+      }
+      ax() {
+        return this.#x;
+      }
+    } {
+      #x: number;
+      constructor(a: number, b: number) {
+        super(a);
+        this.#x = b;
+      }
+      probe() {
+        return { a: this.ax(), x: this.#x };
+      }
+    }
+    const shared = { tag: "S" };
+    const c = new Coll(1, 2);
+    const c2 = new Coll(shared as any, shared as any); // same object in both #x slots
+    void [c, c2];
+
+    const out = (await roundtrip(() => ({ c, c2 })))();
+    expect(out.c.probe()).toEqual({ a: 1, x: 2 }); // distinct slots, distinct values
+    expect(out.c2.probe().a).toBe(out.c2.probe().x); // same object preserved in both slots
+    expect(out.c2.probe().a).toEqual({ tag: "S" });
+  });
+
   test("arbitrary arity: many private fields in any order", async () => {
     class C {
       #e = 5;

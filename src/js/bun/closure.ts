@@ -701,6 +701,10 @@ function injectReifyConstructor(
     ? `${PATCH_METHOD}(v){${fields.map(f => `this.${f}=v[${JSON.stringify(keyPrefix + f)}];`).join("")}}`
     : "";
   const classBodyInjections = patch + hostMethods.join("");
+  // The class body `{` — `node.body` (ClassBody) start is reliable and, crucially, points at
+  // THIS class's brace, not a `{` inside the heritage (`extends class A {…}` / `extends
+  // mixin({…})`), which `source.indexOf("{")` would wrongly find.
+  const classBrace = typeof node.body?.start === "number" ? node.body.start - offset : source.indexOf("{");
 
   const ctor = node.body.body.find(
     (m: any) => m.type === "MethodDefinition" && m.static !== true && m.key?.value === "constructor",
@@ -723,7 +727,6 @@ function injectReifyConstructor(
     // class-body injections after the class body `{` (earlier position) so offsets stay valid.
     let out = source.slice(0, i + 1) + branch + source.slice(i + 1);
     if (classBodyInjections) {
-      const classBrace = out.indexOf("{");
       out = out.slice(0, classBrace + 1) + classBodyInjections + out.slice(classBrace + 1);
     }
     return out;
@@ -732,9 +735,8 @@ function injectReifyConstructor(
   // No explicit constructor: synthesize one right after the class body `{`. A derived
   // class's NORMAL path must forward super(...args) — an explicit empty derived
   // constructor would otherwise never call super and throw.
-  const brace = source.indexOf("{");
   const synthesized = isDerived ? `constructor(...a){${branch}super(...a);}` : `constructor(){${branch}}`;
-  return source.slice(0, brace + 1) + synthesized + classBodyInjections + source.slice(brace + 1);
+  return source.slice(0, classBrace + 1) + synthesized + classBodyInjections + source.slice(classBrace + 1);
 }
 
 // The reachability GATE. Genuine `#private` reconstruction only works in a closed world:
@@ -2046,9 +2048,12 @@ function emitOwnProperties(
 
     const keyName = typeof key === "string" ? key : key.toString();
     const child = transform(value, keyName, descriptor.value, ctx);
-    // A replacer that returns undefined omits enumerable string data properties
-    // (JSON-like); other shapes keep the value.
-    if (child === undefined && typeof key === "string" && descriptor.enumerable) continue;
+    // A REPLACER that turns a defined value into undefined omits the property (JSON-like).
+    // A genuinely-undefined own value is kept (faithful: `{a: undefined}` keeps `a`), so this
+    // only fires when the replacer changed it (descriptor.value was not already undefined).
+    if (child === undefined && descriptor.value !== undefined && typeof key === "string" && descriptor.enumerable) {
+      continue;
+    }
 
     if (typeof key === "string" && descriptor.enumerable && descriptor.writable && descriptor.configurable) {
       ctx.module.push(`${name}[${keyExpr}] = ${emitValue(child, ctx)};`);
