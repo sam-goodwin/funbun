@@ -974,15 +974,10 @@ pub fn parse_json(
         return Err(bun_core::err!("InvalidSourceMap"));
     }
 
-    let sources_content = match json
-        .get(b"sourcesContent")
-        .ok_or_else(|| bun_core::err!("InvalidSourceMap"))?
-        .data
-        .as_e_array()
-    {
-        Some(arr) => arr,
-        None => return Err(bun_core::err!("InvalidSourceMap")),
-    };
+    // `sourcesContent` is OPTIONAL per the source map v3 spec; absent (or not an
+    // array) means no inline source contents are available. tsc, the closure
+    // serializer, and many other tools routinely omit it.
+    let sources_content = json.get(b"sourcesContent").and_then(|v| v.data.as_e_array());
 
     let sources_paths = match json
         .get(b"sources")
@@ -994,15 +989,19 @@ pub fn parse_json(
         None => return Err(bun_core::err!("InvalidSourceMap")),
     };
 
-    if sources_content.items.len_u32() != sources_paths.items.len_u32() {
-        return Err(bun_core::err!("InvalidSourceMap"));
+    // When present, `sourcesContent` must align 1:1 with `sources`; when absent
+    // there is simply no inline content to validate.
+    if let Some(sc) = sources_content {
+        if sc.items.len_u32() != sources_paths.items.len_u32() {
+            return Err(bun_core::err!("InvalidSourceMap"));
+        }
     }
 
     let source_only = matches!(hint, ParseUrlResultHint::SourceOnly(_));
 
     // `Vec<Box<[u8]>>` drops automatically on error.
     let source_paths_slice: Option<Vec<Box<[u8]>>> = if !source_only {
-        let mut v: Vec<Box<[u8]>> = Vec::with_capacity(sources_content.items.len_u32() as usize);
+        let mut v: Vec<Box<[u8]>> = Vec::with_capacity(sources_paths.items.len_u32() as usize);
         for item in sources_paths.items.slice() {
             let Some(s) = item.data.as_e_string() else {
                 return Err(bun_core::err!("InvalidSourceMap"));
@@ -1098,9 +1097,11 @@ pub fn parse_json(
     let content_slice: Option<Box<[u8]>> = match source_index {
         Some(idx)
             if !matches!(hint, ParseUrlResultHint::MappingsOnly)
-                && (idx as usize) < sources_content.items.len_u32() as usize =>
+                && sources_content
+                    .is_some_and(|sc| (idx as usize) < sc.items.len_u32() as usize) =>
         'content: {
-            let item = &sources_content.items.slice()[idx as usize];
+            let sc = sources_content.unwrap();
+            let item = &sc.items.slice()[idx as usize];
             let Some(estr) = item.data.as_e_string() else {
                 break 'content None;
             };

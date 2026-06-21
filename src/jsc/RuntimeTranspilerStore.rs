@@ -1116,6 +1116,9 @@ impl TranspilerJob {
         if let Some(mi) = module_info.as_deref_mut() {
             mi.flags.has_tla = !parse_result.ast.top_level_await_keyword.is_empty();
         }
+        // The loaded module's own `//# sourceMappingURL=` pragma, if any. `Span`
+        // is `Copy`; grab it before the print block consumes `parse_result`.
+        let input_source_map_url: Option<bun_ast::Span> = parse_result.ast.source_mapping_url;
         // Note: derive `*mut` from a `&mut` borrow (not `&x as *const _ as
         // *mut _`, which is Stacked-Borrows UB). The `&mut` borrow ends when the
         // closure returns; the raw pointer stays valid until `module_info` is
@@ -1158,6 +1161,20 @@ impl TranspilerJob {
             }
             self.parse_error = Some(err);
             return;
+        }
+
+        // Chain the loaded module's own source map (M4): the base generated map
+        // was just stored (put_mappings ran during print); decode this module's
+        // `//# sourceMappingURL=` and remember it keyed by the same source path
+        // so stack frames / Symbol.sourceLocation resolve to the original source.
+        if let Some(span) = input_source_map_url {
+            // SAFETY: `vm` is the live owning VM (BACKREF — see `vm` note above);
+            // `span.text` points into the still-live parse `arena`.
+            unsafe {
+                (*vm)
+                    .source_mappings
+                    .put_input_map_from_url(path.text, span.text.slice());
+            }
         }
 
         if bun_core::env::DUMP_SOURCE {

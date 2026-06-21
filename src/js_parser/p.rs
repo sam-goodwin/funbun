@@ -8799,6 +8799,9 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
             // const_values: self.const_values,
             ts_enums,
             import_meta_ref: self.import_meta_ref,
+            // `Span` is `Copy`; carry the scanned `//# sourceMappingURL=` pragma
+            // (if any) so the runtime can chain the loaded module's own map.
+            source_mapping_url: self.lexer.source_mapping_url,
 
             symbols,
             parts: parts_list,

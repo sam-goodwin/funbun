@@ -404,17 +404,13 @@ test("emits an inline source map", () => {
   expect(code).toContain("//# sourceMappingURL=data:application/json");
 });
 
-// Characterization (current behavior, not aspiration): the serializer emits a
-// correct inline source map (verified by the decode tests below), but Bun's
-// runtime does NOT apply an inline `//# sourceMappingURL=data:` map from a
-// dynamically-imported module to stack traces. The transpiler parses the
-// pragma into `lexer.source_mapping_url` and discards it when reprinting the
-// AST, and SourceProvider source-map registration is gated on `already_bundled`
-// (ZigSourceProvider.cpp), which is false for a plainly-loaded .mjs. So a frame
-// inside the reconstructed function resolves to the reconstructed module, NOT
-// the original source. If that gap is ever closed, this test will start failing
-// on the `toContain("mod")` line and should be tightened to assert the original.
-test("thrown error's own frame currently resolves to the reconstructed module (runtime does not apply inline maps)", async () => {
+// The serializer emits a correct inline source map (verified by the decode tests
+// below), AND Bun chains a loaded module's own `//# sourceMappingURL=data:` map
+// onto its generated map at resolve time. So a frame inside the reconstructed
+// function resolves to the ORIGINAL source where `boom` was defined (this test
+// file) — not the reconstructed `mod.mjs`. This is the payoff of the runtime
+// input-map chaining: stack traces survive serialization.
+test("thrown error's own frame chains through the inline map back to the original source", async () => {
   function boom() {
     throw new Error("kaboom");
   }
@@ -428,14 +424,14 @@ test("thrown error's own frame currently resolves to the reconstructed module (r
     caught = e;
   }
   expect(caught?.message).toBe("kaboom");
-  // The boom frame (first stack line after the message) names the reconstructed
-  // module, proving the inline map was NOT applied. We intentionally assert the
-  // current limitation rather than the call-site frame (which would pass
-  // vacuously regardless of remapping).
+  // The boom frame (first stack line after the message) names the ORIGINAL
+  // source file, proving the inline map was chained — not the reconstructed
+  // module. (We assert the boom frame specifically; the call-site frame would
+  // mention closure.test vacuously regardless of remapping.)
   const boomFrame = caught.stack.split("\n").find((l: string) => l.includes("at boom"));
   expect(boomFrame).toBeDefined();
-  expect(boomFrame).toContain("mod.mjs");
-  expect(boomFrame).not.toContain("closure.test");
+  expect(boomFrame).toContain("closure.test");
+  expect(boomFrame).not.toContain("mod.mjs");
 });
 
 // ---------------------------------------------------------------------------

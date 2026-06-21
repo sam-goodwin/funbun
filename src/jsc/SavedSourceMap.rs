@@ -25,6 +25,12 @@ pub struct SavedSourceMap {
     pub find_cache: FindCache,
     pub last_path_hash: u64,
     pub last_ism: Option<InternalSourceMap>,
+
+    /// A loaded module's OWN source map (decoded from its `//# sourceMappingURL=`
+    /// pragma), keyed by `hash(source path)`. Bun's generated map for that module
+    /// maps generated -> the loaded file; this map continues loaded file ->
+    /// original source, so `resolve_mapping` chains the two. Guarded by `mutex`.
+    pub input_maps: std::collections::HashMap<u64, Arc<ParsedSourceMap>>,
 }
 
 impl Default for SavedSourceMap {
@@ -35,6 +41,7 @@ impl Default for SavedSourceMap {
             find_cache: FindCache::default(),
             last_path_hash: 0,
             last_ism: None,
+            input_maps: std::collections::HashMap::new(),
         }
     }
 }
@@ -48,6 +55,7 @@ impl SavedSourceMap {
             find_cache: FindCache::default(),
             last_path_hash: 0,
             last_ism: None,
+            input_maps: std::collections::HashMap::new(),
         });
 
         // SAFETY: `map` is a valid pointer to the sibling HashTable on VirtualMachine.
@@ -440,6 +448,41 @@ impl SavedSourceMap {
         Some(Value::from(Some(raw)))
     }
 
+    /// Decode a loaded module's own `//# sourceMappingURL=` pragma and remember
+    /// it so `resolve_mapping` can chain it onto Bun's generated map. Only inline
+    /// `data:` URLs are handled here; an external `.map` path is ignored (loaded
+    /// lazily elsewhere). Decode failures are silently dropped — a bad input map
+    /// must not break stack traces, the generated map still resolves.
+    pub fn put_input_map_from_url(&mut self, path: &[u8], url: &[u8]) {
+        if !url.starts_with(b"data:") {
+            return;
+        }
+        let arena = bun_alloc::Arena::new();
+        let parsed = match SourceMap::parse_url(
+            &arena,
+            url,
+            SourceMap::ParseUrlResultHint::MappingsOnly,
+        ) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let Some(map) = parsed.map else {
+            return;
+        };
+        let h = hash(path);
+        self.lock();
+        self.input_maps.insert(h, map);
+        self.unlock();
+    }
+
+    fn get_input_map(&mut self, path: &[u8]) -> Option<Arc<ParsedSourceMap>> {
+        let h = hash(path);
+        self.lock();
+        let result = self.input_maps.get(&h).cloned();
+        self.unlock();
+        result
+    }
+
     pub fn resolve_mapping(
         &mut self,
         path: &[u8],
@@ -472,6 +515,27 @@ impl SavedSourceMap {
             // on the legitimate INVALID (-1) sentinel.
             None => map.find_mapping(line, column)?,
         };
+
+        // Chain through the loaded module's own source map, if it has one. The
+        // base `mapping` maps generated -> this file; the input map continues
+        // this file -> the original source. Look the base mapping's original
+        // (line, column) up in the input map and return THAT, with the input
+        // map as the source (so `display_source_url_if_needed` names the
+        // original file from its `external_source_names`).
+        if mapping.original.lines.zero_based() >= 0 {
+            if let Some(input_map) = self.get_input_map(path) {
+                if let Some(chained) =
+                    input_map.find_mapping(mapping.original.lines, mapping.original.columns)
+                {
+                    return Some(SourceMap::mapping::Lookup {
+                        mapping: chained,
+                        source_map: Some(input_map),
+                        prefetched_source_code: None,
+                        name: None,
+                    });
+                }
+            }
+        }
 
         Some(SourceMap::mapping::Lookup {
             mapping,

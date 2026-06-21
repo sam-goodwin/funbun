@@ -92,6 +92,12 @@ pub struct Ast<'a> {
     pub has_commonjs_export_names: bool,
     pub has_import_meta: bool,
     pub import_meta_ref: Ref,
+
+    /// The `//# sourceMappingURL=` pragma scanned from the source, if any
+    /// (`crate::Span::text` holds the raw URL — an inline `data:` map or a path
+    /// to an external `.map`). Carried so the runtime transpile path can chain a
+    /// loaded module's own source map onto Bun's generated map.
+    pub source_mapping_url: Option<crate::Span>,
 }
 
 // `parts`/`symbols`/`import_records` are now `ArenaVec`s and need an allocator,
@@ -137,6 +143,7 @@ impl<'a> Ast<'a> {
             has_commonjs_export_names: false,
             has_import_meta: false,
             import_meta_ref: Ref::NONE,
+            source_mapping_url: None,
         }
     }
 }

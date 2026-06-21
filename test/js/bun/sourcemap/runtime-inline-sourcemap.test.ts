@@ -68,4 +68,42 @@ describe("runtime inline source map (already-bundled module)", () => {
       expect({ stdout, exitCode }).toEqual({ stdout: "", exitCode: 1 });
     },
   );
+
+  // `sourcesContent` is OPTIONAL per the v3 spec — tsc, the closure serializer,
+  // and many tools omit it. Bun's parser previously REQUIRED it (and required
+  // its length to equal `sources`), rejecting such maps as InvalidSourceMap.
+  // A map with no `sourcesContent` must still load and remap.
+  test("map without sourcesContent still remaps the stack", async () => {
+    const map = {
+      version: 3,
+      sources: ["original.ts"],
+      names: [],
+      mappings: "AAAA;AACA;AACA;AACA;AACA;AACA",
+    };
+    const b64 = Buffer.from(JSON.stringify(map)).toString("base64");
+    const entry = [
+      "// @bun",
+      "function boom() {",
+      "  throw new Error('kaboom');",
+      "}",
+      "boom();",
+      `//# sourceMappingURL=data:application/json;base64,${b64}`,
+      "",
+    ].join("\n");
+    using dir = tempDir("inline-srcmap-nocontent", { "entry.js": entry });
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "entry.js"],
+      env: bunEnv,
+      cwd: String(dir),
+      stderr: "pipe",
+      stdout: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    const boomFrame = stderr.split("\n").find(l => l.includes("at boom"));
+    expect(boomFrame).toBeDefined();
+    expect(boomFrame).toContain("original.ts");
+    expect(boomFrame).not.toContain("entry.js");
+    expect(stderr).not.toContain("Could not decode sourcemap");
+    expect({ stdout, exitCode }).toEqual({ stdout: "", exitCode: 1 });
+  });
 });
