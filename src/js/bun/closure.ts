@@ -1800,38 +1800,32 @@ function serializeNumber(value: number): string {
 
 // `fn.toString()` yields different syntaxes depending on how the function was
 // defined. Arrow / `function` / `class` sources are already valid expressions;
-// method-shorthand sources (`foo() {}`, `async foo() {}`, `*foo() {}`, object
-// or proxy-trap methods) are not, so wrap them in an object literal and pull the
-// method back out by name.
+// method-shorthand and accessor sources (`foo(){}`, `async *g(){}`, `get x(){}`,
+// `[sym](){}`, `"str-key"(){}`) are not. We discriminate via the AST: only the
+// object-literal wrapping (parse offset 2) accepts a method/accessor, and the
+// method's FunctionExpression value starts exactly at its parameter `(` — so we
+// rebuild a plain function expression by slicing from there and dropping the
+// property name / get|set keyword (its value is all that matters).
 function functionSourceToExpression(source: string, name: string): string {
-  const trimmed = source.trimStart();
-  if (/^(async\s+)?function\b/.test(trimmed) || /^class\b/.test(trimmed)) {
-    return `(${source})`;
+  const parsed = parseWithOffset(source);
+  if (parsed === null) {
+    // Unparseable (an extracted method still referencing `this.#x`, or exotic
+    // input) — wrap as an object member and pull it back out by name.
+    return `({ ${source} })[${JSON.stringify(name)}]`;
   }
-  // Arrow: `(...) =>`, `x =>`, optionally async.
-  if (/^(async\s+)?(\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>/.test(trimmed)) {
-    return `(${source})`;
+  const { node, offset } = parsed;
+  // function / arrow / class — already a valid expression once parenthesized.
+  if (offset !== 2) return `(${source})`;
+  // Method shorthand or accessor: `node` is the method's FunctionExpression
+  // value and `node.start` is its parameter `(`.
+  if (typeof node.start === "number") {
+    const open = node.start - offset;
+    if (open >= 0 && open < source.length && source[open] === "(") {
+      const prefix = "(" + (node.async ? "async " : "") + "function" + (node.generator ? "*" : "") + " ";
+      return prefix + source.slice(open) + ")";
+    }
   }
-  // Accessor source from a property descriptor: `get v() {...}` / `set v(n) {...}`
-  // (note the space — `get(...)` with no space is a method named "get"). Convert
-  // to a plain function expression; the accessor name is irrelevant.
-  if (/^(get|set)\s/.test(trimmed)) {
-    return `(${trimmed.replace(/^(get|set)\s+[^(]*/, "function ")})`;
-  }
-  // Method shorthand of any name shape — `foo(){}`, `async foo(){}`, `*gen(){}`,
-  // `async *g(){}`, `async* [Symbol.iterator](){}`, `"str-key"(){}`, `123(){}`.
-  // `async` and `*` may appear with or without surrounding whitespace. The
-  // property name is irrelevant to the function value, so drop it and emit a
-  // plain (async/generator) function expression.
-  const method = trimmed.match(
-    /^(async\b)?\s*(\*)?\s*(?:[A-Za-z_$][\w$]*|\[[\s\S]*?\]|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\d[\w.]*)\s*(\([\s\S]*)$/,
-  );
-  if (method !== null) {
-    const asyncPart = method[1] ? "async " : "";
-    const star = method[2] ? "*" : "";
-    return `(${asyncPart}function${star} ${method[3]})`;
-  }
-  // Fallback: wrap and extract by name (should be unreachable for valid sources).
+  // Position sanity failed — fall back to wrap-by-name (always valid).
   return `({ ${source} })[${JSON.stringify(name)}]`;
 }
 
