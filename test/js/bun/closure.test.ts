@@ -660,6 +660,60 @@ describe("source maps: emitted inline map is decode-correct", () => {
   });
 });
 
+// Characterization: a function imported from a node_modules package that ships a
+// built `.js` + an EXTERNAL `.js.map`. Bun does not chain that external map
+// (same gap as the inline-map characterization above), so `Symbol.sourceLocation`
+// reports the shipped `.js` position, and the serializer faithfully emits a map
+// referencing the `.js` — NOT the package's original `.ts` declared in the
+// `.js.map`. The serializer inlines the function (self-contained), it is not
+// re-imported by reference. If Bun ever chains external maps, sourceLocation
+// would return the `.ts` and the emitted map would follow automatically — at
+// which point the `index.js`/`original.ts` assertions below should be flipped.
+test("node_modules external .js.map is not chained; map references the shipped .js", async () => {
+  const externalMap = JSON.stringify({
+    version: 3,
+    sources: ["original.ts"],
+    names: [],
+    mappings: ";;AAIA;AACA",
+  });
+  using dir = tempDir("closure-nm-map", {
+    "node_modules/pkg/package.json": JSON.stringify({
+      name: "pkg",
+      version: "1.0.0",
+      main: "index.js",
+      type: "module",
+    }),
+    "node_modules/pkg/index.js": `export function greet() {\n  return "hi from pkg";\n}\n//# sourceMappingURL=index.js.map\n`,
+    "node_modules/pkg/index.js.map": externalMap,
+    "fixture.mjs": `
+      import { serialize } from "bun:closure";
+      import { greet } from "pkg";
+      const loc = greet[Symbol.sourceLocation];
+      const code = serialize(greet);
+      const m = code.match(/base64,([A-Za-z0-9+/=]+)/);
+      const map = JSON.parse(Buffer.from(m[1], "base64").toString("utf8"));
+      console.log(JSON.stringify({ locUrl: loc.url, sources: map.sources, inlined: code.includes("hi from pkg") }));
+    `,
+  });
+  await using proc = Bun.spawn({
+    cmd: [bunExe(), "fixture.mjs"],
+    env: bunEnv,
+    cwd: String(dir),
+    stderr: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+  const result = JSON.parse(stdout.trim());
+  // sourceLocation reports the shipped .js, not original.ts from the external map.
+  expect(result.locUrl).toContain("index.js");
+  expect(result.locUrl).not.toContain("original.ts");
+  // The emitted map references the .js (faithful to sourceLocation), not the .ts.
+  expect(result.sources.some((s: string) => s.includes("index.js"))).toBe(true);
+  expect(result.sources.some((s: string) => s.includes("original.ts"))).toBe(false);
+  // The package function is inlined (self-contained), not re-imported by reference.
+  expect(result.inlined).toBe(true);
+  expect({ stderr: stderr.includes("error:"), exitCode }).toEqual({ stderr: false, exitCode: 0 });
+});
+
 test("reconstructs an object getter (preserves dynamic behavior)", async () => {
   let o = {
     _x: 5,
