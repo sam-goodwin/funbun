@@ -465,16 +465,17 @@ describe("source maps: emitted inline map is decode-correct", () => {
   for (let i = 0; i < B64.length; i++) B64INV[B64[i]] = i;
 
   // Decode a v3 `mappings` string into per-generated-line segments. Each segment
-  // is { genLine, genCol, srcIdx, srcLine } (all 0-based). srcIdx/srcLine are
-  // cumulative across the whole string per the v3 spec; genCol resets per line.
+  // is { genLine, genCol, srcIdx, srcLine, srcCol } (all 0-based). srcIdx/srcLine/
+  // srcCol are cumulative across the whole string per the v3 spec; genCol resets
+  // per line.
   function decodeMappings(mappings: string) {
-    const out: Array<Array<{ genLine: number; genCol: number; srcIdx: number; srcLine: number }>> = [];
+    const out: Array<Array<{ genLine: number; genCol: number; srcIdx: number; srcLine: number; srcCol: number }>> = [];
     let srcIdx = 0;
     let srcLine = 0;
     let srcCol = 0;
     const lines = mappings.split(";");
     for (let gl = 0; gl < lines.length; gl++) {
-      const segments: Array<{ genLine: number; genCol: number; srcIdx: number; srcLine: number }> = [];
+      const segments: Array<{ genLine: number; genCol: number; srcIdx: number; srcLine: number; srcCol: number }> = [];
       const raw = lines[gl];
       if (raw !== "") {
         let genCol = 0;
@@ -502,7 +503,7 @@ describe("source maps: emitted inline map is decode-correct", () => {
             srcIdx += fields[1];
             srcLine += fields[2];
             srcCol += fields[3];
-            segments.push({ genLine: gl, genCol, srcIdx, srcLine });
+            segments.push({ genLine: gl, genCol, srcIdx, srcLine, srcCol });
           }
         }
       }
@@ -548,6 +549,32 @@ describe("source maps: emitted inline map is decode-correct", () => {
     expect(srcIdx).toBeGreaterThanOrEqual(0);
     // The first body line of `boom` maps to its original (0-based) definition line.
     expect(mappedPairs(decoded).has(`${srcIdx}:${loc.line - 1}`)).toBe(true);
+  });
+
+  test("columns are accurate: definition line maps to its column, body lines to their indentation", () => {
+    // 6-space indent here; the body `throw` carries that indentation verbatim.
+    function deep() {
+      throw new Error("x");
+    }
+    const loc = (deep as any)[Symbol.sourceLocation];
+    const { decoded } = decodeInlineMap(serialize(deep));
+    const flat = decoded.flat();
+
+    // The function's first line maps to its original definition column (0-based).
+    // JSC's startColumn points just past the name (the `(`), and the map must
+    // reproduce it — NOT the old coarse column 0.
+    const defSeg = flat.find(s => s.srcLine === loc.line - 1);
+    expect(defSeg).toBeDefined();
+    expect(defSeg!.srcCol).toBe(loc.column - 1);
+    expect(defSeg!.srcCol).toBeGreaterThan(0);
+
+    // The body `throw` line keeps its source indentation, so its column maps
+    // identity (generated column == source column == original column) and is the
+    // line's leading-whitespace width, not 0.
+    const bodySeg = flat.find(s => s.srcLine === loc.line); // line after the def
+    expect(bodySeg).toBeDefined();
+    expect(bodySeg!.srcCol).toBe(bodySeg!.genCol);
+    expect(bodySeg!.srcCol).toBeGreaterThan(0);
   });
 
   test("captured-value prelude shifts generated lines but original lines stay correct", () => {
@@ -722,6 +749,45 @@ test("node_modules external .js.map chains; sourceLocation + emitted map referen
   expect(result.sources.some((s: string) => s.includes("index.js"))).toBe(false);
   // The package function is inlined (self-contained), not re-imported by reference.
   expect(result.inlined).toBe(true);
+  expect({ stderr: stderr.includes("error:"), exitCode }).toEqual({ stderr: false, exitCode: 0 });
+});
+
+// When a closure captures a function defined in a DIFFERENT file, the serializer
+// inlines both and emits a MULTI-source map. After reify, a frame from the
+// captured function must chain to ITS original file (source index > 0 resolving
+// through the input map's per-source names) — distinct from the root's file.
+test("multi-source map: a captured cross-file function's frame chains to its own original file", async () => {
+  using dir = tempDir("closure-multisrc", {
+    // a.mjs's factory returns a closure whose throw lives in a.mjs.
+    "a.mjs": `export const makeHelper = () => {\n  const helper = () => {\n    throw new Error("from-a");\n  };\n  return helper;\n};\n`,
+    "fixture.mjs": `
+      import { serialize } from "bun:closure";
+      import { makeHelper } from "./a.mjs";
+      import { writeFileSync } from "node:fs";
+      const helper = makeHelper();
+      const root = () => helper();
+      const code = serialize(root);
+      const map = JSON.parse(Buffer.from(code.match(/base64,([A-Za-z0-9+/=]+)/)[1], "base64").toString("utf8"));
+      writeFileSync(new URL("./mod.mjs", import.meta.url), code);
+      const fn = (await import("./mod.mjs")).default;
+      let frame = "";
+      try { fn(); } catch (e) { frame = e.stack.split("\\n").find(l => l.includes("a.mjs")) ?? ""; }
+      console.log(JSON.stringify({ nSources: map.sources.length, frame: frame.trim() }));
+    `,
+  });
+  await using proc = Bun.spawn({
+    cmd: [bunExe(), "fixture.mjs"],
+    env: bunEnv,
+    cwd: String(dir),
+    stderr: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+  const result = JSON.parse(stdout.trim());
+  // The emitted map genuinely has two sources (a.mjs + the fixture).
+  expect(result.nSources).toBe(2);
+  // A stack frame chains to a.mjs (the captured helper's original file), and to
+  // the throw line (3) — proving the right source index resolved, not source 0.
+  expect(result.frame).toContain("a.mjs:3");
   expect({ stderr: stderr.includes("error:"), exitCode }).toEqual({ stderr: false, exitCode: 0 });
 });
 

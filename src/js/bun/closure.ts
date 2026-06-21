@@ -97,7 +97,12 @@ interface SourceBlock {
   lineOffset: number;
   url: string;
   line: number;
+  column: number;
   lineCount: number;
+  // The verbatim source emitted for this block. Its body lines keep their
+  // original indentation (so their columns map identity), while the first line
+  // is the function start (mapped to `column`).
+  source: string;
 }
 
 // The ALS context-restoration wrapper turns the root into an arrow `(...args) =>
@@ -199,7 +204,9 @@ function serialize(fn: Function, replacer?: Replacer): string {
       lineOffset: exportReconstructed.sourceLineOffset,
       url: exportReconstructed.location.url,
       line: exportReconstructed.location.line,
+      column: exportReconstructed.location.column,
       lineCount: exportReconstructed.sourceLineCount,
+      source: exportReconstructed.source,
     });
   }
 
@@ -232,10 +239,23 @@ function vlqEncode(value: number): string {
   return out;
 }
 
-// Builds a v3 source map (as a JSON string) mapping the generated module's lines
-// back to the original source files at line granularity, or undefined if there
-// is nothing to map. Column information is coarse (every mapped line points at
-// column 0), which is enough for stack traces to name the right file and line.
+// Number of leading space/tab characters on a line (its indentation width).
+function leadingWhitespace(line: string): number {
+  let i = 0;
+  while (i < line.length) {
+    const c = line.charCodeAt(i);
+    if (c !== 32 && c !== 9) break;
+    i++;
+  }
+  return i;
+}
+
+// Builds a v3 source map (as a JSON string) mapping the generated module back to
+// the original source files, or undefined if there is nothing to map. The source
+// is emitted verbatim, so columns are accurate: a block's first line maps to the
+// function's start column (`block.column`); each body line keeps its original
+// indentation, so its content-start column maps identity. One segment per line
+// at the content start (the position a stack frame reports).
 function buildSourceMap(
   blocks: SourceBlock[],
   moduleStartLines: number[],
@@ -246,7 +266,8 @@ function buildSourceMap(
 
   const sources: string[] = [];
   const sourceIndexByUrl = new Map<string, number>();
-  const mapped = new Map<number, [number, number]>(); // genLine -> [sourceIndex, srcLine0]
+  // genLine -> [sourceIndex, srcLine0, genColumn, srcColumn]
+  const mapped = new Map<number, [number, number, number, number]>();
   let maxLine = 0;
 
   for (const block of blocks) {
@@ -260,15 +281,32 @@ function buildSourceMap(
       leadingLines +
       (block.moduleIndex === -1 ? preludeLineCount : moduleStartLines[block.moduleIndex]) +
       block.lineOffset;
+    const sourceLines = block.source.split("\n");
     for (let k = 0; k < block.lineCount; k++) {
       const genLine = genStart + k;
-      mapped.set(genLine, [sourceIndex, block.line - 1 + k]);
+      let genColumn: number;
+      let srcColumn: number;
+      if (k === 0) {
+        // First line is the function start. `fn.toString()` strips its leading
+        // indent (so it begins at generated column 0 of its placed line), and it
+        // maps to the original definition column. `location.column` is 1-based.
+        genColumn = 0;
+        srcColumn = block.column > 0 ? block.column - 1 : 0;
+      } else {
+        // Body lines are verbatim — same indentation in generated and original —
+        // so the content-start column maps identity.
+        const ws = leadingWhitespace(sourceLines[k] ?? "");
+        genColumn = ws;
+        srcColumn = ws;
+      }
+      mapped.set(genLine, [sourceIndex, block.line - 1 + k, genColumn, srcColumn]);
       if (genLine > maxLine) maxLine = genLine;
     }
   }
 
   let prevSource = 0;
   let prevSrcLine = 0;
+  let prevSrcColumn = 0;
   const lines: string[] = [];
   for (let g = 0; g <= maxLine; g++) {
     const entry = mapped.get(g);
@@ -276,12 +314,19 @@ function buildSourceMap(
       lines.push("");
       continue;
     }
-    const sourceIndex = entry[0];
-    const srcLine = entry[1];
-    // [generatedColumn=0, sourceIndexDelta, sourceLineDelta, sourceColumn=0]
-    lines.push(vlqEncode(0) + vlqEncode(sourceIndex - prevSource) + vlqEncode(srcLine - prevSrcLine) + vlqEncode(0));
+    const [sourceIndex, srcLine, genColumn, srcColumn] = entry;
+    // One segment per line: [generatedColumnDelta, sourceIndexDelta,
+    // sourceLineDelta, sourceColumnDelta]. generatedColumn resets to 0 each line
+    // (so its delta is the absolute column); the rest are cumulative.
+    lines.push(
+      vlqEncode(genColumn) +
+        vlqEncode(sourceIndex - prevSource) +
+        vlqEncode(srcLine - prevSrcLine) +
+        vlqEncode(srcColumn - prevSrcColumn),
+    );
     prevSource = sourceIndex;
     prevSrcLine = srcLine;
+    prevSrcColumn = srcColumn;
   }
 
   return JSON.stringify({ version: 3, sources, names: [], mappings: lines.join(";") });
@@ -807,6 +852,9 @@ interface ReconstructedFunction {
   // always emitted verbatim, so it maps line-for-line onto the original file).
   sourceLineOffset: number;
   sourceLineCount: number;
+  // The verbatim source as emitted (post `#private`/heritage rewrite); used to
+  // derive per-line columns for the source map.
+  source: string;
   location: { url: string; line: number; column: number } | undefined;
 }
 
@@ -870,7 +918,7 @@ function reconstructFunctionExpr(fn: Function, ctx: Context): ReconstructedFunct
   // first line, so the only vertical offset comes from the IIFE wrapper.
   const fnExpr = functionSourceToExpression(source, (fn as any).name);
   if (bindings.length === 0) {
-    return { expr: fnExpr, sourceLineOffset: 0, sourceLineCount, location };
+    return { expr: fnExpr, sourceLineOffset: 0, sourceLineCount, source, location };
   }
   // (function () {\n  <bindings...>\n  return <fnExpr>;\n})()
   // The `return` line is at offset 1 (header) + bindings.length.
@@ -878,6 +926,7 @@ function reconstructFunctionExpr(fn: Function, ctx: Context): ReconstructedFunct
     expr: `(function () {\n${bindings.join("\n")}\nreturn ${fnExpr};\n})()`,
     sourceLineOffset: 1 + bindings.length,
     sourceLineCount,
+    source,
     location,
   };
 }
@@ -1677,7 +1726,9 @@ function recordSourceBlock(ctx: Context, moduleIndex: number, reconstructed: Rec
     lineOffset: reconstructed.sourceLineOffset,
     url: location.url,
     line: location.line,
+    column: location.column,
     lineCount: reconstructed.sourceLineCount,
+    source: reconstructed.source,
   });
 }
 
