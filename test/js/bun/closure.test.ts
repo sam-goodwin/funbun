@@ -602,6 +602,62 @@ describe("source maps: emitted inline map is decode-correct", () => {
     expect(srcLines.length).toBeGreaterThan(0);
     for (const sl of srcLines) expect(sl).toBeGreaterThanOrEqual(0);
   });
+
+  // --- Indirection: the same edge cases explored for ALS, applied to maps. ---
+  // The transforms (nesting, #private rewrite, ALS-wrapping) all reshape the
+  // generated text; the map must keep pointing every body at its true origin.
+
+  test("nested-function source maps back to the enclosing definition line", () => {
+    function outer() {
+      function inner() {
+        return 7;
+      }
+      return inner;
+    }
+    const loc = (outer as any)[Symbol.sourceLocation];
+    const { json, decoded } = decodeInlineMap(serialize(outer));
+    const srcIdx = json.sources.findIndex((s: string) => s.includes("closure.test"));
+    // `inner` lives textually inside `outer`'s source, so the block covers the
+    // whole outer body — the first mapped line is outer's definition line.
+    expect(mappedPairs(decoded).has(`${srcIdx}:${loc.line - 1}`)).toBe(true);
+  });
+
+  test("class method survives #private rewrite with its definition line intact", () => {
+    class Secret {
+      #value = 5;
+      reveal() {
+        return this.#value;
+      }
+    }
+    const inst = new Secret();
+    const method = inst.reveal.bind(inst);
+    // The bound method's source location is the class/method site in this file.
+    const loc = (inst.reveal as any)[Symbol.sourceLocation];
+    const { json, decoded } = decodeInlineMap(serialize(method));
+    const srcIdx = json.sources.findIndex((s: string) => s.includes("closure.test"));
+    expect(srcIdx).toBeGreaterThanOrEqual(0);
+    // Despite the `#value` -> rewritten-field transform, the map still points the
+    // method body at its exact original definition line.
+    expect(mappedPairs(decoded).has(`${srcIdx}:${loc.line - 1}`)).toBe(true);
+  });
+
+  test("ALS-wrapped root keeps the body's original line mapping (offset by the wrap)", () => {
+    const als = new AsyncLocalStorage<{ tag: string }>();
+    const captured = als.run({ tag: "ctx" }, () => {
+      function worker() {
+        return als.getStore()?.tag;
+      }
+      return worker;
+    });
+    const loc = (captured as any)[Symbol.sourceLocation];
+    const code = serialize(captured);
+    // Sanity: the root really was wrapped in an als.run reconstruction.
+    expect(code).toContain("AsyncLocalStorage");
+    const { json, decoded } = decodeInlineMap(code);
+    const srcIdx = json.sources.findIndex((s: string) => s.includes("closure.test"));
+    const seg = decoded.flat().find(s => s.srcIdx === srcIdx && s.srcLine === loc.line - 1);
+    expect(seg).toBeDefined();
+  });
 });
 
 test("reconstructs an object getter (preserves dynamic behavior)", async () => {
