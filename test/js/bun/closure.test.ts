@@ -4535,6 +4535,33 @@ describe("genuine #private: general permutations", () => {
     expect(out.me()).toBe(out); // self-cycle preserved
   });
 
+  test("same-named private fields across an inheritance chain stay distinct (genuine)", async () => {
+    class A {
+      #x = "a";
+      ax() {
+        return this.#x;
+      }
+    }
+    class B extends A {
+      #x = "b"; // a DIFFERENT private slot than A's #x
+      bx() {
+        return this.#x;
+      }
+      both() {
+        return this.ax() + this.#x;
+      }
+    }
+    const b = new B();
+    void b;
+
+    const code = serialize(() => b);
+    expect(code).not.toContain("$bunClosurePrivate$"); // genuine — distinct slots, not mangled
+    const out = (await roundtrip(() => b))();
+    expect(out.ax()).toBe("a"); // A's #x
+    expect(out.bx()).toBe("b"); // B's #x
+    expect(out.both()).toBe("ab"); // both distinct slots from inside B
+  });
+
   test("a cycle through private fields across an inheritance chain round-trips", async () => {
     class Base {
       #link: any = null;

@@ -118,6 +118,10 @@ interface Context {
   // field names its injected constructor branch installs. Consumed when emitting an
   // instance so it flows through the factory.
   classReify: Map<Function, { factory: string; fields: string[] }>;
+  // A stable per-genuine-class id used to namespace patch-method keys, so a private field
+  // name that collides across an inheritance chain (`class A { #x } class B extends A { #x }`)
+  // maps to distinct keys (each class writes its own genuine slot).
+  genuineClassId: Map<Function, number>;
   // Whether any genuine-private class was emitted (so `let REIFY_SLOT` is hoisted).
   needsReifySlot: boolean;
 }
@@ -183,6 +187,7 @@ function serialize(fn: Function, replacer?: Replacer): string {
     hostedArrows: genuinePlan.hostedArrows,
     classHosts: genuinePlan.classHosts,
     classReify: new Map(),
+    genuineClassId: new Map(),
     needsReifySlot: false,
   };
 
@@ -679,11 +684,18 @@ function classStructure(source: string): ClassStructure | null {
 //   - any host methods (for escaped `#x` arrows) are injected too.
 // The reify branch goes after the constructor body `{`; the patch + host methods after the
 // class body `{`. All insertions are single-line, so source-map lines are unchanged.
-function injectReifyConstructor(source: string, info: ClassStructure, hostMethods: string[]): string {
+function injectReifyConstructor(
+  source: string,
+  info: ClassStructure,
+  hostMethods: string[],
+  keyPrefix: string,
+): string {
   const { fields, isDerived, node, offset } = info;
   const branch = `if(${REIFY_SLOT}){` + (isDerived ? "super();" : "") + `return;}`;
+  // Patch keys are namespaced by class id so a same-named private across an inheritance
+  // chain still maps to this class's own genuine slot.
   const patch = fields.length
-    ? `${PATCH_METHOD}(v){${fields.map(f => `this.${f}=v[${JSON.stringify(f)}];`).join("")}}`
+    ? `${PATCH_METHOD}(v){${fields.map(f => `this.${f}=v[${JSON.stringify(keyPrefix + f)}];`).join("")}}`
     : "";
   const classBodyInjections = patch + hostMethods.join("");
 
@@ -805,12 +817,20 @@ function computeGenuineClasses(root: unknown): GenuinePlan {
     return structure.get(C)!;
   };
 
+  // Every reachable class's own methods — a method legitimately reading a private (even an
+  // inherited one with a same-named field) must not be mistaken for an escaped closure.
+  const allMethods = new Set<Function>();
+  for (const f of funcs) {
+    if (structOf(f) !== null) for (const m of classOwnMethods(f)) allMethods.add(m);
+  }
+
   // Structural candidates: every class in a hierarchy that reaches Object through parseable
-  // user classes only (no builtin base), has ≥1 private field, no same-name collision
-  // across the chain, and no chain member with a non-hostable escaped `#x` closure.
+  // user classes only (no builtin base), has ≥1 private field, and no chain member with a
+  // non-hostable escaped `#x` closure. (Same-name private collisions across the chain are
+  // allowed — keys are namespaced by class id.)
   const candidate = new Set<Function>();
   for (const f of funcs) {
-    const chain = genuineChain(f, structOf, funcs);
+    const chain = genuineChain(f, structOf, funcs, allMethods);
     if (chain) for (const c of chain) candidate.add(c);
   }
 
@@ -903,30 +923,34 @@ function computeGenuineMethods(
 }
 
 // Walk `C` and its superclass chain up to Object. Returns the chain (leaf-first) if every
-// member is a parseable user class, there is ≥1 private field and no same-name private
-// collision across the chain, and no member has a per-class disqualifier; else null.
+// member is a parseable user class with ≥1 private field somewhere and no per-class
+// disqualifier; else null. Same-name private fields across the chain are fine — each class
+// writes its own genuine slot, namespaced by class id in the patch keys.
 function genuineChain(
   C: Function,
   structOf: (C: Function) => ClassStructure | null,
   funcs: Set<Function>,
+  allMethods: Set<Function>,
 ): Function[] | null {
   const chain: Function[] = [];
-  const names = new Set<string>();
   let hasField = false;
   let cur: any = C;
   while (typeof cur === "function" && cur !== Function.prototype) {
     const s = structOf(cur);
     if (s === null) return null; // a builtin/native base in the chain → not genuine
-    for (const f of s.fields) {
-      if (names.has(f)) return null; // same-name private collision across the chain
-      names.add(f);
-    }
     if (s.fields.length > 0) hasField = true;
-    if (perClassDisqualified(cur, s.fields, funcs)) return null;
+    if (perClassDisqualified(cur, s.fields, funcs, allMethods)) return null;
     chain.push(cur);
     cur = Object.getPrototypeOf(cur);
   }
   return hasField ? chain : null;
+}
+
+// A stable per-genuine-class id, assigned on first use, for namespacing patch keys.
+function genuineClassId(fn: Function, ctx: Context): number {
+  let id = ctx.genuineClassId.get(fn);
+  if (id === undefined) ctx.genuineClassId.set(fn, (id = ctx.genuineClassId.size));
+  return id;
 }
 
 // The classes whose `.prototype` lies on `o`'s prototype chain (leaf-first) — i.e. the
@@ -956,16 +980,15 @@ function classOwnMethods(C: Function): Set<Function> {
   return methods;
 }
 
-// True if some reachable function — other than C's own methods — is an escaped closure
-// that textually references one of C's private fields and is NOT a hostable escaped arrow.
-// A hostable arrow is reconstructed by hosting it in C's body (see computeGenuineClasses /
-// emitFunction), so it doesn't disqualify; any other #-referencing non-method closure
-// can't be served by genuine reconstruction. Bound/extracted methods are NOT disqualifying:
-// they're emitted as references through the reconstructed prototype.
-function perClassDisqualified(C: Function, fields: string[], funcs: Set<Function>): boolean {
-  const ownMethods = classOwnMethods(C);
+// True if some reachable function — other than a class method or a hostable arrow — is an
+// escaped closure that textually references one of C's private fields. A method (of ANY
+// class, e.g. an inherited one that legitimately reads a same-named private) is fine; a
+// hostable arrow is reconstructed by hosting it in C's body. Anything else reading the
+// private — an escaped ordinary function whose `this` won't carry the genuine slot — can't
+// be served by genuine reconstruction. `allMethods` is every reachable class's methods.
+function perClassDisqualified(C: Function, fields: string[], funcs: Set<Function>, allMethods: Set<Function>): boolean {
   for (const g of funcs) {
-    if (g === C || ownMethods.has(g) || hostableEscapedArrow(g)) continue;
+    if (g === C || allMethods.has(g) || hostableEscapedArrow(g)) continue;
     let src: string;
     try {
       src = g.toString();
@@ -1329,7 +1352,7 @@ function reconstructFunctionExpr(fn: Function, ctx: Context): ReconstructedFunct
   const gpInfo = ctx.genuineClasses.has(fn) ? classStructure(original) : null;
   if (gpInfo !== null) {
     const hosts = (ctx.classHosts.get(fn) ?? []).map(h => `${h.hostKey}(${h.params.join(",")}){return (${h.source});}`);
-    source = injectReifyConstructor(original, gpInfo, hosts);
+    source = injectReifyConstructor(original, gpInfo, hosts, `${genuineClassId(fn, ctx)}:`);
     genuinePrivate = { fields: gpInfo.fields };
     ctx.needsReifySlot = true;
   } else {
@@ -1877,9 +1900,19 @@ function emitGenuinePrivateInstance(value: object, name: string, ctx: Context): 
   }
   const privateFields = (value as any)[Symbol.privateFields] as Array<{ name: string; value: unknown }> | undefined;
   if (patchClasses.length > 0 && privateFields && privateFields.length > 0) {
-    const entries = privateFields.map(
-      f => `${JSON.stringify(f.name)}: ${emitValue(transform(value, f.name, f.value, ctx), ctx)}`,
-    );
+    // Symbol.privateFields is flat in base→derived declaration order; attribute each entry to
+    // its declaring class (base-first) and key it by that class's id, so a same-named private
+    // across the chain lands in the right genuine slot.
+    const entries: string[] = [];
+    let idx = 0;
+    for (const c of [...patchClasses].reverse()) {
+      const prefix = `${genuineClassId(c, ctx)}:`;
+      for (const fname of ctx.classReify.get(c)?.fields ?? []) {
+        const pf = privateFields[idx++];
+        if (pf === undefined) continue;
+        entries.push(`${JSON.stringify(prefix + fname)}: ${emitValue(transform(value, pf.name, pf.value, ctx), ctx)}`);
+      }
+    }
     const valsName = REF_PREFIX + ctx.counter++;
     ctx.module.push(`const ${valsName} = { ${entries.join(", ")} };`);
     for (const c of patchClasses) {
@@ -2713,6 +2746,7 @@ async function bundle(fn: Function, replacer?: Replacer): Promise<string> {
     hostedArrows: genuinePlan.hostedArrows,
     classHosts: genuinePlan.classHosts,
     classReify: new Map(),
+    genuineClassId: new Map(),
     needsReifySlot: false,
   };
   // 2. Recover the closure module's import bindings: localName → original source.
