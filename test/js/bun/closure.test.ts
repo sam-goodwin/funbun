@@ -434,6 +434,23 @@ test("thrown error's own frame chains through the inline map back to the origina
   expect(boomFrame).not.toContain("mod.mjs");
 });
 
+// Symbol.sourceLocation resolves through the SAME chained map, so a function
+// reconstructed in mod.mjs reports its ORIGINAL definition site (this test file)
+// — both the url and the line are remapped, not just the line.
+test("Symbol.sourceLocation of a reified function chains to the original source", async () => {
+  function defined() {
+    return 123;
+  }
+  const code = serialize(defined);
+  using dir = tempDir("closure-srcloc-chain", { "mod.mjs": code });
+  const { default: fn } = await import(`${String(dir)}/mod.mjs`);
+  const loc = (fn as any)[Symbol.sourceLocation];
+  expect(loc).toBeDefined();
+  expect(loc.url).toContain("closure.test");
+  expect(loc.url).not.toContain("mod.mjs");
+  expect(typeof loc.line).toBe("number");
+});
+
 // ---------------------------------------------------------------------------
 // Source maps: the serializer owns the *emitted* inline v3 map. These tests
 // decode that map (independent of Bun's runtime source-map application, which

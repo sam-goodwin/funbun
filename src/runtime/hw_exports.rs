@@ -104,6 +104,7 @@ pub fn resolve_source_map_position(
     column_zero_based: i32,
     out_line: *mut i32,
     out_column: *mut i32,
+    out_source_url: *mut bun_core::String,
 ) -> bool {
     // SAFETY: `path` is a valid C++ stack local (see ZigGlobalObject.cpp).
     let path_utf8 = unsafe { (*path).to_utf8() };
@@ -127,6 +128,18 @@ pub fn resolve_source_map_position(
             unsafe {
                 *out_line = ol;
                 *out_column = oc;
+            }
+            // Remap the source FILENAME too when the map names a different source
+            // (e.g. a chained input map points the loaded file at its original).
+            // Hand C++ an OWNED clone (it derefs); `display_source_url_if_needed`
+            // returns `None` for same-file transpile maps, leaving the url as-is.
+            if !out_source_url.is_null() {
+                if let Some(name) = lookup.display_source_url_if_needed(p) {
+                    let owned = bun_core::String::clone_utf8(name.to_utf8().slice());
+                    name.deref();
+                    // SAFETY: `out_source_url` is a valid C++ stack out-param.
+                    unsafe { *out_source_url = owned };
+                }
             }
             true
         }

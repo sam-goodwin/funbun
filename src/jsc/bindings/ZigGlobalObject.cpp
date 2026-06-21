@@ -3409,7 +3409,7 @@ JSC_DEFINE_CUSTOM_GETTER(functionBoundDetailsGetter, (JSC::JSGlobalObject * glob
 // remapped through the module's source map so they point at the ORIGINAL source
 // (e.g. the .ts), matching how stack traces are reported, rather than the
 // transpiled output JSC actually executes.
-extern "C" bool Bun__resolveSourceMapPosition(void* bunVM, const BunString* path, int lineZeroBased, int columnZeroBased, int* outLineZeroBased, int* outColumnZeroBased);
+extern "C" bool Bun__resolveSourceMapPosition(void* bunVM, const BunString* path, int lineZeroBased, int columnZeroBased, int* outLineZeroBased, int* outColumnZeroBased, BunString* outSourceUrl);
 
 JSC_DEFINE_CUSTOM_GETTER(functionSourceLocationGetter, (JSC::JSGlobalObject * globalObject, JSC::EncodedJSValue thisValue, JSC::PropertyName))
 {
@@ -3436,9 +3436,16 @@ JSC_DEFINE_CUSTOM_GETTER(functionSourceLocationGetter, (JSC::JSGlobalObject * gl
         BunString pathStr = Bun::toString(url);
         int mappedLine = 0;
         int mappedColumn = 0;
-        if (Bun__resolveSourceMapPosition(defaultGlobalObject(globalObject)->bunVM(), &pathStr, line - 1, column - 1, &mappedLine, &mappedColumn)) {
+        // Receives an owned remapped filename when the map (e.g. a chained input
+        // map) names a different source than the loaded file; empty otherwise.
+        BunString mappedUrl = BunStringEmpty;
+        if (Bun__resolveSourceMapPosition(defaultGlobalObject(globalObject)->bunVM(), &pathStr, line - 1, column - 1, &mappedLine, &mappedColumn, &mappedUrl)) {
             line = mappedLine + 1;
             column = mappedColumn + 1;
+            if (mappedUrl.tag != BunStringTag::Empty && mappedUrl.tag != BunStringTag::Dead) {
+                url = mappedUrl.toWTFString();
+                mappedUrl.deref();
+            }
         }
     }
 
