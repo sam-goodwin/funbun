@@ -1447,10 +1447,18 @@ impl JSTranspiler {
                 t.options.dead_code_elimination,
                 t.options.minify_syntax,
                 t.options.tree_shaking,
+                t.options.target,
             );
             t.options.dead_code_elimination = false;
             t.options.minify_syntax = false;
             t.options.tree_shaking = false;
+            // Target Bun: JavaScriptCore implements `using` / `await using` (and
+            // the rest of modern syntax) natively, so the visit pass does NOT
+            // lower them (`lower_using = !target.is_bun()`). The AST must reflect
+            // the source, not the transpiler's lowering — otherwise e.g. a
+            // `using` declaration is rewritten into try/finally + an injected
+            // disposal-helper import that corrupts the node shape.
+            t.options.target = bun_ast::Target::Bun;
             (prev, opts)
         });
         let _restore = TranspilerStateGuard {
@@ -1468,6 +1476,7 @@ impl JSTranspiler {
             t.options.dead_code_elimination = prev_opts.0;
             t.options.minify_syntax = prev_opts.1;
             t.options.tree_shaking = prev_opts.2;
+            t.options.target = prev_opts.3;
         });
         let log_ref = self.transpiler.get().log_mut();
         let Some(parse_result) = parse_result else {

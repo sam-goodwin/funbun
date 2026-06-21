@@ -216,6 +216,29 @@ describe("Transpiler.ast", () => {
     expect(() => ast("const = ;")).toThrow();
   });
 
+  // The AST must reflect the SOURCE, not the transpiler's lowering. `using` /
+  // `await using` are lowered (into try/finally + an injected disposal-helper
+  // import) for non-Bun targets, which corrupted the node shape — ast() now
+  // parses with the Bun target (native support), so they stay faithful.
+  test("`using` declarations are not lowered away", () => {
+    const a = ast("{ using x = r; }");
+    expect(a.body[0].type).toBe("BlockStatement");
+    expect(a.body[0].body[0]).toMatchObject({ type: "VariableDeclaration", kind: "using" });
+    expect(a.body[0].body[0].declarations[0].id).toMatchObject({ type: "Identifier", name: "x" });
+  });
+
+  test("`using` / `await using` inside a function body stay faithful", () => {
+    // Previously these mis-parsed the whole program as an ImportDeclaration.
+    const arrow = ast("(() => { using x = r; return 1; })").body[0];
+    expect(arrow.type).toBe("ExpressionStatement");
+    expect(arrow.expression.type).toBe("ArrowFunctionExpression");
+
+    const asyncArrow = ast("(async () => { await using x = r; })").body[0].expression;
+    expect(asyncArrow.type).toBe("ArrowFunctionExpression");
+    // An arrow's block body is the statements array directly (no BlockStatement).
+    expect(asyncArrow.body[0]).toMatchObject({ type: "VariableDeclaration", kind: "await using" });
+  });
+
   test("walking the tree collects called method names", () => {
     // Demonstrates the static-analysis use case: which methods are called.
     const a = ast("a.foo(); b.bar(); a.foo(); c[d]()");
