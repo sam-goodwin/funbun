@@ -344,7 +344,12 @@ function buildSourceMap(
         genColumn = ws;
         srcColumn = ws;
       }
-      mapped.set(genLine, [sourceIndex, block.line - 1 + k, genColumn, srcColumn]);
+      // Clamp to a valid 0-based line. `block.line` can be unreliable when the engine's
+      // `toString()` reformats a class onto more lines than the original (so a member's
+      // toString-relative line exceeds its file line) — a negative line would crash the
+      // runtime source-map parser (debug) or corrupt the map (release).
+      const srcLine = Math.max(0, block.line - 1 + k);
+      mapped.set(genLine, [sourceIndex, srcLine, genColumn, srcColumn]);
       if (genLine > maxLine) maxLine = genLine;
     }
   }
@@ -1494,7 +1499,13 @@ function classSourceAnchor(fn: Function, source: string): { url: string; line: n
     if (posInSource < 0 || posInSource > source.length) continue;
     let rel = 0;
     for (let i = 0; i < posInSource; i++) if (source[i] === "\n") rel++;
-    return { url: loc.url, line: loc.line - rel, column: 1 };
+    const line = loc.line - rel;
+    // `rel` is the member's line offset within `toString()`, while `loc.line` is its FILE
+    // line. When toString() reformats a one-line class onto many lines, `rel` exceeds the
+    // file span and `line` goes <= 0 — an unreliable anchor. Skip mapping rather than emit a
+    // bogus (or crashing) map; the function still reconstructs, it just isn't stack-mapped.
+    if (line < 1) continue;
+    return { url: loc.url, line, column: 1 };
   }
   return undefined;
 }

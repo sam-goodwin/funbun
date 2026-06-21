@@ -3906,6 +3906,35 @@ describe("interactions: private fields + other features", () => {
 // rather than mangled into a public field. The reachability gate routes the
 // closed-world cases to mangling so everything still round-trips.
 describe("genuine #private reification", () => {
+  // Regression (found by adversarial probing): a captured class instance defined NEAR THE
+  // TOP of its source file produced a source map with a NEGATIVE source line (the engine's
+  // toString() reformats a one-line class onto several lines, so a member's toString-relative
+  // line exceeds its small file line). That crashed the runtime source-map parser on import
+  // (debug) / corrupted the map (release). Needs a fixture so the class is at a low line.
+  test("a captured instance defined at the top of its file imports without a source-map crash", async () => {
+    using dir = tempDir(`closure-smtop-${counter++}`, {
+      "gen.mjs": [
+        `import { serialize } from "bun:closure";`,
+        `import { writeFileSync } from "node:fs";`,
+        `class C { #a = 1; #b = 2; #c = 3; sum() { return this.#a + this.#b + this.#c; } }`,
+        `const inst = new C();`,
+        `writeFileSync(new URL("./mod.mjs", import.meta.url), serialize(() => inst));`,
+        `const out = (await import("./mod.mjs")).default();`,
+        `console.log("sum=" + out.sum());`,
+      ].join("\n"),
+    });
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), `${String(dir)}/gen.mjs`],
+      env: bunEnv,
+      cwd: String(dir),
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect(stdout.trim()).toBe("sum=6");
+    expect(stderr).not.toContain("panic");
+    expect(exitCode).toBe(0);
+  });
+
   // Regression (found by adversarial probing): a class DEFINED INSIDE the serialized
   // function (not a captured top-level class) is verbatim valid source — its `#x` must stay
   // a genuine private, never get mangled to a public `$bunClosurePrivate$x`. The private
