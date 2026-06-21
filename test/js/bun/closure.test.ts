@@ -4294,16 +4294,43 @@ describe("genuine #private reification", () => {
     expect(out()).toBe(true); // `#x in this` is true on the reified genuine instance
   });
 
-  test("an escaped arrow capturing more than `this` (an outer variable) is rejected", () => {
+  // The arrow's non-`this` captures are threaded as host-method parameters, so an escaped
+  // arrow that also closes over outer variables (including inside a template literal, which
+  // ast() exposes opaquely) still hosts genuinely.
+  test("an escaped arrow capturing outer variables is hosted with threaded parameters", async () => {
     class C {
       #x = 1;
-      make(offset: number) {
-        return () => this.#x + offset; // captures `offset` too — not hostable yet
+      make(offset: number, label: string) {
+        return () => `${label}:${this.#x + offset}`;
       }
     }
-    const f = new C().make(10);
+    const f = new C().make(10, "tag");
     void f;
-    expect(() => serialize(() => f)).toThrow(/lexical `this`/);
+
+    const code = serialize(() => f);
+    expect(code).not.toContain("$bunClosurePrivate$");
+    expect(code).toMatch(/__bunClosureHost\$0\([^)]+\)/); // host method has parameters
+    const out = (await roundtrip(() => f))();
+    expect(out()).toBe("tag:11"); // label + (genuine #x + offset)
+  });
+
+  // A threaded capture that is an object keeps its identity (it's emitted once and shared),
+  // so mutating it through the outer graph is visible to the hosted arrow.
+  test("a hosted arrow's threaded object capture preserves shared identity", async () => {
+    class C {
+      #x = 5;
+      make(box: { n: number }) {
+        return () => this.#x + box.n;
+      }
+    }
+    const box = { n: 100 };
+    const f = new C().make(box);
+    void [f, box];
+
+    const out = (await roundtrip(() => ({ f, box })))();
+    expect(out.f()).toBe(105);
+    out.box.n = 200; // mutate the shared object through the outer graph
+    expect(out.f()).toBe(205); // the hosted arrow sees it — same object, not a snapshot
   });
 
   test("capturing the private value first also round-trips (no hosting needed)", async () => {

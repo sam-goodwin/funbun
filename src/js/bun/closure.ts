@@ -102,13 +102,18 @@ interface Context {
   // instead of being rebuilt standalone (where `this.#x` would have to be mangled).
   genuineMethods: Map<Function, { classFn: Function; key: string | symbol; kind: "method" | "get" | "set" }>;
   // Escaped arrows that read a `#private` through their lexical `this` and ARE hostable
-  // (their `this` is an instance of a genuine class, and they capture nothing but `this`/
-  // brands). Each maps to the recovered receiver instance, its class, and the synthetic
-  // host-method key injected into that class. emitFunction reconstructs the arrow as
-  // `<instance>.<hostKey>()`.
-  hostedArrows: Map<Function, { instance: object; classFn: Function; hostKey: string }>;
-  // Per genuine class, the host methods to inject into its body: `<hostKey>(){ return (<arrow source>); }`.
-  classHosts: Map<Function, Array<{ hostKey: string; source: string }>>;
+  // (their `this` is an instance of a genuine class declaring the read privates). Each maps
+  // to the recovered receiver instance, its class, the synthetic host-method key injected
+  // into that class, and the VALUES of the arrow's non-`this` captures (threaded as host
+  // arguments). emitFunction reconstructs the arrow as `<instance>.<hostKey>(<args>)`.
+  hostedArrows: Map<
+    Function,
+    { instance: object; classFn: Function; hostKey: string; args: Array<{ name: string; value: unknown }> }
+  >;
+  // Per genuine class, the host methods to inject into its body, each as
+  // `<hostKey>(<params>){ return (<arrow source>); }` — params are the arrow's non-`this`
+  // captured variable names (resolved to the call-time arguments).
+  classHosts: Map<Function, Array<{ hostKey: string; source: string; params: string[] }>>;
   // For a genuine-private class actually emitted: the reify factory name + the private
   // field names its injected constructor branch installs. Consumed when emitting an
   // instance so it flows through the factory.
@@ -580,16 +585,13 @@ function parseFunctionNode(source: string): any | null {
   return parseWithOffset(source)?.node ?? null;
 }
 
-// True if `node` (parsed from MANGLED source — `#x` outside a class body is a syntax
-// error, so only the post-rewrite form parses) is an arrow function that reads a private
-// through its lexical `this`: `this.<mangled>` or `"<mangled>" in this`. Such an arrow
-// cannot be reconstructed — its `this` (the receiving instance) is baked in lexically and
-// is NOT recoverable (Symbol.freeVariables exposes only the private-name brand, not the
-// instance). Reconstructed standalone it reads a private off an unbound `this` and crashes,
-// so we reject it instead of emitting silently-broken output. Hosting it in the generated
-// class body (the genuine fix) needs a native primitive to expose the arrow's lexical
-// `this`, which does not exist yet.
-function arrowReadsLexicalThisPrivate(node: any): boolean {
+// True if `mangledSource` (the post-`#x`-rewrite form — `#x` outside a class body is a
+// syntax error to parse standalone) is an arrow function that reads a private through its
+// lexical `this`: `this.<mangled>` or `"<mangled>" in this`. Such an arrow is reconstructed
+// by hosting (its receiver is recovered natively); if it can't be hosted it's rejected
+// rather than emitted as a private read off an unbound `this`.
+function arrowReadsLexicalThisPrivate(mangledSource: string): boolean {
+  const node = parseFunctionNode(mangledSource);
   if (node?.type !== "ArrowFunctionExpression") return false;
   const isMangled = (s: unknown): boolean => typeof s === "string" && s.startsWith(PRIVATE_PREFIX);
   // The arrow's lexical `this` resolves to module scope when parsed standalone, which the
@@ -629,7 +631,11 @@ function arrowReadsLexicalThisPrivate(node: any): boolean {
     }
   };
   walk(node.body);
-  return found;
+  if (found) return true;
+  // Textual fallback for forms ast() exposes as opaque `Unsupported` nodes (e.g. template
+  // literals): a mangled private read off `this` (the source string keeps the literal
+  // `this`, unlike the parsed AST). Only reached for arrows, so the receiver is lexical.
+  return new RegExp(`\\bthis\\s*\\.\\s*${PRIVATE_PREFIX.replace(/\$/g, "\\$")}`).test(mangledSource);
 }
 
 // Module-level slot a genuine-private class's constructor reads to install captured
@@ -824,7 +830,9 @@ function computeGenuineClasses(root: unknown): GenuinePlan {
 
   // Assign hosting: an escaped arrow is hosted only when its receiver's DIRECT class is
   // genuine and declares every private the arrow reads (so `this.#x` is legal in that
-  // class's body and the receiver carries the brand). Each gets a unique host-method key.
+  // class's body and the receiver carries the brand). The arrow's non-`this` captures are
+  // threaded as host-method parameters (passed the captured values at the call site). Each
+  // gets a unique host-method key.
   const hostedArrows: GenuinePlan["hostedArrows"] = new Map();
   const classHosts: GenuinePlan["classHosts"] = new Map();
   const hostCount = new Map<Function, number>();
@@ -832,24 +840,30 @@ function computeGenuineClasses(root: unknown): GenuinePlan {
     const proto = Object.getPrototypeOf(instance);
     const classFn = (proto as any)?.constructor;
     if (typeof classFn !== "function" || classFn.prototype !== proto || !candidate.has(classFn)) continue;
-    const reads = (((arrow as any)[Symbol.freeVariables] as FreeVariable[] | undefined) ?? [])
-      .filter(v => v.name.startsWith("#"))
-      .map(v => v.name);
+    const fv = ((arrow as any)[Symbol.freeVariables] as FreeVariable[] | undefined) ?? [];
+    const reads = fv.filter(v => v.name.startsWith("#")).map(v => v.name);
     const fields = structOf(classFn)?.fields ?? [];
     if (!reads.every(name => fields.includes(name))) continue;
+    // Non-`#brand` captures become host parameters threaded the captured value.
+    const captures = fv.filter(v => !v.name.startsWith("#"));
     const n = hostCount.get(classFn) ?? 0;
     hostCount.set(classFn, n + 1);
     const hostKey = `__bunClosureHost$${n}`;
-    hostedArrows.set(arrow, { instance, classFn, hostKey });
+    hostedArrows.set(arrow, {
+      instance,
+      classFn,
+      hostKey,
+      args: captures.map(v => ({ name: v.name, value: v.value })),
+    });
     let hosts = classHosts.get(classFn);
     if (hosts === undefined) classHosts.set(classFn, (hosts = []));
-    hosts.push({ hostKey, source: arrow.toString() });
+    hosts.push({ hostKey, source: arrow.toString(), params: captures.map(v => v.name) });
   }
   return { genuine: candidate, hostedArrows, classHosts };
 }
 
-// True if `fn` is an arrow that reads a `#private` through its lexical `this` AND captures
-// nothing but `this`/brands (so its host method needs no parameters) — the hostable shape.
+// True if `fn` is an arrow that reads a `#private` through its lexical `this` (its non-`this`
+// captures are threaded as host-method parameters, so any number of them is fine).
 function hostableEscapedArrow(fn: Function): boolean {
   let src: string;
   try {
@@ -858,9 +872,7 @@ function hostableEscapedArrow(fn: Function): boolean {
     return false;
   }
   if (!src.includes("#")) return false;
-  if (!arrowReadsLexicalThisPrivate(parseFunctionNode(rewritePrivateMembers(src)))) return false;
-  const fv = (fn as any)[Symbol.freeVariables] as FreeVariable[] | undefined;
-  return (fv ?? []).every(v => v.name.startsWith("#"));
+  return arrowReadsLexicalThisPrivate(rewritePrivateMembers(src));
 }
 
 // Index the prototype methods/accessors of every genuine class by function identity, so a
@@ -1313,7 +1325,7 @@ function reconstructFunctionExpr(fn: Function, ctx: Context): ReconstructedFunct
   let genuinePrivate: { fields: string[] } | undefined;
   const gpInfo = ctx.genuineClasses.has(fn) ? classStructure(original) : null;
   if (gpInfo !== null) {
-    const hosts = (ctx.classHosts.get(fn) ?? []).map(h => `${h.hostKey}(){return (${h.source});}`);
+    const hosts = (ctx.classHosts.get(fn) ?? []).map(h => `${h.hostKey}(${h.params.join(",")}){return (${h.source});}`);
     source = injectReifyConstructor(original, gpInfo, hosts);
     genuinePrivate = { fields: gpInfo.fields };
     ctx.needsReifySlot = true;
@@ -1329,11 +1341,7 @@ function reconstructFunctionExpr(fn: Function, ctx: Context): ReconstructedFunct
     // wasn't hosted (its `this` class isn't genuine-reconstructable, or it captures more
     // than `this`/brands), it cannot be reconstructed — reject it instead of emitting
     // silently-broken output.
-    if (
-      source.includes(PRIVATE_PREFIX) &&
-      !ctx.hostedArrows.has(fn) &&
-      arrowReadsLexicalThisPrivate(parseFunctionNode(source))
-    ) {
+    if (source.includes(PRIVATE_PREFIX) && !ctx.hostedArrows.has(fn) && arrowReadsLexicalThisPrivate(source)) {
       throw new TypeError(
         "Cannot serialize an arrow function that reads a #private field through its lexical `this`: " +
           "the receiving instance cannot be recovered. Capture the value first, e.g. " +
@@ -2174,7 +2182,8 @@ function emitFunction(fn: Function, ctx: Context): string {
   const hosted = ctx.hostedArrows.get(fn);
   if (hosted !== undefined) {
     const instanceExpr = emitValue(hosted.instance, ctx);
-    ctx.module.push(`const ${name} = ${instanceExpr}.${hosted.hostKey}();`);
+    const argExprs = hosted.args.map(a => emitValue(transform(undefined, a.name, a.value, ctx), ctx));
+    ctx.module.push(`const ${name} = ${instanceExpr}.${hosted.hostKey}(${argExprs.join(", ")});`);
     return name;
   }
 
