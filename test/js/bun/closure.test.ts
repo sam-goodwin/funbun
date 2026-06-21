@@ -1530,6 +1530,30 @@ describe("access-path pruning", () => {
     expect(fn()).toBe(11);
   });
 
+  // We can't statically prove which key a parameter lookup will use, so the WHOLE object
+  // must be kept — every entry has to survive, not just one observed at serialize time.
+  test("a parameter-keyed lookup keeps every entry of the object", async () => {
+    const obj = { foo: () => "foo", bar: () => "bar", baz: () => "baz" };
+    const code = serialize((key: keyof typeof obj) => obj[key]?.());
+    // No pruning: all three entries are present in the output.
+    expect(code).toContain("foo");
+    expect(code).toContain("bar");
+    expect(code).toContain("baz");
+    const fn = await roundtrip((key: keyof typeof obj) => obj[key]?.());
+    expect(fn("foo")).toBe("foo");
+    expect(fn("bar")).toBe("bar");
+    expect(fn("baz")).toBe("baz"); // baz survived even though no static access proved it
+    expect(fn("nope" as any)).toBeUndefined();
+  });
+
+  test("a static access alongside a dynamic one on the same object keeps everything", async () => {
+    const obj = { a: () => 1, b: () => 2, c: () => 3 };
+    // `obj.a` is a static access; `obj[k]` is dynamic — the dynamic one widens to keep all.
+    const fn = await roundtrip((k: keyof typeof obj) => obj.a() + (obj[k]?.() ?? 0));
+    expect(fn("b")).toBe(3); // a() + b()
+    expect(fn("c")).toBe(4); // a() + c()
+  });
+
   test("unions the members referenced across multiple closures sharing an object", async () => {
     const shared = { x: 1, y: 2, z: 3 };
     const read = () => shared.x + shared.y;
