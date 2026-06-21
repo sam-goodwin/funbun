@@ -3906,6 +3906,70 @@ describe("interactions: private fields + other features", () => {
 // rather than mangled into a public field. The reachability gate routes the
 // closed-world cases to mangling so everything still round-trips.
 describe("genuine #private reification", () => {
+  // Regression (found by adversarial probing): a class DEFINED INSIDE the serialized
+  // function (not a captured top-level class) is verbatim valid source — its `#x` must stay
+  // a genuine private, never get mangled to a public `$bunClosurePrivate$x`. The private
+  // rewrite only applies to the OUTERMOST class being reconstructed via the mangle fallback.
+  test("a class defined inside the serialized function keeps genuine privates", async () => {
+    const code = serialize(() => {
+      class C {
+        #x = 11;
+        raw() {
+          return this.#x;
+        }
+      }
+      return new C();
+    });
+    expect(code).not.toContain("$bunClosurePrivate$"); // not mangled
+
+    const make = await roundtrip(() => {
+      class C {
+        #x = 11;
+        raw() {
+          return this.#x;
+        }
+      }
+      return new C();
+    });
+    const inst = make();
+    expect(inst.raw()).toBe(11);
+    expect(Object.keys(inst)).toEqual([]); // genuinely private — no public key leaked
+    expect((inst as any).$bunClosurePrivate$x).toBeUndefined();
+  });
+
+  test("a factory function returning instances of an inner class keeps privacy", async () => {
+    const factory = await roundtrip((v: number) => {
+      class Box {
+        #v: number;
+        constructor(v: number) {
+          this.#v = v;
+        }
+        get() {
+          return this.#v;
+        }
+      }
+      return new Box(v);
+    });
+    expect(factory(42).get()).toBe(42);
+    expect(factory(7).get()).toBe(7); // a fresh genuine instance each call
+    expect(Object.keys(factory(1))).toEqual([]);
+  });
+
+  // The genuine private's brand check is real: reading `#x` through a Proxy (whose receiver
+  // is the proxy, not the branded instance) must throw — exactly as it does pre-serialize.
+  test("a Proxy over an inner-class instance preserves the genuine brand check", async () => {
+    const out = await roundtrip(() => {
+      class C {
+        #x = 5;
+        raw() {
+          return this.#x;
+        }
+      }
+      return new Proxy(new C(), {});
+    });
+    expect(() => (out() as any).raw()).toThrow(TypeError); // brand check fails on the proxy
+  });
+
   test("a single-class instance reifies with true privacy (no mangled public field)", async () => {
     class Account {
       #balance = 100;

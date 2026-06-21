@@ -2593,21 +2593,30 @@ function rewritePrivateMembers(source: string): string {
       const mangled = mangledPrivateName(pid.name);
       edits.push({ start, end, text: quoted ? JSON.stringify(mangled) : mangled });
     };
-    (function walk(node: any): void {
+    // Only mangle privates whose nearest enclosing class IS the top-level node being
+    // reconstructed (a mangle-fallback class). A class NESTED inside the reconstructed
+    // source — e.g. `() => { class C { #x } return new C(); }`, or a class defined in an
+    // extracted method — is valid verbatim source whose `#x` must stay a genuine private.
+    const top = parsed.node;
+    (function walk(node: any, enclosingClass: any): void {
       if ($isJSArray(node)) {
-        for (const x of node) walk(x);
+        for (const x of node) walk(x, enclosingClass);
         return;
       }
       if (!node || typeof node !== "object") return;
-      if (node.type === "BinaryExpression" && node.operator === "in" && node.left?.type === "PrivateIdentifier") {
-        pushPid(node.left, true);
-        if (typeof node.left.start === "number") handled.add(node.left.start);
+      const isClass = node.type === "ClassExpression" || node.type === "ClassDeclaration";
+      const next = isClass ? node : enclosingClass;
+      if (enclosingClass === top) {
+        if (node.type === "BinaryExpression" && node.operator === "in" && node.left?.type === "PrivateIdentifier") {
+          pushPid(node.left, true);
+          if (typeof node.left.start === "number") handled.add(node.left.start);
+        }
+        if (node.type === "PrivateIdentifier" && typeof node.start === "number" && !handled.has(node.start)) {
+          pushPid(node, false);
+        }
       }
-      if (node.type === "PrivateIdentifier" && typeof node.start === "number" && !handled.has(node.start)) {
-        pushPid(node, false);
-      }
-      for (const k of Object.keys(node)) if (k !== "type") walk(node[k]);
-    })(parsed.node);
+      for (const k of Object.keys(node)) if (k !== "type") walk(node[k], next);
+    })(top, top.type === "ClassExpression" || top.type === "ClassDeclaration" ? top : null);
     if (edits.length === 0) return source;
     // Apply right-to-left so earlier edits don't shift later positions.
     edits.sort((a, b) => b.start - a.start);
