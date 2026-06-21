@@ -493,38 +493,56 @@ function accessChild(node: AccessNode, prop: string): AccessNode {
   return c;
 }
 
+// Extract the function/class node from a parsed program, or null.
+function extractCallableNode(prog: any): any | null {
+  const body = prog?.body;
+  if (!$isJSArray(body) || body.length === 0) return null;
+  const first = body[0];
+  if (first.type === "FunctionDeclaration" || first.type === "ClassDeclaration") return first;
+  if (first.type === "ExpressionStatement") {
+    const e = first.expression;
+    if (
+      e &&
+      (e.type === "ArrowFunctionExpression" || e.type === "FunctionExpression" || e.type === "ClassExpression")
+    ) {
+      return e;
+    }
+    // method shorthand: `m(){}`, `get x(){}`, `async *m(){}`, `[sym](){}`
+    if (e && e.type === "ObjectExpression" && e.properties?.length) {
+      const p = e.properties[0];
+      if (p && p.value) return p.value;
+    }
+  }
+  return null;
+}
+
 // Parse a function's source (in any form `Function.prototype.toString` yields)
-// and return its AST node, or null if it can't be parsed.
-function parseFunctionNode(source: string): any | null {
+// and return its AST node plus the column `offset` of `source` within the code
+// that actually parsed — each wrapper shifts node positions by its prefix length,
+// so a node at AST position P sits at `source` position `P - offset`.
+function parseWithOffset(source: string): { node: any; offset: number } | null {
   const t = getTranspiler();
-  const tryParse = (code: string): any | null => {
+  const attempts: ReadonlyArray<readonly [string, number]> = [
+    ["(" + source + ")", 1],
+    [source, 0],
+    ["({" + source + "})", 2],
+  ];
+  for (const [code, offset] of attempts) {
     let prog: any;
     try {
       prog = t.ast(code);
     } catch {
-      return null;
+      continue;
     }
-    const body = prog?.body;
-    if (!$isJSArray(body) || body.length === 0) return null;
-    const first = body[0];
-    if (first.type === "FunctionDeclaration" || first.type === "ClassDeclaration") return first;
-    if (first.type === "ExpressionStatement") {
-      const e = first.expression;
-      if (
-        e &&
-        (e.type === "ArrowFunctionExpression" || e.type === "FunctionExpression" || e.type === "ClassExpression")
-      ) {
-        return e;
-      }
-      // method shorthand: `m(){}`, `get x(){}`, `async *m(){}`, `[sym](){}`
-      if (e && e.type === "ObjectExpression" && e.properties?.length) {
-        const p = e.properties[0];
-        if (p && p.value) return p.value;
-      }
-    }
-    return null;
-  };
-  return tryParse("(" + source + ")") ?? tryParse(source) ?? tryParse("({" + source + "})");
+    const node = extractCallableNode(prog);
+    if (node !== null) return { node, offset };
+  }
+  return null;
+}
+
+// Parse a function's source and return its AST node, or null if it can't parse.
+function parseFunctionNode(source: string): any | null {
+  return parseWithOffset(source)?.node ?? null;
 }
 
 // Walk a function AST and record how each `rootNames` identifier (free variable
@@ -982,25 +1000,39 @@ function collectMemberFreeVariables(holder: object, classFn: Function, byId: Map
 // identifier bound to the captured superclass value. The superclass identity is
 // the class's own prototype, reliable even though it isn't a free variable.
 function classHeritage(fn: Function, source: string, ctx: Context): { source: string; binding: string } | undefined {
-  const trimmed = source.trimStart();
-  if (!trimmed.startsWith("class")) return undefined;
+  if (!source.trimStart().startsWith("class")) return undefined;
   const superclass = Object.getPrototypeOf(fn);
   if (typeof superclass !== "function" || superclass === Function.prototype) return undefined;
 
-  const simple = trimmed.match(/^class\s+(?:[A-Za-z_$][\w$]*\s+)?extends\s+([A-Za-z_$][\w$]*)\s*\{/);
-  if (simple !== null) {
-    return { source, binding: `const ${simple[1]} = ${emitValue(superclass, ctx)};` };
+  const parsed = parseWithOffset(source);
+  const node = parsed?.node;
+  if (node === undefined || (node.type !== "ClassDeclaration" && node.type !== "ClassExpression") || !node.superClass) {
+    return undefined; // no class / no extends clause we can locate
+  }
+  const sc = node.superClass;
+
+  // `extends Identifier`: the heritage is a single name that resolves in scope;
+  // bind it, no source edit needed.
+  if (sc.type === "Identifier" && typeof sc.name === "string") {
+    return { source, binding: `const ${sc.name} = ${emitValue(superclass, ctx)};` };
   }
 
-  const span = findHeritageSpan(source);
-  if (span === undefined) return undefined; // no extends clause we can locate
+  // Computed heritage (`extends mixin(Base)`, `extends ns.Base`): replace the
+  // heritage expression with a synthetic identifier bound to the captured value.
+  // The AST gives the heritage's start; its end is the class body `{` (the AST
+  // node positions are offset by the parse wrapper), trimmed back over whitespace.
+  const start = sc.start - parsed!.offset;
+  const brace = node.body?.start === undefined ? -1 : node.body.start - parsed!.offset;
+  if (start < 0 || brace <= start || brace > source.length) return undefined;
+  let end = brace;
+  while (end > start && /\s/.test(source[end - 1]!)) end--;
   const superName = `__bunSuper$${ctx.counter++}`;
   // Preserve the heritage's line span so generated line numbers (and thus the
   // source map) don't shift.
-  const newlines = source.slice(span.start, span.end).split("\n").length - 1;
+  const newlines = source.slice(start, end).split("\n").length - 1;
   const replacement = superName + "\n".repeat(newlines);
   return {
-    source: source.slice(0, span.start) + replacement + source.slice(span.end),
+    source: source.slice(0, start) + replacement + source.slice(end),
     binding: `const ${superName} = ${emitValue(superclass, ctx)};`,
   };
 }
@@ -1097,71 +1129,6 @@ function fieldInitializerBindings(fn: Function, source: string, boundNames: Set<
     bindings.push(`const ${name} = ${emitValue(value, ctx)};`);
   }
   return bindings;
-}
-
-// Locates the heritage expression in a class header — the span between `extends`
-// and the class body `{` — handling call/member/parenthesized expressions by
-// tracking ()/[] depth and skipping strings and comments.
-function findHeritageSpan(source: string): { start: number; end: number } | undefined {
-  const n = source.length;
-  let depth = 0;
-  let heritageStart = -1;
-  for (let i = 0; i < n; ) {
-    const c = source[i];
-    if (c === "/" && source[i + 1] === "/") {
-      i += 2;
-      while (i < n && source[i] !== "\n") i++;
-      continue;
-    }
-    if (c === "/" && source[i + 1] === "*") {
-      i += 2;
-      while (i < n && !(source[i] === "*" && source[i + 1] === "/")) i++;
-      i += 2;
-      continue;
-    }
-    if (c === '"' || c === "'") {
-      i++;
-      while (i < n && source[i] !== c) i += source[i] === "\\" ? 2 : 1;
-      i++;
-      continue;
-    }
-    if (c === "`") {
-      i++;
-      while (i < n && source[i] !== "`") i += source[i] === "\\" ? 2 : 1;
-      i++;
-      continue;
-    }
-    if (c === "(" || c === "[") {
-      depth++;
-      i++;
-      continue;
-    }
-    if (c === ")" || c === "]") {
-      depth--;
-      i++;
-      continue;
-    }
-    if (c === "{" && depth === 0) {
-      if (heritageStart === -1) return undefined;
-      let end = i;
-      while (end > heritageStart && /\s/.test(source[end - 1]!)) end--;
-      return { start: heritageStart, end };
-    }
-    if (
-      depth === 0 &&
-      heritageStart === -1 &&
-      source.startsWith("extends", i) &&
-      !/[\w$]/.test(source[i - 1] ?? "") &&
-      !/[\w$]/.test(source[i + 7] ?? "")
-    ) {
-      i += 7;
-      while (i < n && /\s/.test(source[i]!)) i++;
-      heritageStart = i;
-      continue;
-    }
-    i++;
-  }
-  return undefined;
 }
 
 // Applies the replacer (if any) to a value before it is serialized. `holder` is
