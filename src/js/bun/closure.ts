@@ -746,6 +746,10 @@ interface GenuinePlan {
   classHosts: Map<Function, Array<{ hostKey: string; source: string }>>;
 }
 function computeGenuineClasses(root: unknown): GenuinePlan {
+  // Cells shared across 2+ functions are hoisted to module scope by name; a hosted arrow
+  // must reference such a cell by name (NOT thread it as a snapshot parameter) to keep
+  // mutations shared.
+  const sharedIds = typeof root === "function" ? analyzeSharedCells(root).sharedIds : new Set<number>();
   const funcs = new Set<Function>();
   const objs = new Set<object>();
   const seen = new Set<unknown>();
@@ -867,8 +871,10 @@ function computeGenuineClasses(root: unknown): GenuinePlan {
     const reads = fv.filter(v => v.name.startsWith("#")).map(v => v.name);
     const fields = structOf(classFn)?.fields ?? [];
     if (!reads.every(name => fields.includes(name))) continue;
-    // Non-`#brand` captures become host parameters threaded the captured value.
-    const captures = fv.filter(v => !v.name.startsWith("#"));
+    // Non-`#brand` captures become host parameters threaded the captured value — EXCEPT
+    // shared cells, which are hoisted to module scope and resolved by name inside the host
+    // method (threading them would snapshot, breaking mutation sharing).
+    const captures = fv.filter(v => !v.name.startsWith("#") && !sharedIds.has(v.id));
     const n = hostCount.get(classFn) ?? 0;
     hostCount.set(classFn, n + 1);
     const hostKey = `__bunClosureHost$${n}`;

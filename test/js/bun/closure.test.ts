@@ -4687,6 +4687,24 @@ describe("genuine #private: general permutations", () => {
     expect(r.fn.call({ y: 42 })).toBe(42); // dynamic this preserved
   });
 
+  test("a hosted arrow sharing a mutable cell with another closure keeps it shared", async () => {
+    let counter = 10;
+    const inc = () => ++counter;
+    class C {
+      #x = 5;
+      read() {
+        return () => this.#x + counter; // escaped arrow captures #x AND the shared `counter`
+      }
+    }
+    const read = new C().read();
+    void [inc, read];
+
+    const out = (await roundtrip(() => ({ inc, read })))();
+    expect(out.read()).toBe(15);
+    out.inc(); // mutate the shared cell through the other closure
+    expect(out.read()).toBe(16); // the hosted arrow sees it — shared, not a snapshot
+  });
+
   test("a private field holding a container of other genuine instances round-trips", async () => {
     class Leaf {
       #v: number;
