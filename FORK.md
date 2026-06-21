@@ -187,9 +187,10 @@ re-bound to that state.
 9. **Source maps.** Each reconstructed function's verbatim source is tracked to
    its generated-line range and mapped back to its original file
    (`Symbol.sourceLocation`); an inline v3 source map (VLQ, line-granularity) is
-   appended covering every contributing file. **Caveat:** Bun itself does not
-   currently *apply* a loaded file's own source map to stack traces (see §6), so
-   these maps presently help external tools, not Bun's own error formatting.
+   appended covering every contributing file. Bun now *chains* this map at
+   runtime (§6), so a frame inside a reconstructed function — and
+   `Symbol.sourceLocation` of it — resolves to the original source, not the
+   reconstructed module.
 
 ### What round-trips (tested)
 
@@ -299,60 +300,61 @@ Other notes:
   with *no* global path (a true engine-internal) still errors.
 - **AsyncLocalStorage** context restoration applies to plain/async function roots
   only (§3.1).
-- **Source-map application** (§6).
 - **String-based transforms are regex/scanner-driven** — fragile at the edges;
   the main motivation for the AST direction in §7.
 
 ---
 
-## 6. Out of scope (found, not fixed): Bun ignores loaded files' source maps
+## 6. Landed: chaining a loaded module's own source map
 
-While testing source maps we found that **Bun does not apply a loaded file's own
-source map** — neither an external `.js.map` nor an inline
-`//# sourceMappingURL=data:` — to stack traces. Running a `.ts` directly works
-(Bun's internal transpile maps), but loading a pre-built `.js`/`.mjs` shows the
-generated position, unmapped. This means a reconstructed closure's own frame
-(e.g. a `throw` inside the reified function) resolves to the **reconstructed
-module**, not the original source — verified by the characterization test
-`thrown error's own frame currently resolves to the reconstructed module` in
-`test/js/bun/closure.test.ts`. The serializer's *emitted* map is correct (proven
-by the decode-verified suite in the same file); the gap is purely in runtime
-application.
+Originally this fork did **not** apply a loaded file's own source map: a frame
+inside a reconstructed closure (a `throw` in the reified function) resolved to
+the **reconstructed module**, not the original source. That gap is now closed —
+stack traces and `Symbol.sourceLocation` survive serialization.
 
-**Root cause (traced, three layers):**
+**How Bun already handled maps.** Bun reprints *every* loaded module and stores a
+generated→thisFile map keyed by path (`put_mappings`); stack resolution and
+`Symbol.sourceLocation` both funnel through `resolve_mapping`. This is why a `.ts`
+run directly shows `.ts` positions — the AST nodes carry their original `.ts`
+offsets, so the generated map points there. For a plain `.js`/`.mjs` the map is
+identity, and the file's *own* `//# sourceMappingURL=` (pointing somewhere else)
+was parsed into `lexer.source_mapping_url` and then dropped.
 
-1. **The transpiler discards the inline comment on reprint.** The lexer parses
-   `//# sourceMappingURL=…` into `lexer.source_mapping_url`
-   (`src/js_parser/lexer.rs:266`), but the printer reprints the AST and does not
-   re-emit the pragma, so by the time `SourceProvider::create` sees the loaded
-   module its source carries no `sourceMappingURL=` comment to detect.
+**The fix — chain at resolve** (commits in §10):
 
-2. **Provider registration is gated on `already_bundled`.** In
-   `src/jsc/bindings/ZigSourceProvider.cpp`, `Bun__addSourceProviderSourceMap`
-   is only called when `resolvedSource.already_bundled` (true only for
-   `bun build --target=bun` output / the bake dev-server provider). A plainly
-   `import()`ed `.mjs` is never registered, so `get_source_map_impl` is never
-   reached for it. (Confirmed empirically: a debug print in
-   `add_source_provider_source_map` fires for `[eval]`'s transpile map but never
-   for the loaded `mod.mjs`.)
+1. **Carry the pragma to the AST** (`Ast.source_mapping_url`, populated in
+   `to_ast`). The lexer already scans line-comment pragmas via
+   `scan_single_line_comment`.
+2. **Store the input map** at transpile, keyed by the same source path as the
+   generated map (both the sync `jsc_hooks` and async `RuntimeTranspilerStore`
+   paths, including their **cache-hit** branches — re-scanned from the raw source
+   there). Inline `data:` maps are decoded eagerly; an external `.map` reference
+   is resolved to a path and read **lazily** on the first symbolication.
+3. **Chain in `resolve_mapping`**: after the base lookup (generated→thisFile),
+   look the result up in the stored input map (thisFile→original) via the same
+   column-accurate `find_mapping`, returning the chained mapping with the input
+   map as the source — so `display_source_url_if_needed` renames the frame. One
+   chokepoint, so stack traces *and* `Symbol.sourceLocation` (its
+   `Bun__resolveSourceMapPosition` now also returns the remapped filename) both
+   chain.
 
-3. **`parse_url` rejects the most common inline form.** Even on the bundled path,
-   `src/sourcemap/lib.rs`'s `parse_url` only matched
-   `data:application/json;base64,` / `data:application/json,` — it returned
-   `UnsupportedFormat` for `data:application/json;charset=utf-8;base64,`, which is
-   what bun:closure and most tools (tsc/webpack/rollup) emit, because it compared
-   the whole header `charset=utf-8;base64` against `"base64"` instead of scanning
-   `;`-separated segments. (Bun's *own* bundler emits without `charset`, so this
-   bug is masked on the already_bundled path.)
+Two general parser fixes fell out, each independently correct and tested:
 
-A real fix would re-emit/chain the input map through the transpile and register
-the provider for any module whose source (or parsed pragma) carries a map — i.e.
-ungate registration from `already_bundled` *and* fix the `charset` segment scan.
-Prototype patches for layers 2 and 3 were written and verified to be individually
-correct, but proved **insufficient in isolation** (layer 1 strips the comment
-before either runs) and were reverted rather than shipped as dead code. The store
-is `src/jsc/SavedSourceMap.rs`; transpiled files register via `put_mappings`.
-This remains a core-runtime fix, deliberately left out of this fork's scope.
+- **`parse_url`** rejected `data:application/json;charset=utf-8;base64,` (what
+  tsc/esbuild/webpack/bun:closure emit) because it compared the whole header
+  against `"base64"` instead of scanning `;`-separated segments.
+- **`parse_json`** *required* `sourcesContent` and that its length equal
+  `sources`, rejecting spec-valid maps that omit it (tsc, the closure serializer).
+  `sourcesContent` is now optional per the v3 spec.
+
+Verified by `test/js/bun/sourcemap/runtime-inline-sourcemap.test.ts` (charset /
+plain / no-`sourcesContent`, all fail on `USE_SYSTEM_BUN`) and the chaining tests
+in `closure.test.ts` (inline stack frame, `Symbol.sourceLocation` url+line,
+node_modules external `.js.map`).
+
+Note: external `.map` loading is currently ungated (Bun maps by default) and only
+touches disk on symbolication; when a `--enable-source-map` CLI flag lands it
+should gate that disk read.
 
 ---
 
