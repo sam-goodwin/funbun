@@ -404,7 +404,17 @@ test("emits an inline source map", () => {
   expect(code).toContain("//# sourceMappingURL=data:application/json");
 });
 
-test("source map remaps a thrown error to the original file", async () => {
+// Characterization (current behavior, not aspiration): the serializer emits a
+// correct inline source map (verified by the decode tests below), but Bun's
+// runtime does NOT apply an inline `//# sourceMappingURL=data:` map from a
+// dynamically-imported module to stack traces. The transpiler parses the
+// pragma into `lexer.source_mapping_url` and discards it when reprinting the
+// AST, and SourceProvider source-map registration is gated on `already_bundled`
+// (ZigSourceProvider.cpp), which is false for a plainly-loaded .mjs. So a frame
+// inside the reconstructed function resolves to the reconstructed module, NOT
+// the original source. If that gap is ever closed, this test will start failing
+// on the `toContain("mod")` line and should be tightened to assert the original.
+test("thrown error's own frame currently resolves to the reconstructed module (runtime does not apply inline maps)", async () => {
   function boom() {
     throw new Error("kaboom");
   }
@@ -418,7 +428,180 @@ test("source map remaps a thrown error to the original file", async () => {
     caught = e;
   }
   expect(caught?.message).toBe("kaboom");
-  expect(caught?.stack).toContain("closure.test");
+  // The boom frame (first stack line after the message) names the reconstructed
+  // module, proving the inline map was NOT applied. We intentionally assert the
+  // current limitation rather than the call-site frame (which would pass
+  // vacuously regardless of remapping).
+  const boomFrame = caught.stack.split("\n").find((l: string) => l.includes("at boom"));
+  expect(boomFrame).toBeDefined();
+  expect(boomFrame).toContain("mod.mjs");
+  expect(boomFrame).not.toContain("closure.test");
+});
+
+// ---------------------------------------------------------------------------
+// Source maps: the serializer owns the *emitted* inline v3 map. These tests
+// decode that map (independent of Bun's runtime source-map application, which
+// the characterization test above shows does not consume it) and assert it
+// points generated lines back at the correct original (source, line). Column
+// info is coarse by design (buildSourceMap maps at line granularity, column 0),
+// so we only verify file + line fidelity.
+// ---------------------------------------------------------------------------
+describe("source maps: emitted inline map is decode-correct", () => {
+  const B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  const B64INV: Record<string, number> = {};
+  for (let i = 0; i < B64.length; i++) B64INV[B64[i]] = i;
+
+  // Decode a v3 `mappings` string into per-generated-line segments. Each segment
+  // is { genLine, genCol, srcIdx, srcLine } (all 0-based). srcIdx/srcLine are
+  // cumulative across the whole string per the v3 spec; genCol resets per line.
+  function decodeMappings(mappings: string) {
+    const out: Array<Array<{ genLine: number; genCol: number; srcIdx: number; srcLine: number }>> = [];
+    let srcIdx = 0;
+    let srcLine = 0;
+    let srcCol = 0;
+    const lines = mappings.split(";");
+    for (let gl = 0; gl < lines.length; gl++) {
+      const segments: Array<{ genLine: number; genCol: number; srcIdx: number; srcLine: number }> = [];
+      const raw = lines[gl];
+      if (raw !== "") {
+        let genCol = 0;
+        for (const seg of raw.split(",")) {
+          const fields: number[] = [];
+          let shift = 0;
+          let value = 0;
+          for (const c of seg) {
+            const digit = B64INV[c];
+            const cont = digit & 32;
+            value += (digit & 31) << shift;
+            if (cont) {
+              shift += 5;
+            } else {
+              const negative = value & 1;
+              let v = value >> 1;
+              if (negative) v = -v;
+              fields.push(v);
+              value = 0;
+              shift = 0;
+            }
+          }
+          genCol += fields[0] ?? 0;
+          if (fields.length >= 4) {
+            srcIdx += fields[1];
+            srcLine += fields[2];
+            srcCol += fields[3];
+            segments.push({ genLine: gl, genCol, srcIdx, srcLine });
+          }
+        }
+      }
+      out.push(segments);
+    }
+    return out;
+  }
+
+  function decodeInlineMap(code: string) {
+    const m = code.match(/sourceMappingURL=data:application\/json;charset=utf-8;base64,([A-Za-z0-9+/=]+)/);
+    if (!m) throw new Error("no inline source map found in serialized output");
+    const json = JSON.parse(Buffer.from(m[1], "base64").toString("utf8"));
+    return { json, decoded: decodeMappings(json.mappings as string) };
+  }
+
+  // All (srcIdx, srcLine) pairs the map points at, deduped.
+  function mappedPairs(decoded: ReturnType<typeof decodeMappings>) {
+    const set = new Set<string>();
+    for (const segs of decoded) for (const s of segs) set.add(`${s.srcIdx}:${s.srcLine}`);
+    return set;
+  }
+
+  test("is a structurally valid v3 map", () => {
+    function boom() {
+      throw new Error("x");
+    }
+    const { json } = decodeInlineMap(serialize(boom));
+    expect(json.version).toBe(3);
+    expect(Array.isArray(json.sources)).toBe(true);
+    expect(json.sources.length).toBeGreaterThanOrEqual(1);
+    expect(json.names).toEqual([]);
+    expect(typeof json.mappings).toBe("string");
+    expect(json.mappings.length).toBeGreaterThan(0);
+  });
+
+  test("source is the captured function's file and a line maps to its definition line", () => {
+    function boom() {
+      throw new Error("x");
+    }
+    const loc = (boom as any)[Symbol.sourceLocation];
+    const { json, decoded } = decodeInlineMap(serialize(boom));
+    const srcIdx = json.sources.findIndex((s: string) => s.includes("closure.test"));
+    expect(srcIdx).toBeGreaterThanOrEqual(0);
+    // The first body line of `boom` maps to its original (0-based) definition line.
+    expect(mappedPairs(decoded).has(`${srcIdx}:${loc.line - 1}`)).toBe(true);
+  });
+
+  test("captured-value prelude shifts generated lines but original lines stay correct", () => {
+    // An object free variable forces a `const __bunClosure$N = {}` prelude ahead
+    // of the function body (a primitive would be inlined and produce no prelude).
+    const config = { base: 41 };
+    function reader() {
+      return config.base + 1;
+    }
+    const loc = (reader as any)[Symbol.sourceLocation];
+    const { json, decoded } = decodeInlineMap(serialize(reader));
+    const srcIdx = json.sources.findIndex((s: string) => s.includes("closure.test"));
+    // The body maps back to its true original line despite the generated offset.
+    const seg = decoded.flat().find(s => s.srcIdx === srcIdx && s.srcLine === loc.line - 1);
+    expect(seg).toBeDefined();
+    // And it is genuinely offset: the mapping for the definition line is not at
+    // generated line 0 (the prelude binding comes first).
+    expect(seg!.genLine).toBeGreaterThan(0);
+  });
+
+  test("two functions from the same file produce one source and both definition lines", () => {
+    function first() {
+      return 1;
+    }
+    function second() {
+      return 2;
+    }
+    const l1 = (first as any)[Symbol.sourceLocation].line;
+    const l2 = (second as any)[Symbol.sourceLocation].line;
+    expect(l1).not.toBe(l2);
+    // Capture both into one closure graph so both bodies are inlined.
+    const root = () => [first(), second()];
+    const { json, decoded } = decodeInlineMap(serialize(root));
+    const fileSources = json.sources.filter((s: string) => s.includes("closure.test"));
+    expect(fileSources.length).toBe(1);
+    const srcIdx = json.sources.indexOf(fileSources[0]);
+    const pairs = mappedPairs(decoded);
+    expect(pairs.has(`${srcIdx}:${l1 - 1}`)).toBe(true);
+    expect(pairs.has(`${srcIdx}:${l2 - 1}`)).toBe(true);
+  });
+
+  test("monotonic generated lines: every mapped generated line is unique and ordered", () => {
+    const a = 1;
+    const b = 2;
+    function uses() {
+      return a + b;
+    }
+    void uses;
+    const root = () => uses();
+    const { decoded } = decodeInlineMap(serialize(root));
+    const mappedGenLines = decoded.map((segs, i) => (segs.length ? i : -1)).filter(i => i >= 0);
+    const sorted = [...mappedGenLines].sort((x, y) => x - y);
+    expect(mappedGenLines).toEqual(sorted);
+    expect(new Set(mappedGenLines).size).toBe(mappedGenLines.length);
+  });
+
+  test("decoded original lines are all valid (non-negative) line numbers", () => {
+    function multi() {
+      const x = 1;
+      const y = 2;
+      return x + y;
+    }
+    const { decoded } = decodeInlineMap(serialize(multi));
+    const srcLines = decoded.flat().map(s => s.srcLine);
+    expect(srcLines.length).toBeGreaterThan(0);
+    for (const sl of srcLines) expect(sl).toBeGreaterThanOrEqual(0);
+  });
 });
 
 test("reconstructs an object getter (preserves dynamic behavior)", async () => {
@@ -4133,7 +4316,12 @@ describe("ALS rich: nesting", () => {
     const als = new AsyncLocalStorage<string>();
     // outer captured context "L1"; the body opens "L2" and reads it.
     const code = als.run("L1", () =>
-      serialize(() => als.run("L2", () => `${als.getStore()}`).concat("|").concat(als.getStore()!)),
+      serialize(() =>
+        als
+          .run("L2", () => `${als.getStore()}`)
+          .concat("|")
+          .concat(als.getStore()!),
+      ),
     );
     const reified = await reify<() => string>(code);
     expect(reified()).toBe("L2|L1");
@@ -4169,8 +4357,9 @@ describe("ALS rich: promises & async contexts", () => {
 
   test("a reified closure returning a promise whose .then reads the store", async () => {
     const als = new AsyncLocalStorage<number>();
-    const code = als.run(42, () =>
-      serialize(() => Promise.resolve().then(() => als.getStore())), // continuation reads store
+    const code = als.run(
+      42,
+      () => serialize(() => Promise.resolve().then(() => als.getStore())), // continuation reads store
     );
     const reified = await reify<() => Promise<number>>(code);
     await expect(reified()).resolves.toBe(42);
@@ -4228,9 +4417,7 @@ describe("ALS rich: intermixing & complex stores", () => {
   test("two ALS captured, only one has an active store — only that one is restored", async () => {
     const withCtx = new AsyncLocalStorage<string>();
     const without = new AsyncLocalStorage<string>();
-    const code = withCtx.run("HAS", () =>
-      serialize(() => `${withCtx.getStore()}/${without.getStore() ?? "none"}`),
-    );
+    const code = withCtx.run("HAS", () => serialize(() => `${withCtx.getStore()}/${without.getStore() ?? "none"}`));
     const reified = await reify<() => string>(code);
     expect(reified()).toBe("HAS/none");
   });
@@ -4247,9 +4434,7 @@ describe("ALS rich: intermixing & complex stores", () => {
 
   test("the store contains a function which is reconstructed and callable", async () => {
     const als = new AsyncLocalStorage<{ format: (n: number) => string }>();
-    const code = als.run({ format: (n: number) => `#${n}` }, () =>
-      serialize(() => als.getStore()!.format(7)),
-    );
+    const code = als.run({ format: (n: number) => `#${n}` }, () => serialize(() => als.getStore()!.format(7)));
     const reified = await reify<() => string>(code);
     expect(reified()).toBe("#7");
   });
