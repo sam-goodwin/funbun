@@ -982,6 +982,18 @@ impl TranspilerJob {
                 },
             );
 
+            // A cache hit restores the generated map but skips the print path
+            // that chains the module's own input map. The raw source still
+            // carries the //# sourceMappingURL= comment, so scan it here to keep
+            // input-map chaining working on cache hits (mirrors the parse path).
+            if let Some(url) =
+                bun_sourcemap::find_source_mapping_url_u8(&parse_result.source.contents)
+            {
+                // SAFETY: leaf-field `&mut` borrow on `*vm.source_mappings`.
+                unsafe { &mut (*vm).source_mappings }
+                    .put_input_map_from_url(path.text, url.slice());
+            }
+
             if bun_core::env::DUMP_SOURCE {
                 // SAFETY: `vm` is the live owning VM (BACKREF — see `vm` note above).
                 let vm = unsafe { NonNull::new_unchecked(vm) };

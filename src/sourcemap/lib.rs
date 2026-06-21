@@ -1195,7 +1195,7 @@ pub fn append_source_map_chunk<'a>(
 }
 
 /// Always returns UTF-8.
-fn find_source_mapping_url_u8(source: &[u8]) -> Option<bun_core::zig_string::Slice> {
+pub fn find_source_mapping_url_u8(source: &[u8]) -> Option<bun_core::zig_string::Slice> {
     const NEEDLE: &[u8] = b"\n//# sourceMappingURL=";
     let found = bun_core::strings::last_index_of(source, NEEDLE)?;
     let start = found + NEEDLE.len();

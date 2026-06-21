@@ -2694,6 +2694,17 @@ fn transpile_source_code_inner(
                             list: core::mem::take(&mut entry.sourcemap).into_vec(),
                         },
                     );
+                    // A cache hit skips the print path that chains the module's
+                    // own input map. The raw source still carries the
+                    // //# sourceMappingURL= comment, so scan it here to keep
+                    // input-map chaining working on cache hits.
+                    if let Some(url) =
+                        bun_sourcemap::find_source_mapping_url_u8(&source.contents)
+                    {
+                        // SAFETY: per fn contract — `jsc_vm` is the live per-thread VM.
+                        unsafe { &mut (*jsc_vm).source_mappings }
+                            .put_input_map_from_url(path.text, url.slice());
+                    }
                     // Rebuild the cached ESM record for the
                     // isolation source-provider cache (same shape as
                     // `RuntimeTranspilerStore`).
