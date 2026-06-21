@@ -4659,6 +4659,177 @@ describe("genuine #private: general permutations", () => {
     expect(r.priv).toBe(5); // lexical this → genuine slot
     expect(r.fn.call({ y: 42 })).toBe(42); // dynamic this preserved
   });
+
+  test("a private field holding a container of other genuine instances round-trips", async () => {
+    class Leaf {
+      #v: number;
+      constructor(v: number) {
+        this.#v = v;
+      }
+      v() {
+        return this.#v;
+      }
+    }
+    class Tree {
+      #kids: Map<string, Leaf>;
+      constructor(kids: Map<string, Leaf>) {
+        this.#kids = kids;
+      }
+      kid(k: string) {
+        return this.#kids.get(k);
+      }
+    }
+    const t = new Tree(
+      new Map([
+        ["a", new Leaf(1)],
+        ["b", new Leaf(2)],
+      ]),
+    );
+    void t;
+    const out = (await roundtrip(() => t))();
+    expect(out.kid("a")!.v()).toBe(1);
+    expect(out.kid("b")!.v()).toBe(2);
+  });
+
+  test("private fields holding builtins (Date, Map, bound method) round-trip", async () => {
+    class C {
+      #when: Date;
+      #lookup: Map<string, number>;
+      #bound: () => number;
+      constructor() {
+        this.#when = new Date(0);
+        this.#lookup = new Map([["k", 7]]);
+        this.#bound = this.raw.bind(this);
+      }
+      raw() {
+        return 99;
+      }
+      when() {
+        return this.#when.getTime();
+      }
+      look(k: string) {
+        return this.#lookup.get(k);
+      }
+      bound() {
+        return this.#bound();
+      }
+    }
+    const c = new C();
+    void c;
+    const out = (await roundtrip(() => c))();
+    expect(out.when()).toBe(0);
+    expect(out.look("k")).toBe(7);
+    expect(out.bound()).toBe(99);
+  });
+
+  test("a well-known-symbol-keyed method reads the genuine private", async () => {
+    class C {
+      #x = 8;
+      *[Symbol.iterator]() {
+        yield this.#x;
+        yield this.#x + 1;
+      }
+    }
+    const c = new C();
+    void c;
+    const out = (await roundtrip(() => c))();
+    expect([...out]).toEqual([8, 9]); // the Symbol.iterator method reads the genuine slot
+  });
+
+  test("public accessors coexist with genuine privates", async () => {
+    class C {
+      #x = 4;
+      get doubled() {
+        return this.#x * 2;
+      }
+      set doubled(v: number) {
+        this.#x = v / 2;
+      }
+    }
+    const c = new C();
+    void c;
+    const out = (await roundtrip(() => c))();
+    expect(out.doubled).toBe(8);
+    out.doubled = 20;
+    expect(out.doubled).toBe(20); // setter wrote the genuine slot
+  });
+
+  test("a frozen genuine instance round-trips and stays frozen", async () => {
+    class C {
+      #x = 3;
+      get() {
+        return this.#x;
+      }
+    }
+    const c = Object.freeze(new C());
+    void c;
+    const out = (await roundtrip(() => c))();
+    expect(out.get()).toBe(3);
+    expect(Object.isFrozen(out)).toBe(true);
+  });
+
+  test("a genuine instance reached via a free var AND a private field keeps one identity", async () => {
+    class Inner {
+      #v = 1;
+      v() {
+        return this.#v;
+      }
+    }
+    class Outer {
+      #inner: Inner;
+      constructor(i: Inner) {
+        this.#inner = i;
+      }
+      inner() {
+        return this.#inner;
+      }
+    }
+    const shared = new Inner();
+    const outer = new Outer(shared);
+    void [shared, outer];
+    const out = (await roundtrip(() => ({ shared, outer })))();
+    expect(out.outer.inner()).toBe(out.shared); // same instance via both paths
+    expect(out.shared.v()).toBe(1);
+  });
+
+  test("a genuine class also carrying external statics round-trips", async () => {
+    class C {
+      static label = "cls";
+      #x = 6;
+      get() {
+        return this.#x;
+      }
+    }
+    (C as any).extra = { tag: "x" };
+    const c = new C();
+    void c;
+    const out = (await roundtrip(() => ({ c, C })))();
+    expect(out.c.get()).toBe(6);
+    expect((out.C as any).label).toBe("cls");
+    expect((out.C as any).extra).toEqual({ tag: "x" });
+    expect(out.c).toBeInstanceOf(out.C);
+  });
+
+  test("the replacer is applied to a genuine instance's private value", async () => {
+    class C {
+      #secret = "RAW";
+      constructor(s?: string) {
+        if (s) this.#secret = s;
+      }
+      get() {
+        return this.#secret;
+      }
+    }
+    const c = new C();
+    void c;
+    const code = serialize(
+      () => c,
+      (_key, value) => (value === "RAW" ? "REDACTED" : value),
+    );
+    using dir = tempDir(`closure-rt-${Date.now()}`, { "mod.mjs": code });
+    const out = ((await import(`${String(dir)}/mod.mjs`)).default as any)();
+    expect(out.get()).toBe("REDACTED"); // replacer rewrote the private value
+  });
 });
 
 describe("interactions: guards fire when nested", () => {
