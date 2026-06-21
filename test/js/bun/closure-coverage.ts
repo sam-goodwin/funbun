@@ -580,13 +580,18 @@ export const CATEGORIES: CoverageCategory[] = [
       ),
       S(
         "map.nodemodules-external",
-        "node_modules external .js.map not chained",
-        "node_modules external .js.map is not chained; map references the shipped .js",
+        "node_modules external .js.map chains to original .ts",
+        "node_modules external .js.map chains; sourceLocation + emitted map reference the original .ts",
       ),
       S(
-        "map.runtime-gap",
-        "runtime does not apply loaded inline maps (characterized)",
-        "thrown error's own frame currently resolves to the reconstructed module",
+        "map.runtime-chain",
+        "loaded module's inline map is chained onto stack traces",
+        "thrown error's own frame chains through the inline map back to the original source",
+      ),
+      S(
+        "map.sourceloc-chain",
+        "Symbol.sourceLocation of a reified fn chains to the original",
+        "Symbol.sourceLocation of a reified function chains to the original source",
       ),
       S(
         "map.source-location",
