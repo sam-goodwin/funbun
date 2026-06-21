@@ -186,9 +186,12 @@ re-bound to that state.
 
 9. **Source maps.** Each reconstructed function's verbatim source is tracked to
    its generated-line range and mapped back to its original file
-   (`Symbol.sourceLocation`); an inline v3 source map (VLQ, line-granularity) is
-   appended covering every contributing file. Bun now *chains* this map at
-   runtime (§6), so a frame inside a reconstructed function — and
+   (`Symbol.sourceLocation`); an inline v3 source map (VLQ) is appended covering
+   every contributing file. Columns are accurate: because the source is emitted
+   verbatim, the first line maps to the function's definition column and each
+   body line keeps its original indentation (one segment per line at the
+   content-start column — see the granularity note in §5). Bun now *chains* this
+   map at runtime (§6), so a frame inside a reconstructed function — and
    `Symbol.sourceLocation` of it — resolves to the original source, not the
    reconstructed module.
 
@@ -302,6 +305,22 @@ Other notes:
   only (§3.1).
 - **String-based transforms are regex/scanner-driven** — fragile at the edges;
   the main motivation for the AST direction in §7.
+- **Source-map column granularity is line/statement-level, not per-token.** The
+  emitted map carries one segment per generated line, at that line's content-start
+  column (the function-definition column on the first line; the indentation on
+  body lines). Those positions are *exact*, and they are where stack frames
+  normally sit (statement / call boundaries). But a frame that lands in the
+  *middle* of an expression snaps back to the statement start, because we emit no
+  segment there and source-map consumers (Bun, V8, browsers) return the
+  at-or-before segment without interpolating. This is a deliberate serializer
+  choice: the source is copied **verbatim** rather than tokenized, so there are no
+  token boundaries to place finer segments at.
+  **Future improvement:** tokenize the emitted source (a small JS tokenizer, or
+  reuse `Bun.Transpiler`'s tokens) and emit a segment per token for full
+  per-column accuracy — the standard way bundlers achieve it, since they already
+  hold tokens while printing. Worth it only if mid-expression frame columns
+  matter; the common stack-trace case (statement/call positions) is already
+  exact.
 
 ---
 
