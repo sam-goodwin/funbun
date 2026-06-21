@@ -3849,6 +3849,118 @@ describe("interactions: private fields + other features", () => {
   });
 });
 
+// A base class with `#private` data fields, when nothing in the captured graph
+// needs its privates outside a closed world (no subclass instance, no extracted/
+// bound method, no escaped `#x` closure), is reconstructed with GENUINE private
+// slots — installed by a constructor reify branch and seeded through a factory —
+// rather than mangled into a public field. The reachability gate routes the
+// closed-world cases to mangling so everything still round-trips.
+describe("genuine #private reification", () => {
+  test("a single-class instance reifies with true privacy (no mangled public field)", async () => {
+    class Account {
+      #balance = 100;
+      deposit(n: number) {
+        this.#balance += n;
+        return this.#balance;
+      }
+      get balance() {
+        return this.#balance;
+      }
+    }
+    const a = new Account();
+    a.deposit(50);
+    void a;
+
+    const code = serialize(() => a);
+    // The genuine path is taken: a reify factory + slot, and NO mangled public field.
+    expect(code).toContain("_reify");
+    expect(code).toContain("$bunClosureReify$");
+    expect(code).not.toContain("$bunClosurePrivate$");
+
+    const out = (await roundtrip(() => a))();
+    expect(out.balance).toBe(150); // reified private state
+    expect(out.deposit(10)).toBe(160); // method mutates the genuine slot
+    // The `#balance` slot is genuinely private: not present as any own property.
+    expect(Object.getOwnPropertyNames(out)).not.toContain("$bunClosurePrivate$balance");
+    expect(Object.keys(out)).toEqual([]);
+  });
+
+  test("instanceof and class identity are retained across two instances", async () => {
+    class Point {
+      #x: number;
+      #y: number;
+      constructor(x: number, y: number) {
+        this.#x = x;
+        this.#y = y;
+      }
+      sum() {
+        return this.#x + this.#y;
+      }
+    }
+    const p = new Point(1, 2);
+    const q = new Point(10, 20);
+    void [p, q];
+
+    const out = (await roundtrip(() => [p, q] as const))();
+    expect(out[0].sum()).toBe(3);
+    expect(out[1].sum()).toBe(30);
+    // One shared reconstructed class cell: identical constructor, mutual instanceof.
+    const Ctor = Object.getPrototypeOf(out[0]).constructor;
+    expect(Object.getPrototypeOf(out[1]).constructor).toBe(Ctor);
+    expect(out[0]).toBeInstanceOf(Ctor);
+    expect(out[1]).toBeInstanceOf(Ctor);
+  });
+
+  test("a reified method that throws maps its stack frame to the original source (line + column)", async () => {
+    class Boom {
+      #tag = "kab";
+      explode() {
+        throw new Error(this.#tag + "oom");
+      }
+    }
+    const b = new Boom();
+    void b;
+
+    const code = serialize(() => b);
+    expect(code).toContain("_reify"); // genuine path
+    using dir = tempDir("closure-gp-srcmap", { "mod.mjs": code });
+    const { default: fn } = await import(`${String(dir)}/mod.mjs`);
+    let caught: any;
+    try {
+      fn().explode();
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught?.message).toBe("kaboom");
+    // The `explode` frame chains through the inline map back to THIS file with a
+    // line:column suffix — not the reconstructed module — so stack traces survive.
+    const frame = caught.stack.split("\n").find((l: string) => l.includes("explode"));
+    expect(frame).toBeDefined();
+    expect(frame).toContain("closure.test");
+    expect(frame).not.toContain("mod.mjs");
+    expect(frame).toMatch(/:\d+:\d+/); // a concrete line:column was mapped
+  });
+
+  test("the gate falls back to mangling for a bound method, preserving correctness", async () => {
+    class Counter {
+      #n = 5;
+      step() {
+        return ++this.#n;
+      }
+    }
+    const c = new Counter();
+    const bound = c.step.bind(c);
+    void bound;
+
+    const code = serialize(() => bound());
+    // Extracted method ⇒ disqualified from genuine ⇒ mangled fallback is used.
+    expect(code).toContain("$bunClosurePrivate$");
+    const out = await roundtrip(() => bound());
+    expect(out()).toBe(6);
+    expect(out()).toBe(7);
+  });
+});
+
 describe("interactions: guards fire when nested", () => {
   test("a WeakMap nested in a captured object round-trips", async () => {
     const key = { id: 1 };

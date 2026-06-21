@@ -90,6 +90,18 @@ interface Context {
   // The reified root function is wrapped so it runs inside `name.run(store, ...)`,
   // re-establishing the async context so `als.getStore()` returns the same store.
   alsContexts: Array<{ name: string; storeExpr: string }>;
+  // Classes the reachability pre-pass cleared for GENUINE `#private` reconstruction
+  // (real private slots installed via the constructor) rather than mangling. A class
+  // qualifies only when nothing in the captured graph would need its privates outside
+  // a closed world — no subclass instance, no extracted/bound method, no escaped
+  // `#x` closure. See computeGenuineClasses.
+  genuineClasses: Set<Function>;
+  // For a genuine-private class actually emitted: the reify factory name + the private
+  // field names its injected constructor branch installs. Consumed when emitting an
+  // instance so it flows through the factory.
+  classReify: Map<Function, { factory: string; fields: string[] }>;
+  // Whether any genuine-private class was emitted (so `let REIFY_SLOT` is hoisted).
+  needsReifySlot: boolean;
 }
 
 interface SourceBlock {
@@ -147,6 +159,9 @@ function serialize(fn: Function, replacer?: Replacer): string {
     keepSets: computeKeepSets(fn),
     symbols: new Map(),
     alsContexts: [],
+    genuineClasses: computeGenuineClasses(fn),
+    classReify: new Map(),
+    needsReifySlot: false,
   };
 
   // Emit shared cells at module scope (deduped by id) before any function that
@@ -213,9 +228,12 @@ function serialize(fn: Function, replacer?: Replacer): string {
   // External imports are re-emitted at the very top; they shift every generated
   // line down, so the source map is offset by their count to stay correct.
   const importBlock = ctx.imports.size > 0 ? [...ctx.imports].join("\n") + "\n" : "";
-  const leadingLines = ctx.imports.size;
+  // The genuine-private reify slot (if any) is hoisted just below the imports and counts
+  // as another leading line for the source map.
+  const reifyBlock = ctx.needsReifySlot ? `let ${REIFY_SLOT} = null;\n` : "";
+  const leadingLines = ctx.imports.size + (ctx.needsReifySlot ? 1 : 0);
 
-  let output = `${importBlock}${prelude}export default ${exportExpr};\n`;
+  let output = `${importBlock}${reifyBlock}${prelude}export default ${exportExpr};\n`;
   const sourceMap = buildSourceMap(ctx.sourceBlocks, moduleStartLines, preludeLineCount, leadingLines);
   if (sourceMap !== undefined) {
     const { Buffer } = require("node:buffer");
@@ -543,6 +561,185 @@ function parseWithOffset(source: string): { node: any; offset: number } | null {
 // Parse a function's source and return its AST node, or null if it can't parse.
 function parseFunctionNode(source: string): any | null {
   return parseWithOffset(source)?.node ?? null;
+}
+
+// Module-level slot a genuine-private class's constructor reads to install captured
+// private values during reification. Holds a `{ "#field": value }` object while a
+// reify factory constructs, `null` otherwise so normal `new` is unaffected.
+const REIFY_SLOT = "$bunClosureReify$";
+
+// Parse `source` and, if it is a base class (no heritage) declaring `#private` data
+// fields, return those field names plus the parse offset; else null. This is the
+// STRUCTURAL eligibility check; whether genuine reconstruction is actually safe in
+// the captured graph is decided separately by the reachability gate (ctx.genuineClasses).
+function genuinePrivateClassInfo(source: string): { fields: string[]; node: any; offset: number } | null {
+  if (!source.trimStart().startsWith("class")) return null;
+  const parsed = parseWithOffset(source);
+  if (parsed === null) return null;
+  const { node, offset } = parsed;
+  if (node.type !== "ClassExpression" && node.type !== "ClassDeclaration") return null;
+  if (node.superClass != null) return null; // heritage → not yet handled (GP2/GP3)
+  const members = node.body?.body;
+  if (!$isJSArray(members)) return null;
+  const fields: string[] = [];
+  for (const m of members) {
+    // Private DATA fields only; private methods carry no per-instance state.
+    if (
+      m.type === "PropertyDefinition" &&
+      m.static !== true &&
+      m.key?.type === "PrivateIdentifier" &&
+      typeof m.key.name === "string"
+    ) {
+      fields.push(m.key.name);
+    }
+  }
+  if (fields.length === 0) return null;
+  return { fields, node, offset };
+}
+
+// Inject a guarded reify branch at the top of the class's constructor body:
+//   constructor(...) { if (REIFY_SLOT !== null) { this.#x = REIFY_SLOT["#x"]; ...; return; } <orig> }
+// The branch is a single line inserted right after the body `{`, so the original
+// body's lines (and thus source maps) are unchanged.
+function injectReifyConstructor(source: string, info: { fields: string[]; node: any; offset: number }): string {
+  const { fields, node, offset } = info;
+  const branch =
+    `if(${REIFY_SLOT}!==null){` +
+    fields.map(f => `this.${f}=${REIFY_SLOT}[${JSON.stringify(f)}];`).join("") +
+    `return;}`;
+
+  const ctor = node.body.body.find(
+    (m: any) => m.type === "MethodDefinition" && m.static !== true && m.key?.value === "constructor",
+  );
+  if (ctor !== undefined) {
+    // ctor.value.start is the params `(`; scan past the balanced param list to the
+    // body `{` (ast() does not expose the body-brace position directly).
+    let i = ctor.value.start - offset;
+    let depth = 0;
+    for (; i < source.length; i++) {
+      const c = source[i];
+      if (c === "(") depth++;
+      else if (c === ")" && --depth === 0) {
+        i++;
+        break;
+      }
+    }
+    while (i < source.length && source[i] !== "{") i++;
+    return source.slice(0, i + 1) + branch + source.slice(i + 1);
+  }
+
+  // No explicit constructor: synthesize one right after the class body `{` (the first
+  // `{` in the source, since a base class has no heritage to contain one).
+  const brace = source.indexOf("{");
+  return source.slice(0, brace + 1) + `constructor(){${branch}}` + source.slice(brace + 1);
+}
+
+// The reachability GATE. Genuine `#private` reconstruction only works in a closed
+// world: instances come from the real constructor and the code reading `#x` lives on
+// the class prototype. So a class qualifies only if NOTHING reachable from the root
+// would need its privates elsewhere. We over-approximate reachability (more mangling
+// fallback is always safe) and disqualify a structurally-eligible class when the graph
+// contains a subclass instance, a bound/extracted method of it, or an escaped closure
+// that textually references one of its private fields.
+function computeGenuineClasses(root: unknown): Set<Function> {
+  const funcs = new Set<Function>();
+  const objs = new Set<object>();
+  const seen = new Set<unknown>();
+  const stack: unknown[] = [root];
+  const push = (v: unknown) => {
+    if (v !== null && (typeof v === "object" || typeof v === "function")) stack.push(v);
+  };
+  while (stack.length) {
+    const v = stack.pop()!;
+    if (seen.has(v)) continue;
+    seen.add(v);
+    // Never walk a Proxy's internals (would trip its traps / observable side effects).
+    if ($isProxyObject(v as object)) continue;
+    if (typeof v === "function") {
+      funcs.add(v);
+      const fv = (v as any)[Symbol.freeVariables] as FreeVariable[] | undefined;
+      if (fv) for (const x of fv) push(x.value);
+      const bound = (v as any)[Symbol.boundFunction] as BoundDetails | undefined;
+      if (bound) {
+        push(bound.target);
+        push(bound.boundThis);
+        for (const a of bound.boundArgs) push(a);
+      }
+      if ((v as any).prototype) push((v as any).prototype);
+    } else {
+      objs.add(v as object);
+      // Intentionally NOT reading Symbol.privateFields here: it's only needed to push
+      // values hidden inside private fields (a rare disqualifier source), and reading it
+      // on an object with a private accessor (`get #x`) trips a native assertion.
+      // Disqualifiers (subclass instances, bound/extracted methods, escaped closures) are
+      // reachable via ordinary properties, free variables, and prototypes — which we walk.
+    }
+    // Own DATA properties only — reading an accessor could fire a getter (side effect).
+    for (const key of Reflect.ownKeys(v as object)) {
+      const d = Object.getOwnPropertyDescriptor(v as object, key);
+      if (d !== undefined && "value" in d) push(d.value);
+    }
+    push(Object.getPrototypeOf(v as object));
+  }
+
+  const genuine = new Set<Function>();
+  for (const f of funcs) {
+    let info: ReturnType<typeof genuinePrivateClassInfo>;
+    try {
+      info = genuinePrivateClassInfo(f.toString());
+    } catch {
+      continue;
+    }
+    if (info === null) continue;
+    if (!isClassDisqualified(f, info.fields, funcs, objs)) genuine.add(f);
+  }
+  return genuine;
+}
+
+// The own (prototype + static) method/accessor function identities of class `C`.
+function classOwnMethods(C: Function): Set<Function> {
+  const methods = new Set<Function>();
+  for (const holder of [C.prototype, C] as object[]) {
+    if (holder == null) continue;
+    for (const key of Reflect.ownKeys(holder)) {
+      const d = Object.getOwnPropertyDescriptor(holder, key);
+      if (d === undefined) continue;
+      for (const m of [d.value, d.get, d.set]) if (typeof m === "function") methods.add(m);
+    }
+  }
+  return methods;
+}
+
+function isClassDisqualified(C: Function, fields: string[], funcs: Set<Function>, objs: Set<object>): boolean {
+  const proto = C.prototype;
+  // A subclass instance can't get C's genuine brand (built via Object.create, no ctor).
+  for (const o of objs) {
+    let p = Object.getPrototypeOf(o);
+    let direct = true;
+    while (p !== null) {
+      if (p === proto) {
+        if (!direct) return true;
+        break;
+      }
+      direct = false;
+      p = Object.getPrototypeOf(p);
+    }
+  }
+  const ownMethods = classOwnMethods(C);
+  for (const g of funcs) {
+    if (g === C || ownMethods.has(g)) continue;
+    const bound = (g as any)[Symbol.boundFunction] as BoundDetails | undefined;
+    if (bound !== undefined && typeof bound.target === "function" && ownMethods.has(bound.target)) return true;
+    // An escaped closure that reads one of C's privates can't be hosted yet (GP-host).
+    let src: string;
+    try {
+      src = g.toString();
+    } catch {
+      continue;
+    }
+    if (src.includes("#") && fields.some(name => src.includes(name))) return true;
+  }
+  return false;
 }
 
 // Walk a function AST and record how each `rootNames` identifier (free variable
@@ -874,6 +1071,10 @@ interface ReconstructedFunction {
   // derive per-line columns for the source map.
   source: string;
   location: { url: string; line: number; column: number } | undefined;
+  // Set when this is a class reconstructed with GENUINE `#private` fields: the field
+  // names its injected constructor reify branch installs. emitFunction emits a reify
+  // factory for it; instances are reconstructed through that factory.
+  genuinePrivate?: { fields: string[] };
 }
 
 // Returns an expression that evaluates to a reconstruction of `fn`, wrapping its
@@ -883,14 +1084,31 @@ function reconstructFunctionExpr(fn: Function, ctx: Context): ReconstructedFunct
   if (isNativeFunctionSource(original)) {
     throw new TypeError("Cannot serialize a native function (no JavaScript source is available)");
   }
-  // Transform `#private` members into mangled public members so they can be
-  // reconstructed — for classes AND for methods extracted from a class (whose
-  // `this.#x` would otherwise be invalid standalone syntax). No-op when the
-  // source has no `#`. Same-line replacement, so source maps stay correct.
-  let source = rewritePrivateMembers(original);
+  // A base class the gate cleared for genuine privates keeps real `#x` slots, installed
+  // by a constructor reify branch; instances flow through a reify factory (true privacy,
+  // real brand checks, `#x in obj`). Every other case — heritage classes, and methods
+  // extracted from a class whose standalone `this.#x` is invalid syntax — mangles
+  // `#private` into a public field. Both keep lines intact so source maps stay correct.
+  let source: string;
+  let genuinePrivate: { fields: string[] } | undefined;
+  const gpInfo = ctx.genuineClasses.has(fn) ? genuinePrivateClassInfo(original) : null;
+  if (gpInfo !== null) {
+    source = injectReifyConstructor(original, gpInfo);
+    genuinePrivate = { fields: gpInfo.fields };
+    ctx.needsReifySlot = true;
+  } else {
+    source = rewritePrivateMembers(original);
+  }
 
   const freeVariables = allFreeVariables(fn, source);
-  const location = (fn as any)[Symbol.sourceLocation] as ReconstructedFunction["location"];
+  let location = (fn as any)[Symbol.sourceLocation] as ReconstructedFunction["location"];
+  // A class's own Symbol.sourceLocation reports an EMPTY url (its line/column are
+  // correct), so its body would never chain to the original source. Borrow a url from
+  // one of its methods — defined in the same file — so class-body frames map too.
+  if (location !== undefined && !location.url) {
+    const url = firstMemberSourceUrl(fn);
+    if (url) location = { ...location, url };
+  }
 
   const bindings: string[] = [];
   // Names already resolvable in the reconstructed output (so a field-initializer
@@ -936,7 +1154,7 @@ function reconstructFunctionExpr(fn: Function, ctx: Context): ReconstructedFunct
   // first line, so the only vertical offset comes from the IIFE wrapper.
   const fnExpr = functionSourceToExpression(source, (fn as any).name);
   if (bindings.length === 0) {
-    return { expr: fnExpr, sourceLineOffset: 0, sourceLineCount, source, location };
+    return { expr: fnExpr, sourceLineOffset: 0, sourceLineCount, source, location, genuinePrivate };
   }
   // (function () {\n  <bindings...>\n  return <fnExpr>;\n})()
   // The `return` line is at offset 1 (header) + bindings.length.
@@ -946,6 +1164,7 @@ function reconstructFunctionExpr(fn: Function, ctx: Context): ReconstructedFunct
     sourceLineCount,
     source,
     location,
+    genuinePrivate,
   };
 }
 
@@ -954,6 +1173,25 @@ function reconstructFunctionExpr(fn: Function, ctx: Context): ReconstructedFunct
 // in each method's (and static member's) own free variables, deduped by cell id.
 // Methods share the class's defining scope, so same-named captures are the same
 // cell.
+// The source url of the first prototype/static member of `fn` that carries one — used
+// to give a class (whose own Symbol.sourceLocation url is empty) a real url so its body
+// chains to the original source.
+function firstMemberSourceUrl(fn: Function): string | undefined {
+  for (const holder of [fn.prototype, fn] as object[]) {
+    if (holder == null) continue;
+    for (const key of Reflect.ownKeys(holder)) {
+      const d = Object.getOwnPropertyDescriptor(holder, key);
+      if (d === undefined) continue;
+      for (const m of [d.value, d.get, d.set]) {
+        if (typeof m !== "function") continue;
+        const loc = (m as any)[Symbol.sourceLocation] as { url?: string } | undefined;
+        if (loc?.url) return loc.url;
+      }
+    }
+  }
+  return undefined;
+}
+
 function allFreeVariables(fn: Function, source: string): FreeVariable[] {
   const own = ((fn as any)[Symbol.freeVariables] as FreeVariable[] | undefined) ?? [];
   if (!source.trimStart().startsWith("class")) {
@@ -1288,11 +1526,40 @@ function emitObjectBody(value: object, name: string, ctx: Context): void {
     }
   } else if (value instanceof Error) {
     emitErrorBody(value, name, ctx);
+  } else if (emitGenuinePrivateInstance(value, name, ctx)) {
+    // Handled: reconstructed via the class's reify factory (genuine `#private`).
   } else {
     ctx.module.push(`const ${name} = ${objectBaseExpression(value, ctx)};`);
     emitOwnProperties(name, value, ctx);
     emitPrivateFields(name, value, ctx);
   }
+}
+
+// If `value` is an instance of a class the gate cleared for genuine privates, emit it
+// through that class's reify factory (seeding the captured private values) and assign
+// its public own properties afterward — the constructor's reify branch returns before
+// the original body, so public fields are restored here. The real `#private` slots are
+// installed inside the constructor, preserving privacy, brand checks, and `instanceof`.
+// Returns false (caller uses the default Object.create path) when not applicable.
+function emitGenuinePrivateInstance(value: object, name: string, ctx: Context): boolean {
+  const proto = Object.getPrototypeOf(value);
+  const ctor = (proto as any)?.constructor;
+  if (typeof ctor !== "function" || ctor.prototype !== proto) return false;
+  if (!ctx.genuineClasses.has(ctor)) return false;
+  // Emit the class first so its reify factory is registered in ctx.classReify.
+  emitValue(ctor, ctx);
+  const reify = ctx.classReify.get(ctor);
+  if (reify === undefined) return false;
+
+  const privateFields = (value as any)[Symbol.privateFields] as Array<{ name: string; value: unknown }> | undefined;
+  const entries: string[] = [];
+  for (const field of privateFields ?? []) {
+    const child = transform(value, field.name, field.value, ctx);
+    entries.push(`${JSON.stringify(field.name)}: ${emitValue(child, ctx)}`);
+  }
+  ctx.module.push(`const ${name} = ${reify.factory}({ ${entries.join(", ")} });`);
+  emitOwnProperties(name, value, ctx);
+  return true;
 }
 
 // Emits an instance's private (#name) field values (read natively) as the
@@ -1677,6 +1944,17 @@ function emitFunction(fn: Function, ctx: Context): string {
   // the offset within the expression.
   ctx.module.push(`const ${name} = ${reconstructed.expr};`);
   recordSourceBlock(ctx, ctx.module.length - 1, reconstructed);
+  // A genuine-private class needs a reify factory: seed the module-level slot with the
+  // captured private values, construct (the constructor's reify branch installs them and
+  // returns early), then clear the slot. Instances flow through this; a plain `new` of the
+  // class elsewhere still runs the original constructor unchanged (slot is null).
+  if (reconstructed.genuinePrivate !== undefined) {
+    const factory = name + "_reify";
+    ctx.module.push(
+      `const ${factory} = (v) => { ${REIFY_SLOT} = v; try { return new ${name}(); } finally { ${REIFY_SLOT} = null; } };`,
+    );
+    ctx.classReify.set(fn, { factory, fields: reconstructed.genuinePrivate.fields });
+  }
   // Functions can carry their own properties (e.g. `fn.version = 2`, or a class's
   // externally-assigned statics like `C.instance = ...`). Emit the ENUMERABLE
   // ones — that skips `name`/`length`/`prototype` and non-enumerable static
@@ -2074,6 +2352,9 @@ async function bundle(fn: Function, replacer?: Replacer): Promise<string> {
     keepSets: computeKeepSets(fn),
     symbols: new Map(),
     alsContexts: [],
+    genuineClasses: computeGenuineClasses(fn),
+    classReify: new Map(),
+    needsReifySlot: false,
   };
   // 2. Recover the closure module's import bindings: localName → original source.
   type Binding = { source: string; imported?: string; default?: boolean; star?: boolean };
@@ -2123,7 +2404,8 @@ async function bundle(fn: Function, replacer?: Replacer): Promise<string> {
     const value = transform(undefined, variable.name, variable.value, ctx);
     stateExports.push(`export const ${variable.name} = ${emitValue(value, ctx)};`);
   }
-  const stateModule = (ctx.module.length ? ctx.module.join("\n") + "\n" : "") + stateExports.join("\n");
+  const reifyBlock = ctx.needsReifySlot ? `let ${REIFY_SLOT} = null;\n` : "";
+  const stateModule = reifyBlock + (ctx.module.length ? ctx.module.join("\n") + "\n" : "") + stateExports.join("\n");
 
   // 4. Re-import the remaining referenced module-level dependencies (named imports
   //    that JSC does not surface as free variables) from their original sources.
