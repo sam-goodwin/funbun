@@ -2207,6 +2207,24 @@ impl<'a> AstJsConverter<'a> {
             }
             D::EFunction(f) => self.function_node("FunctionExpression", &f.func, start),
             D::EClass(c) => self.class_node("ClassExpression", &c, start),
+            D::ETemplate(t) => {
+                // Expose the interpolated expressions (the string quasis are not parsed
+                // here); this lets a walk see `this.#x` inside a template literal. A tagged
+                // template's tag is included as `tag`.
+                let node = self.node("TemplateLiteral", start)?;
+                let parts = t.parts();
+                let arr = JSValue::create_empty_array(self.global, parts.len())?;
+                for (i, part) in parts.iter().enumerate() {
+                    let v = self.expr(&part.value)?;
+                    arr.put_index(self.global, i as u32, v)?;
+                }
+                node.put(self.global, "expressions", arr);
+                if let Some(tag) = &t.tag {
+                    let tg = self.expr(tag)?;
+                    node.put(self.global, "tag", tg);
+                }
+                Ok(node)
+            }
             _ => {
                 let node = self.node("Unsupported", start)?;
                 let nm = self.str(e.data.tag_name().as_bytes())?;

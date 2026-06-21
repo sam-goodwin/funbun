@@ -3519,9 +3519,10 @@ JSC_DEFINE_CUSTOM_GETTER(objectPrivateFieldsGetter, (JSC::JSGlobalObject * globa
         if (!uid || !uid->isSymbol() || !static_cast<WTF::SymbolImpl*>(uid)->isPrivate())
             continue;
         // Only own data fields (private methods/accessors are recreated from the
-        // class source, not snapshotted as instance state).
+        // class source, not snapshotted as instance state). A private accessor's slot
+        // holds a GetterSetter — skip it (putDirect would otherwise assert/misbehave).
         JSC::JSValue value = object->getDirect(vm, identifier);
-        if (!value)
+        if (!value || value.isGetterSetter() || value.isCustomGetterSetter())
             continue;
 
         JSC::JSObject* entry = JSC::constructEmptyObject(globalObject);

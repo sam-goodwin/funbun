@@ -4348,6 +4348,319 @@ describe("genuine #private reification", () => {
   });
 });
 
+// Generality: genuine privates must hold across arity (any number/order of fields), depth
+// (arbitrary nesting), and interaction with other JS features (containers, identity,
+// cycles, private methods/accessors, async/generator methods, hosted arrows).
+describe("genuine #private: general permutations", () => {
+  test("arbitrary arity: many private fields in any order", async () => {
+    class C {
+      #e = 5;
+      #a = 1;
+      #d = 4;
+      #b = 2;
+      #c = 3;
+      all() {
+        return [this.#a, this.#b, this.#c, this.#d, this.#e];
+      }
+    }
+    const out = (await roundtrip(() => new C()))();
+    expect(out.all()).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  test("genuine instances nested in array, object, Map, and Set", async () => {
+    class P {
+      #x: number;
+      constructor(x: number) {
+        this.#x = x;
+      }
+      get() {
+        return this.#x;
+      }
+    }
+    const arr = [new P(1), new P(2)];
+    const obj = { a: new P(3) };
+    const map = new Map([["k", new P(4)]]);
+    const set = new Set([new P(5)]);
+    void [arr, obj, map, set];
+    const out = (await roundtrip(() => ({ arr, obj, map, set })))();
+    expect(out.arr.map((p: any) => p.get())).toEqual([1, 2]);
+    expect(out.obj.a.get()).toBe(3);
+    expect(out.map.get("k").get()).toBe(4);
+    expect([...out.set][0].get()).toBe(5);
+  });
+
+  test("a shared instance keeps identity across multiple references", async () => {
+    class C {
+      #x = 1;
+      get() {
+        return this.#x;
+      }
+    }
+    const c = new C();
+    void c;
+    const out = (await roundtrip(() => ({ p: c, q: c, list: [c, c] })))();
+    expect(out.p).toBe(out.q);
+    expect(out.list[0]).toBe(out.p);
+    expect(out.list[1]).toBe(out.p);
+    expect(out.p.get()).toBe(1);
+  });
+
+  test("arbitrarily deep nesting of genuine instances through private fields", async () => {
+    class L {
+      #v: number;
+      #next: L | null;
+      constructor(v: number, next: L | null) {
+        this.#v = v;
+        this.#next = next;
+      }
+      v() {
+        return this.#v;
+      }
+      next() {
+        return this.#next;
+      }
+    }
+    const list = new L(1, new L(2, new L(3, null)));
+    void list;
+    const out = (await roundtrip(() => list))();
+    expect([out.v(), out.next()!.v(), out.next()!.next()!.v()]).toEqual([1, 2, 3]);
+    expect(out.next()!.next()!.next()).toBeNull();
+  });
+
+  test("private data + private method + private accessor coexist", async () => {
+    class C {
+      #x = 10;
+      #double() {
+        return this.#x * 2;
+      }
+      get #plusOne() {
+        return this.#x + 1;
+      }
+      run() {
+        return this.#double() + this.#plusOne;
+      }
+    }
+    const out = (await roundtrip(() => new C()))();
+    expect(out.run()).toBe(31);
+  });
+
+  test("async and generator methods read genuine privates", async () => {
+    class C {
+      #x = 7;
+      async ax() {
+        return this.#x;
+      }
+      *gen() {
+        yield this.#x;
+        yield this.#x * 2;
+      }
+    }
+    const out = (await roundtrip(() => new C()))();
+    expect(await out.ax()).toBe(7);
+    expect([...out.gen()]).toEqual([7, 14]);
+  });
+
+  test("a static private field does not block instance reification", async () => {
+    class C {
+      static #count = 3;
+      #x = 1;
+      val() {
+        return this.#x;
+      }
+      static count() {
+        return C.#count;
+      }
+    }
+    const out = (await roundtrip(() => new C()))();
+    expect(out.val()).toBe(1);
+  });
+
+  test("two hosted arrows on the same class both read the genuine slot", async () => {
+    class C {
+      #x = 5;
+      mkAdd() {
+        return () => this.#x + 1;
+      }
+      mkMul() {
+        return () => this.#x * 2;
+      }
+    }
+    const c = new C();
+    const add = c.mkAdd();
+    const mul = c.mkMul();
+    void [add, mul];
+    const out = (await roundtrip(() => ({ add, mul })))();
+    expect(out.add()).toBe(6);
+    expect(out.mul()).toBe(10);
+  });
+
+  test("a circular reference through private fields round-trips", async () => {
+    class Node {
+      #peer: Node | null = null;
+      id: number;
+      constructor(id: number) {
+        this.id = id;
+      }
+      link(p: Node) {
+        this.#peer = p;
+      }
+      peer() {
+        return this.#peer;
+      }
+    }
+    const a = new Node(1);
+    const b = new Node(2);
+    a.link(b);
+    b.link(a);
+    void [a, b];
+    const out = (await roundtrip(() => ({ a, b })))();
+    expect(out.a.peer()!.id).toBe(2);
+    expect(out.b.peer()!.id).toBe(1);
+    expect(out.a.peer()!.peer()).toBe(out.a); // the cycle is preserved by identity
+  });
+
+  test("a private field that references the instance itself round-trips", async () => {
+    class S {
+      #self: S | null = null;
+      constructor() {
+        this.#self = this;
+      }
+      me() {
+        return this.#self;
+      }
+    }
+    const s = new S();
+    void s;
+    const out = (await roundtrip(() => s))();
+    expect(out.me()).toBe(out); // self-cycle preserved
+  });
+
+  test("a cycle through private fields across an inheritance chain round-trips", async () => {
+    class Base {
+      #link: any = null;
+      bid: number;
+      constructor(id: number) {
+        this.bid = id;
+      }
+      setLink(x: any) {
+        this.#link = x;
+      }
+      link() {
+        return this.#link;
+      }
+    }
+    class Derived extends Base {
+      #tag: string;
+      constructor(id: number, tag: string) {
+        super(id);
+        this.#tag = tag;
+      }
+      tag() {
+        return this.#tag;
+      }
+    }
+    const a = new Derived(1, "a");
+    const b = new Derived(2, "b");
+    a.setLink(b);
+    b.setLink(a);
+    void [a, b];
+    const out = (await roundtrip(() => ({ a, b })))();
+    expect([out.a.bid, out.a.tag(), out.a.link().bid, out.a.link().tag()]).toEqual([1, "a", 2, "b"]);
+    expect(out.a.link().link()).toBe(out.a); // cross-level cycle preserved
+  });
+
+  test("mutual recursion between two different genuine classes round-trips", async () => {
+    class Ping {
+      #pong: any = null;
+      set(p: any) {
+        this.#pong = p;
+      }
+      pong() {
+        return this.#pong;
+      }
+      kind() {
+        return "ping";
+      }
+    }
+    class Pong {
+      #ping: any = null;
+      set(p: any) {
+        this.#ping = p;
+      }
+      ping() {
+        return this.#ping;
+      }
+      kind() {
+        return "pong";
+      }
+    }
+    const ping = new Ping();
+    const pong = new Pong();
+    ping.set(pong);
+    pong.set(ping);
+    void [ping, pong];
+    const out = (await roundtrip(() => ping))();
+    expect(out.kind()).toBe("ping");
+    expect(out.pong().kind()).toBe("pong");
+    expect(out.pong().ping()).toBe(out); // mutual cycle preserved
+  });
+
+  test("a private field holding a hosted arrow bound to the same instance round-trips", async () => {
+    class C {
+      #x = 9;
+      #getter: any = null;
+      constructor() {
+        this.#getter = () => this.#x; // an escaped arrow stored in a private field (a cycle)
+      }
+      getter() {
+        return this.#getter;
+      }
+      direct() {
+        return this.#x;
+      }
+    }
+    const c = new C();
+    void c;
+    const out = (await roundtrip(() => c))();
+    expect(out.direct()).toBe(9);
+    expect(out.getter()()).toBe(9); // the hosted arrow reads the genuine slot of the same instance
+  });
+
+  test("arbitrarily nested arrows reading a private round-trip", async () => {
+    class C {
+      #x = 3;
+      deep() {
+        return () => () => () => this.#x + 1; // arrows nested 3 deep, all sharing lexical this
+      }
+    }
+    const f = new C().deep();
+    void f;
+    const out = (await roundtrip(() => f))();
+    expect(out()()()).toBe(4);
+  });
+
+  test("a nested ordinary function inside a hosted arrow keeps dynamic this", async () => {
+    class C {
+      #x = 5;
+      mk() {
+        // the arrow reads this.#x (lexical); the returned function's `this` is dynamic.
+        return () => ({
+          priv: this.#x,
+          fn: function (this: any) {
+            return this?.y;
+          },
+        });
+      }
+    }
+    const f = new C().mk();
+    void f;
+    const out = (await roundtrip(() => f))();
+    const r = out();
+    expect(r.priv).toBe(5); // lexical this → genuine slot
+    expect(r.fn.call({ y: 42 })).toBe(42); // dynamic this preserved
+  });
+});
+
 describe("interactions: guards fire when nested", () => {
   test("a WeakMap nested in a captured object round-trips", async () => {
     const key = { id: 1 };

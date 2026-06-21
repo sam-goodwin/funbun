@@ -201,8 +201,23 @@ describe("Transpiler.ast", () => {
     });
   });
 
+  test("template literals expose their interpolated expressions", () => {
+    const a = ast("`tpl ${x} and ${y + 1}`").body[0].expression;
+    expect(a.type).toBe("TemplateLiteral");
+    expect(stripStart(a.expressions)).toEqual([
+      { type: "Identifier", name: "x" },
+      {
+        type: "BinaryExpression",
+        operator: "+",
+        left: { type: "Identifier", name: "y" },
+        right: { type: "NumericLiteral", value: 1 },
+      },
+    ]);
+  });
+
   test("unmapped node kinds surface as Unsupported, never throw", () => {
-    const a = ast("`tpl ${x}`").body[0].expression;
+    // A `with` statement is not mapped; it must surface as Unsupported, not throw.
+    const a = ast("with (o) { x; }").body[0];
     expect(a.type).toBe("Unsupported");
     expect(typeof a.node).toBe("string");
   });

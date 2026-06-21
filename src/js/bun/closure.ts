@@ -252,7 +252,7 @@ function serialize(fn: Function, replacer?: Replacer): string {
   const importBlock = ctx.imports.size > 0 ? [...ctx.imports].join("\n") + "\n" : "";
   // The genuine-private reify slot (if any) is hoisted just below the imports and counts
   // as another leading line for the source map.
-  const reifyBlock = ctx.needsReifySlot ? `let ${REIFY_SLOT} = null;\n` : "";
+  const reifyBlock = ctx.needsReifySlot ? `let ${REIFY_SLOT} = false;\n` : "";
   const leadingLines = ctx.imports.size + (ctx.needsReifySlot ? 1 : 0);
 
   let output = `${importBlock}${reifyBlock}${prelude}export default ${exportExpr};\n`;
@@ -631,17 +631,16 @@ function arrowReadsLexicalThisPrivate(mangledSource: string): boolean {
     }
   };
   walk(node.body);
-  if (found) return true;
-  // Textual fallback for forms ast() exposes as opaque `Unsupported` nodes (e.g. template
-  // literals): a mangled private read off `this` (the source string keeps the literal
-  // `this`, unlike the parsed AST). Only reached for arrows, so the receiver is lexical.
-  return new RegExp(`\\bthis\\s*\\.\\s*${PRIVATE_PREFIX.replace(/\$/g, "\\$")}`).test(mangledSource);
+  return found;
 }
 
-// Module-level slot a genuine-private class's constructor reads to install captured
-// private values during reification. Holds a `{ "#field": value }` object while a
-// reify factory constructs, `null` otherwise so normal `new` is unaffected.
+// Module-level flag set true while a reify factory constructs a BARE genuine-private
+// instance, so the injected constructor branch skips the original body; `false`/null
+// otherwise, so a normal `new` is unaffected.
 const REIFY_SLOT = "$bunClosureReify$";
+// The per-class method injected to install that class's private fields from a values
+// object, called on the bare instance AFTER all instances exist (so cycles work).
+const PATCH_METHOD = "__bunReifyPatch";
 
 // Parse `source` and, if it is a base class (no heritage) declaring `#private` data
 // fields, return those field names plus the parse offset; else null. This is the
@@ -671,20 +670,22 @@ function classStructure(source: string): ClassStructure | null {
   return { fields, isDerived: node.superClass != null, node, offset };
 }
 
-// Inject a guarded reify branch at the top of the class's constructor body:
-//   constructor(...) { if (REIFY_SLOT !== null) { super(); this.#x = REIFY_SLOT["#x"]; ...; return; } <orig> }
-// A derived class calls super() first (its base's own injected branch installs the base
-// privates from the same slot). Also injects any host methods (for escaped `#x` arrows)
-// right after the class body `{`. All insertions are single-line, so the original body's
-// lines (and thus source maps) are unchanged.
+// Rewrite a genuine-private class's source for two-phase reification:
+//   - a guarded reify branch at the top of the constructor body skips the original body
+//     (and calls super() for a derived class) so the factory builds a BARE instance:
+//       constructor(...) { if (REIFY_SLOT) { super(); return; } <orig> }
+//   - a patch method installs this class's privates from a values object, called AFTER all
+//     instances exist (so cycles and self-references work): `__patch(v){ this.#x = v["#x"]; }`
+//   - any host methods (for escaped `#x` arrows) are injected too.
+// The reify branch goes after the constructor body `{`; the patch + host methods after the
+// class body `{`. All insertions are single-line, so source-map lines are unchanged.
 function injectReifyConstructor(source: string, info: ClassStructure, hostMethods: string[]): string {
   const { fields, isDerived, node, offset } = info;
-  const branch =
-    `if(${REIFY_SLOT}!==null){` +
-    (isDerived ? "super();" : "") +
-    fields.map(f => `this.${f}=${REIFY_SLOT}[${JSON.stringify(f)}];`).join("") +
-    `return;}`;
-  const hosts = hostMethods.join("");
+  const branch = `if(${REIFY_SLOT}){` + (isDerived ? "super();" : "") + `return;}`;
+  const patch = fields.length
+    ? `${PATCH_METHOD}(v){${fields.map(f => `this.${f}=v[${JSON.stringify(f)}];`).join("")}}`
+    : "";
+  const classBodyInjections = patch + hostMethods.join("");
 
   const ctor = node.body.body.find(
     (m: any) => m.type === "MethodDefinition" && m.static !== true && m.key?.value === "constructor",
@@ -703,12 +704,12 @@ function injectReifyConstructor(source: string, info: ClassStructure, hostMethod
       }
     }
     while (i < source.length && source[i] !== "{") i++;
-    // Insert the reify branch after the constructor body `{` (later position) first, then
-    // the host methods after the class body `{` (earlier position) so offsets stay valid.
+    // Insert the reify branch after the constructor body `{` (later position) first, then the
+    // class-body injections after the class body `{` (earlier position) so offsets stay valid.
     let out = source.slice(0, i + 1) + branch + source.slice(i + 1);
-    if (hosts) {
+    if (classBodyInjections) {
       const classBrace = out.indexOf("{");
-      out = out.slice(0, classBrace + 1) + hosts + out.slice(classBrace + 1);
+      out = out.slice(0, classBrace + 1) + classBodyInjections + out.slice(classBrace + 1);
     }
     return out;
   }
@@ -718,7 +719,7 @@ function injectReifyConstructor(source: string, info: ClassStructure, hostMethod
   // constructor would otherwise never call super and throw.
   const brace = source.indexOf("{");
   const synthesized = isDerived ? `constructor(...a){${branch}super(...a);}` : `constructor(){${branch}}`;
-  return source.slice(0, brace + 1) + synthesized + hosts + source.slice(brace + 1);
+  return source.slice(0, brace + 1) + synthesized + classBodyInjections + source.slice(brace + 1);
 }
 
 // The reachability GATE. Genuine `#private` reconstruction only works in a closed world:
@@ -760,9 +761,11 @@ function computeGenuineClasses(root: unknown): GenuinePlan {
         if ((v as any).prototype) push((v as any).prototype);
       } else {
         objs.add(v as object);
-        // Intentionally NOT reading Symbol.privateFields here: it's only needed to push
-        // values hidden inside private fields (a rare disqualifier source), and reading it
-        // on an object with a private accessor (`get #x`) trips a native assertion.
+        // Reach values stored in private fields (e.g. an escaped arrow held in `this.#fn`)
+        // so they participate in hosting/genuine decisions. Symbol.privateFields returns only
+        // DATA fields (accessors/methods excluded) for any object, so this is safe.
+        const pf = (v as any)[Symbol.privateFields] as Array<{ name: string; value: unknown }> | undefined;
+        if (pf) for (const f of pf) push(f.value);
       }
       // Own DATA properties only — reading an accessor could fire a getter (side effect).
       for (const key of Reflect.ownKeys(v as object)) {
@@ -1795,29 +1798,47 @@ function emitObjectBody(value: object, name: string, ctx: Context): void {
   }
 }
 
-// If `value` is an instance of a class the gate cleared for genuine privates, emit it
-// through that class's reify factory (seeding the captured private values) and assign
-// its public own properties afterward — the constructor's reify branch returns before
-// the original body, so public fields are restored here. The real `#private` slots are
-// installed inside the constructor, preserving privacy, brand checks, and `instanceof`.
-// Returns false (caller uses the default Object.create path) when not applicable.
+// If `value` is an instance of a class the gate cleared for genuine privates, emit it in two
+// phases: (1) construct a BARE instance via the reify factory, emitted BEFORE its private
+// values so cycles/self-references can refer back to it; (2) install the genuine `#private`
+// slots by calling each chain class's patch method (after all instances exist). Public own
+// properties are restored last. Real `#private` slots preserve privacy, brand checks, and
+// `instanceof`. Returns false (caller uses the default Object.create path) when not applicable.
 function emitGenuinePrivateInstance(value: object, name: string, ctx: Context): boolean {
   const proto = Object.getPrototypeOf(value);
   const ctor = (proto as any)?.constructor;
   if (typeof ctor !== "function" || ctor.prototype !== proto) return false;
   if (!ctx.genuineClasses.has(ctor)) return false;
-  // Emit the class first so its reify factory is registered in ctx.classReify.
+  // Emit the class first so its (and its ancestors') reify factories are in ctx.classReify.
   emitValue(ctor, ctx);
   const reify = ctx.classReify.get(ctor);
   if (reify === undefined) return false;
 
-  const privateFields = (value as any)[Symbol.privateFields] as Array<{ name: string; value: unknown }> | undefined;
-  const entries: string[] = [];
-  for (const field of privateFields ?? []) {
-    const child = transform(value, field.name, field.value, ctx);
-    entries.push(`${JSON.stringify(field.name)}: ${emitValue(child, ctx)}`);
+  // Phase 1: bare construct. Emitted before any private value so a private referencing this
+  // instance (or a cycle through another instance) resolves to an already-declared binding.
+  ctx.module.push(`const ${name} = ${reify.factory}();`);
+
+  // Phase 2: install privates. Each genuine class in the chain that declares private fields
+  // gets its own patch method (sharing the name across the chain, reached via its prototype),
+  // each reading only its own keys from the shared values object.
+  const patchClasses: Function[] = [];
+  for (let p: object | null = proto; p && p !== Object.prototype; p = Object.getPrototypeOf(p)) {
+    const c = (p as any).constructor;
+    if (typeof c === "function" && c.prototype === p && (ctx.classReify.get(c)?.fields.length ?? 0) > 0) {
+      patchClasses.push(c);
+    }
   }
-  ctx.module.push(`const ${name} = ${reify.factory}({ ${entries.join(", ")} });`);
+  const privateFields = (value as any)[Symbol.privateFields] as Array<{ name: string; value: unknown }> | undefined;
+  if (patchClasses.length > 0 && privateFields && privateFields.length > 0) {
+    const entries = privateFields.map(
+      f => `${JSON.stringify(f.name)}: ${emitValue(transform(value, f.name, f.value, ctx), ctx)}`,
+    );
+    const valsName = REF_PREFIX + ctx.counter++;
+    ctx.module.push(`const ${valsName} = { ${entries.join(", ")} };`);
+    for (const c of patchClasses) {
+      ctx.module.push(`${emitValue(c, ctx)}.prototype.${PATCH_METHOD}.call(${name}, ${valsName});`);
+    }
+  }
   emitOwnProperties(name, value, ctx);
   return true;
 }
@@ -2231,14 +2252,14 @@ function emitFunction(fn: Function, ctx: Context): string {
   // the offset within the expression.
   ctx.module.push(`const ${name} = ${reconstructed.expr};`);
   recordSourceBlock(ctx, ctx.module.length - 1, reconstructed);
-  // A genuine-private class needs a reify factory: seed the module-level slot with the
-  // captured private values, construct (the constructor's reify branch installs them and
-  // returns early), then clear the slot. Instances flow through this; a plain `new` of the
-  // class elsewhere still runs the original constructor unchanged (slot is null).
+  // A genuine-private class needs a reify factory: set the module-level flag, construct a
+  // BARE instance (the constructor's reify branch skips the original body), then clear the
+  // flag. Privates are installed afterward by the patch method (see emitGenuinePrivateInstance)
+  // so cycles work. A plain `new` of the class elsewhere still runs the original constructor.
   if (reconstructed.genuinePrivate !== undefined) {
     const factory = name + "_reify";
     ctx.module.push(
-      `const ${factory} = (v) => { ${REIFY_SLOT} = v; try { return new ${name}(); } finally { ${REIFY_SLOT} = null; } };`,
+      `const ${factory} = () => { ${REIFY_SLOT} = true; try { return new ${name}(); } finally { ${REIFY_SLOT} = false; } };`,
     );
     ctx.classReify.set(fn, { factory, fields: reconstructed.genuinePrivate.fields });
   }
@@ -2695,7 +2716,7 @@ async function bundle(fn: Function, replacer?: Replacer): Promise<string> {
     const value = transform(undefined, variable.name, variable.value, ctx);
     stateExports.push(`export const ${variable.name} = ${emitValue(value, ctx)};`);
   }
-  const reifyBlock = ctx.needsReifySlot ? `let ${REIFY_SLOT} = null;\n` : "";
+  const reifyBlock = ctx.needsReifySlot ? `let ${REIFY_SLOT} = false;\n` : "";
   const stateModule = reifyBlock + (ctx.module.length ? ctx.module.join("\n") + "\n" : "") + stateExports.join("\n");
 
   // 4. Re-import the remaining referenced module-level dependencies (named imports
