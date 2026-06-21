@@ -91,11 +91,16 @@ interface Context {
   // re-establishing the async context so `als.getStore()` returns the same store.
   alsContexts: Array<{ name: string; storeExpr: string }>;
   // Classes the reachability pre-pass cleared for GENUINE `#private` reconstruction
-  // (real private slots installed via the constructor) rather than mangling. A class
-  // qualifies only when nothing in the captured graph would need its privates outside
-  // a closed world — no subclass instance, no extracted/bound method, no escaped
+  // (real private slots installed via the constructor) rather than mangling. A whole
+  // user-class hierarchy qualifies together when nothing in the captured graph would need
+  // its privates outside a closed world — no foreign subclass instance and no escaped
   // `#x` closure. See computeGenuineClasses.
   genuineClasses: Set<Function>;
+  // Prototype methods/accessors of genuine classes, by function identity → (class, key,
+  // kind). A method peeled off a genuine class (extracted or bound) is emitted as a
+  // reference through the reconstructed class prototype — which reads the genuine `#x` —
+  // instead of being rebuilt standalone (where `this.#x` would have to be mangled).
+  genuineMethods: Map<Function, { classFn: Function; key: string | symbol; kind: "method" | "get" | "set" }>;
   // For a genuine-private class actually emitted: the reify factory name + the private
   // field names its injected constructor branch installs. Consumed when emitting an
   // instance so it flows through the factory.
@@ -148,6 +153,7 @@ function serialize(fn: Function, replacer?: Replacer): string {
     const m = /^__bunClosure\$(\d+)$/.exec(variable.name);
     if (m !== null) counterStart = Math.max(counterStart, Number(m[1]) + 1);
   }
+  const genuineClasses = computeGenuineClasses(fn);
   const ctx: Context = {
     module: [],
     refs: new Map(),
@@ -159,7 +165,8 @@ function serialize(fn: Function, replacer?: Replacer): string {
     keepSets: computeKeepSets(fn),
     symbols: new Map(),
     alsContexts: [],
-    genuineClasses: computeGenuineClasses(fn),
+    genuineClasses,
+    genuineMethods: computeGenuineMethods(genuineClasses),
     classReify: new Map(),
     needsReifySlot: false,
   };
@@ -724,6 +731,30 @@ function computeGenuineClasses(root: unknown): Set<Function> {
   return candidate;
 }
 
+// Index the prototype methods/accessors of every genuine class by function identity, so a
+// method peeled off an instance (extracted or bound) can be emitted as a reference through
+// the reconstructed class prototype rather than rebuilt standalone.
+function computeGenuineMethods(
+  genuineClasses: Set<Function>,
+): Map<Function, { classFn: Function; key: string | symbol; kind: "method" | "get" | "set" }> {
+  const map = new Map<Function, { classFn: Function; key: string | symbol; kind: "method" | "get" | "set" }>();
+  for (const C of genuineClasses) {
+    const proto = C.prototype;
+    if (proto == null) continue;
+    for (const key of Reflect.ownKeys(proto)) {
+      if (key === "constructor") continue;
+      const d = Object.getOwnPropertyDescriptor(proto, key);
+      if (d === undefined) continue;
+      // First writer wins: a method is indexed to the class that declares it, not a
+      // subclass that inherits the same identity (subclasses don't redefine it).
+      if (typeof d.value === "function" && !map.has(d.value)) map.set(d.value, { classFn: C, key, kind: "method" });
+      if (typeof d.get === "function" && !map.has(d.get)) map.set(d.get, { classFn: C, key, kind: "get" });
+      if (typeof d.set === "function" && !map.has(d.set)) map.set(d.set, { classFn: C, key, kind: "set" });
+    }
+  }
+  return map;
+}
+
 // Walk `C` and its superclass chain up to Object. Returns the chain (leaf-first) if every
 // member is a parseable user class, there is ≥1 private field and no same-name private
 // collision across the chain, and no member has a per-class disqualifier; else null.
@@ -778,15 +809,15 @@ function classOwnMethods(C: Function): Set<Function> {
   return methods;
 }
 
-// True if some reachable function — other than C's own methods — is a bound C method or an
-// escaped closure that textually references one of C's private fields. Both need C's
-// privates outside a closed world, which genuine reconstruction can't serve yet.
+// True if some reachable function — other than C's own methods — is an escaped closure
+// that textually references one of C's private fields. Such a closure can't be hosted in
+// a class body yet (GP3), so genuine reconstruction can't serve it. Bound/extracted
+// methods are NOT disqualifying: they are emitted as references through the reconstructed
+// prototype (see computeGenuineMethods / emitFunction), which read the genuine slot.
 function perClassDisqualified(C: Function, fields: string[], funcs: Set<Function>): boolean {
   const ownMethods = classOwnMethods(C);
   for (const g of funcs) {
     if (g === C || ownMethods.has(g)) continue;
-    const bound = (g as any)[Symbol.boundFunction] as BoundDetails | undefined;
-    if (bound !== undefined && typeof bound.target === "function" && ownMethods.has(bound.target)) return true;
     let src: string;
     try {
       src = g.toString();
@@ -1158,12 +1189,11 @@ function reconstructFunctionExpr(fn: Function, ctx: Context): ReconstructedFunct
 
   const freeVariables = allFreeVariables(fn, source);
   let location = (fn as any)[Symbol.sourceLocation] as ReconstructedFunction["location"];
-  // A class's own Symbol.sourceLocation reports an EMPTY url (its line/column are
-  // correct), so its body would never chain to the original source. Borrow a url from
-  // one of its methods — defined in the same file — so class-body frames map too.
+  // A class's own Symbol.sourceLocation is unreliable (empty url, line always 1), so its
+  // body would never chain (or would chain to the wrong line). Derive a correct anchor
+  // from a method, whose location IS reliable, so class-body frames map to the real source.
   if (location !== undefined && !location.url) {
-    const url = firstMemberSourceUrl(fn);
-    if (url) location = { ...location, url };
+    location = classSourceAnchor(fn, source) ?? location;
   }
 
   const bindings: string[] = [];
@@ -1229,21 +1259,32 @@ function reconstructFunctionExpr(fn: Function, ctx: Context): ReconstructedFunct
 // in each method's (and static member's) own free variables, deduped by cell id.
 // Methods share the class's defining scope, so same-named captures are the same
 // cell.
-// The source url of the first prototype/static member of `fn` that carries one — used
-// to give a class (whose own Symbol.sourceLocation url is empty) a real url so its body
-// chains to the original source.
-function firstMemberSourceUrl(fn: Function): string | undefined {
-  for (const holder of [fn.prototype, fn] as object[]) {
-    if (holder == null) continue;
-    for (const key of Reflect.ownKeys(holder)) {
-      const d = Object.getOwnPropertyDescriptor(holder, key);
-      if (d === undefined) continue;
-      for (const m of [d.value, d.get, d.set]) {
-        if (typeof m !== "function") continue;
-        const loc = (m as any)[Symbol.sourceLocation] as { url?: string } | undefined;
-        if (loc?.url) return loc.url;
-      }
-    }
+// A class's own Symbol.sourceLocation is unreliable (empty url, line always 1). Derive a
+// correct anchor for the class's FIRST source line from one of its methods, whose location
+// IS reliable: find a prototype method that is locatable in `source`, and subtract that
+// method's line offset within `source` from its true file line. Returns undefined if no
+// usable method is found (the class then simply isn't source-mapped).
+function classSourceAnchor(fn: Function, source: string): { url: string; line: number; column: number } | undefined {
+  const parsed = parseWithOffset(source);
+  if (parsed === null) return undefined;
+  const members = parsed.node.body?.body;
+  if (!$isJSArray(members)) return undefined;
+  const proto = fn.prototype;
+  if (proto == null) return undefined;
+  for (const m of members) {
+    if (m.type !== "MethodDefinition" || m.static === true) continue;
+    const key = m.key?.value;
+    if (typeof key !== "string" || key === "constructor") continue;
+    if (typeof m.value?.start !== "number") continue;
+    const d = Object.getOwnPropertyDescriptor(proto, key);
+    const method = d?.value ?? d?.get ?? d?.set;
+    const loc = (method as any)?.[Symbol.sourceLocation] as { url?: string; line?: number } | undefined;
+    if (!loc?.url || typeof loc.line !== "number") continue;
+    const posInSource = m.value.start - parsed.offset; // the method's params `(`
+    if (posInSource < 0 || posInSource > source.length) continue;
+    let rel = 0;
+    for (let i = 0; i < posInSource; i++) if (source[i] === "\n") rel++;
+    return { url: loc.url, line: loc.line - rel, column: 1 };
   }
   return undefined;
 }
@@ -1983,6 +2024,21 @@ function emitFunction(fn: Function, ctx: Context): string {
     return name;
   }
 
+  // A method peeled off a genuine class — extracted as a value, or a bound function's
+  // target — is referenced through the reconstructed class prototype, so it reads the
+  // genuine `#x` slot rather than a standalone mangled copy.
+  const gm = ctx.genuineMethods.get(fn);
+  if (gm !== undefined) {
+    const classRef = emitValue(gm.classFn, ctx);
+    const keyExpr = propertyKeyExpression(gm.key, ctx);
+    if (gm.kind === "method") {
+      ctx.module.push(`const ${name} = ${classRef}.prototype[${keyExpr}];`);
+    } else {
+      ctx.module.push(`const ${name} = Object.getOwnPropertyDescriptor(${classRef}.prototype, ${keyExpr}).${gm.kind};`);
+    }
+    return name;
+  }
+
   // A native built-in (Math.max, Array.prototype.slice, console.log, Error, ...)
   // has no JS source but a stable identity reachable from globalThis — reference
   // it by its path rather than trying to reconstruct it. This is what lets a
@@ -2397,6 +2453,7 @@ async function bundle(fn: Function, replacer?: Replacer): Promise<string> {
   // 1. Captured state → a virtual module exporting each free variable. Reuses
   //    the existing value emitter (objects, prototypes, pruning, cycles, …).
   const { sharedIds } = analyzeSharedCells(fn);
+  const genuineClasses = computeGenuineClasses(fn);
   const ctx: Context = {
     module: [],
     refs: new Map(),
@@ -2408,7 +2465,8 @@ async function bundle(fn: Function, replacer?: Replacer): Promise<string> {
     keepSets: computeKeepSets(fn),
     symbols: new Map(),
     alsContexts: [],
-    genuineClasses: computeGenuineClasses(fn),
+    genuineClasses,
+    genuineMethods: computeGenuineMethods(genuineClasses),
     classReify: new Map(),
     needsReifySlot: false,
   };

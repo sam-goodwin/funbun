@@ -3941,7 +3941,9 @@ describe("genuine #private reification", () => {
     expect(frame).toMatch(/:\d+:\d+/); // a concrete line:column was mapped
   });
 
-  test("the gate falls back to mangling for a bound method, preserving correctness", async () => {
+  // GP2b: a bound method is emitted as `Class.prototype.method.bind(instance)` through the
+  // reconstructed genuine prototype — reading the genuine slot — so it stays genuine.
+  test("a bound method reads the genuine slot through the reconstructed prototype", async () => {
     class Counter {
       #n = 5;
       step() {
@@ -3953,11 +3955,30 @@ describe("genuine #private reification", () => {
     void bound;
 
     const code = serialize(() => bound());
-    // Extracted method ⇒ disqualified from genuine ⇒ mangled fallback is used.
-    expect(code).toContain("$bunClosurePrivate$");
+    expect(code).not.toContain("$bunClosurePrivate$"); // genuine, via prototype reference
     const out = await roundtrip(() => bound());
     expect(out()).toBe(6);
     expect(out()).toBe(7);
+  });
+
+  test("a method extracted as a value round-trips against a genuine instance", async () => {
+    class Box {
+      #v: number;
+      constructor(v: number) {
+        this.#v = v;
+      }
+      read() {
+        return this.#v;
+      }
+    }
+    const box = new Box(42);
+    const read = box.read; // extracted, unbound — same identity as Box.prototype.read
+    void [box, read];
+
+    const code = serialize(() => ({ box, read }));
+    expect(code).not.toContain("$bunClosurePrivate$");
+    const out = (await roundtrip(() => ({ box, read })))();
+    expect(out.read.call(out.box)).toBe(42); // the extracted method reads the genuine #v
   });
 
   // GP2a: a whole user-class hierarchy is reconstructed genuinely — the leaf instance is
@@ -4019,9 +4040,9 @@ describe("genuine #private reification", () => {
     expect(out).toBeInstanceOf(Map);
   });
 
-  // The instance-leaf fixpoint: a base shared with a disqualified subclass usage (here a
-  // bound base method) must itself fall back, so every access style stays consistent.
-  test("a shared base is disqualified when a bound method of it is also captured", async () => {
+  // A bound base method on a subclass instance: the chain stays genuine (GP2b) and the
+  // bound method reads the genuine #sides through the reconstructed Shape prototype.
+  test("a bound base method on a subclass instance stays genuine", async () => {
     class Shape {
       #sides: number;
       constructor(n: number) {
@@ -4041,7 +4062,7 @@ describe("genuine #private reification", () => {
     void [tri, bound];
 
     const code = serialize(() => ({ tri, run: bound }));
-    expect(code).toContain("$bunClosurePrivate$"); // bound base method ⇒ whole chain mangles
+    expect(code).not.toContain("$bunClosurePrivate$");
     const out = (await roundtrip(() => ({ tri, run: bound })))();
     expect(out.tri.sides()).toBe(3);
     expect(out.run()).toBe(3);
