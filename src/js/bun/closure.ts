@@ -1510,13 +1510,40 @@ function classSourceAnchor(fn: Function, source: string): { url: string; line: n
   return undefined;
 }
 
+// True if the AST contains any `Unsupported` node — ast() surfaces some constructs (yield*,
+// await, …) opaquely, so an identifier-reference walk over such a tree is incomplete.
+function containsUnsupportedNode(node: any): boolean {
+  if ($isJSArray(node)) {
+    for (const x of node) if (containsUnsupportedNode(x)) return true;
+    return false;
+  }
+  if (!node || typeof node !== "object") return false;
+  if (node.type === "Unsupported") return true;
+  for (const k of Object.keys(node)) if (k !== "type" && containsUnsupportedNode(node[k])) return true;
+  return false;
+}
+
 function allFreeVariables(fn: Function, source: string): FreeVariable[] {
   const own = ((fn as any)[Symbol.freeVariables] as FreeVariable[] | undefined) ?? [];
+  // The native Symbol.freeVariables getter scans the bytecode identifier table, which
+  // includes PROPERTY and METHOD NAMES (e.g. `read` in `{ read: ... }` or `obj.read`). If
+  // such a name coincidentally matches an outer binding, it is WRONGLY reported as a free
+  // variable — and binding it can even break (e.g. a name that's actually a later-emitted
+  // value). Cross-check against real AST identifier REFERENCES: object/member/method keys
+  // are StringLiterals that freeIdentifiersOfNode skips, so only genuine references survive.
+  // Unparseable sources (an extracted method whose `this.#x` is invalid standalone) keep all,
+  // conservatively — as do sources with opaque `Unsupported` AST nodes (yield*, await, …)
+  // that hide the references inside, which would otherwise cause a legitimate capture to be
+  // dropped. Filter ONLY when the parse is complete.
+  const node = parseFunctionNode(source);
+  const refs = node !== null && !containsUnsupportedNode(node) ? freeIdentifiersOfNode(node) : null;
+  const isRealRef = (v: FreeVariable) => refs === null || refs.has(v.name);
+
   if (!source.trimStart().startsWith("class")) {
     // `#name` private brands are recreated by the mangling rewrite (the receiver
     // carries the mangled field), never captured as an external free variable —
     // applies to a method extracted from a class just as to the class itself.
-    return own.filter(v => !v.name.startsWith("#"));
+    return own.filter(v => !v.name.startsWith("#") && isRealRef(v));
   }
 
   const byId = new Map<number, FreeVariable>();
@@ -1528,7 +1555,7 @@ function allFreeVariables(fn: Function, source: string): FreeVariable[] {
   }
   collectMemberFreeVariables(fn, fn, byId);
   if (typeof fn === "function" && fn.prototype) collectMemberFreeVariables(fn.prototype, fn, byId);
-  return [...byId.values()];
+  return [...byId.values()].filter(isRealRef);
 }
 
 function collectMemberFreeVariables(holder: object, classFn: Function, byId: Map<number, FreeVariable>): void {
