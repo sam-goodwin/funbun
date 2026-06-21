@@ -897,14 +897,22 @@ pub fn parse_url(
                         let Some(comma) = after.iter().position(|&b| b == b',') else {
                             break 'try_data_url;
                         };
-                        if &after[..comma] != b"base64" {
-                            break 'try_data_url;
+                        // The header is one or more `;`-separated media params,
+                        // e.g. `base64` or `charset=utf-8;base64` (what tsc /
+                        // esbuild / webpack emit). `base64` may appear in any
+                        // segment; if absent the payload is raw (URL-encoded)
+                        // text, matching the no-param `data:application/json,`
+                        // arm below.
+                        let header = &after[..comma];
+                        let data = &after[comma + 1..];
+                        let is_base64 = header.split(|&b| b == b';').any(|seg| seg == b"base64");
+                        if !is_base64 {
+                            break 'json_bytes data;
                         }
-                        let base64_data = &after[comma + 1..];
 
-                        let len = bun_base64::decode_len(base64_data);
+                        let len = bun_base64::decode_len(data);
                         let bytes = arena.alloc_slice_fill_default::<u8>(len);
-                        let decoded = bun_base64::decode(bytes, base64_data);
+                        let decoded = bun_base64::decode(bytes, data);
                         if !decoded.is_successful() {
                             return Err(bun_core::err!("InvalidBase64"));
                         }
