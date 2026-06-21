@@ -546,10 +546,47 @@ export const CATEGORIES: CoverageCategory[] = [
     name: "Source maps",
     items: [
       S("map.inline", "inline source map emitted", "emits an inline source map"),
+      S("map.v3-valid", "emitted map is a valid v3 structure", "is a structurally valid v3 map"),
+      S("map.line-fidelity", "body maps back to its definition line", "a line maps to its definition line"),
       S(
-        "map.remap-throw",
-        "thrown error remapped to original file",
-        "source map remaps a thrown error to the original file",
+        "map.prelude-offset",
+        "captured-value prelude offset stays correct",
+        "captured-value prelude shifts generated lines but original lines stay correct",
+      ),
+      S(
+        "map.multi-fn",
+        "two functions, one source, both lines",
+        "two functions from the same file produce one source and both definition lines",
+      ),
+      S(
+        "map.monotonic",
+        "generated lines unique and ordered",
+        "monotonic generated lines: every mapped generated line is unique and ordered",
+      ),
+      S(
+        "map.nested",
+        "nested function maps to enclosing line",
+        "nested-function source maps back to the enclosing definition line",
+      ),
+      S(
+        "map.class-private",
+        "class method survives #private rewrite",
+        "class method survives #private rewrite with its definition line intact",
+      ),
+      S(
+        "map.als-wrap",
+        "ALS-wrapped root keeps body line mapping",
+        "ALS-wrapped root keeps the body's original line mapping",
+      ),
+      S(
+        "map.nodemodules-external",
+        "node_modules external .js.map not chained",
+        "node_modules external .js.map is not chained; map references the shipped .js",
+      ),
+      S(
+        "map.runtime-gap",
+        "runtime does not apply loaded inline maps (characterized)",
+        "thrown error's own frame currently resolves to the reconstructed module",
       ),
       S(
         "map.source-location",
