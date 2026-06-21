@@ -570,6 +570,58 @@ function parseFunctionNode(source: string): any | null {
   return parseWithOffset(source)?.node ?? null;
 }
 
+// True if `node` (parsed from MANGLED source — `#x` outside a class body is a syntax
+// error, so only the post-rewrite form parses) is an arrow function that reads a private
+// through its lexical `this`: `this.<mangled>` or `"<mangled>" in this`. Such an arrow
+// cannot be reconstructed — its `this` (the receiving instance) is baked in lexically and
+// is NOT recoverable (Symbol.freeVariables exposes only the private-name brand, not the
+// instance). Reconstructed standalone it reads a private off an unbound `this` and crashes,
+// so we reject it instead of emitting silently-broken output. Hosting it in the generated
+// class body (the genuine fix) needs a native primitive to expose the arrow's lexical
+// `this`, which does not exist yet.
+function arrowReadsLexicalThisPrivate(node: any): boolean {
+  if (node?.type !== "ArrowFunctionExpression") return false;
+  const isMangled = (s: unknown): boolean => typeof s === "string" && s.startsWith(PRIVATE_PREFIX);
+  // The arrow's lexical `this` resolves to module scope when parsed standalone, which the
+  // transpiler lowers to `exports`; a nested function's dynamic `this` stays a real
+  // ThisExpression (and we don't descend into those). At the arrow's own level both forms
+  // denote the captured `this`.
+  const isLexicalThis = (n: any): boolean =>
+    n?.type === "ThisExpression" || (n?.type === "Identifier" && n.name === "exports");
+  let found = false;
+  const walk = (n: any): void => {
+    if (found || n === null || typeof n !== "object") return;
+    if ($isJSArray(n)) {
+      for (const c of n) walk(c);
+      return;
+    }
+    // this.<mangledPrivate>
+    if (n.type === "MemberExpression" && isLexicalThis(n.object) && isMangled(n.property?.name ?? n.property?.value)) {
+      found = true;
+      return;
+    }
+    // "<mangledPrivate>" in this  (rewritten brand check)
+    if (n.type === "BinaryExpression" && n.operator === "in" && isLexicalThis(n.right) && isMangled(n.left?.value)) {
+      found = true;
+      return;
+    }
+    // A nested `function`/class rebinds `this`; only nested arrows share the lexical one.
+    if (
+      n.type === "FunctionExpression" ||
+      n.type === "FunctionDeclaration" ||
+      n.type === "ClassExpression" ||
+      n.type === "ClassDeclaration"
+    ) {
+      return;
+    }
+    for (const k in n) {
+      if (k !== "start") walk(n[k]);
+    }
+  };
+  walk(node.body);
+  return found;
+}
+
 // Module-level slot a genuine-private class's constructor reads to install captured
 // private values during reification. Holds a `{ "#field": value }` object while a
 // reify factory constructs, `null` otherwise so normal `new` is unaffected.
@@ -1185,6 +1237,17 @@ function reconstructFunctionExpr(fn: Function, ctx: Context): ReconstructedFunct
     ctx.needsReifySlot = true;
   } else {
     source = rewritePrivateMembers(original);
+    // An arrow that reads a `#private` through its lexical `this` cannot be reconstructed:
+    // the receiving instance is baked in lexically and is not recoverable. Reject it (the
+    // mangled source IS parseable, unlike the `#x` original) instead of emitting
+    // silently-broken output — a private read off an unbound `this`.
+    if (source.includes(PRIVATE_PREFIX) && arrowReadsLexicalThisPrivate(parseFunctionNode(source))) {
+      throw new TypeError(
+        "Cannot serialize an arrow function that reads a #private field through its lexical `this`: " +
+          "the receiving instance cannot be recovered. Capture the value first, e.g. " +
+          "`const v = this.#x; return () => v;`.",
+      );
+    }
   }
 
   const freeVariables = allFreeVariables(fn, source);

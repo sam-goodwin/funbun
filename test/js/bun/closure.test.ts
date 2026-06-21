@@ -4256,6 +4256,47 @@ describe("genuine #private reification", () => {
     expect(frame).not.toContain("mod.mjs");
     expect(frame).toMatch(/:\d+:\d+/);
   });
+
+  // An arrow that reads a #private through its lexical `this` cannot be reconstructed: the
+  // receiving instance is baked in lexically and is unrecoverable. Reject it at serialize
+  // time (clear error) rather than emitting code that reads off an unbound `this` and crashes.
+  test("an escaped arrow reading a private through lexical this is rejected", () => {
+    class C {
+      #x = 41;
+      make() {
+        return () => this.#x + 1;
+      }
+    }
+    const f = new C().make();
+    void f;
+    expect(() => serialize(() => f)).toThrow(/#private field through its lexical `this`/);
+  });
+
+  test("an escaped arrow doing a private brand check on lexical this is rejected", () => {
+    class C {
+      #x = 1;
+      make() {
+        return () => #x in this;
+      }
+    }
+    const f = new C().make();
+    void f;
+    expect(() => serialize(() => f)).toThrow(/lexical `this`/);
+  });
+
+  test("capturing the private value first is the supported workaround and round-trips", async () => {
+    class C {
+      #x = 7;
+      make() {
+        const v = this.#x; // capture the value, not `this`
+        return () => v + 1;
+      }
+    }
+    const f = new C().make();
+    void f;
+    const out = (await roundtrip(() => f))();
+    expect(out()).toBe(8);
+  });
 });
 
 describe("interactions: guards fire when nested", () => {
