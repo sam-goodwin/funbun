@@ -646,6 +646,9 @@ const REIFY_SLOT = "$bunClosureReify$";
 // The per-class method injected to install that class's private fields from a values
 // object, called on the bare instance AFTER all instances exist (so cycles work).
 const PATCH_METHOD = "__bunReifyPatch";
+// Builtin bases a genuine subclass can extend: their no-arg `super()` yields a valid empty
+// instance and their content is restorable (Map.set/Set.add/array indices) after construction.
+const RECONSTRUCTABLE_BUILTIN_BASES: Set<unknown> = new Set([Map, Set, Array]);
 
 // Parse `source` and, if it is a base class (no heritage) declaring `#private` data
 // fields, return those field names plus the parse offset; else null. This is the
@@ -943,7 +946,12 @@ function genuineChain(
   let cur: any = C;
   while (typeof cur === "function" && cur !== Function.prototype) {
     const s = structOf(cur);
-    if (s === null) return null; // a builtin/native base in the chain → not genuine
+    if (s === null) {
+      // A builtin base we can reconstruct (its no-arg `super()` yields a valid empty instance
+      // and its content is restorable) ends the chain genuinely; any other native base rejects.
+      if (RECONSTRUCTABLE_BUILTIN_BASES.has(cur)) break;
+      return null;
+    }
     if (s.fields.length > 0) hasField = true;
     if (perClassDisqualified(cur, s.fields, funcs, allMethods)) return null;
     chain.push(cur);
@@ -966,7 +974,12 @@ function instanceChainClasses(o: object): Function[] {
   let p = Object.getPrototypeOf(o);
   while (p !== null && p !== Object.prototype) {
     const c = (p as any).constructor;
-    if (typeof c === "function" && c.prototype === p) classes.push(c);
+    if (typeof c === "function" && c.prototype === p) {
+      // Stop at a builtin/native base (reconstructed via super(), not Object.create) — only
+      // the user-class portion of the chain must be genuine for the fixpoint.
+      if (isNativeFunctionSource(c.toString())) break;
+      classes.push(c);
+    }
     p = Object.getPrototypeOf(p);
   }
   return classes;
@@ -1786,18 +1799,23 @@ function emitObject(value: object, ctx: Context): string {
   // Record BEFORE recursing so a self-reference resolves to `name`.
   ctx.refs.set(value, name);
 
-  const builtinProto = emitBuiltin(value, name, ctx);
-  if (builtinProto === null) {
-    emitObjectBody(value, name, ctx);
-    // An array subclass (`class X extends Array`) is constructed as a plain array
-    // above; restore its prototype and any extra (non-index) own/private fields.
-    if (Array.isArray(value) && Object.getPrototypeOf(value) !== Array.prototype) {
-      restoreSubclass(value, name, ctx, arrayIndexSkip(value));
+  // A genuine-private class instance (including a genuine subclass of a builtin like Map) is
+  // reconstructed via its reify factory + patch methods, NOT the builtin/object paths below.
+  // (Falls through to the frozen/sealed handling at the end.)
+  if (!emitGenuinePrivateInstance(value, name, ctx)) {
+    const builtinProto = emitBuiltin(value, name, ctx);
+    if (builtinProto === null) {
+      emitObjectBody(value, name, ctx);
+      // An array subclass (`class X extends Array`) is constructed as a plain array
+      // above; restore its prototype and any extra (non-index) own/private fields.
+      if (Array.isArray(value) && Object.getPrototypeOf(value) !== Array.prototype) {
+        restoreSubclass(value, name, ctx, arrayIndexSkip(value));
+      }
+    } else if (Object.getPrototypeOf(value) !== builtinProto) {
+      // A built-in subclass (`class X extends Map/Set/...`): the base data is built;
+      // restore the subclass prototype + its own/private instance fields.
+      restoreSubclass(value, name, ctx);
     }
-  } else if (Object.getPrototypeOf(value) !== builtinProto) {
-    // A built-in subclass (`class X extends Map/Set/...`): the base data is built;
-    // restore the subclass prototype + its own/private instance fields.
-    restoreSubclass(value, name, ctx);
   }
 
   // Preserve a non-extensible/sealed/frozen state — applied LAST, after every
@@ -1865,9 +1883,8 @@ function emitObjectBody(value: object, name: string, ctx: Context): void {
     }
   } else if (value instanceof Error) {
     emitErrorBody(value, name, ctx);
-  } else if (emitGenuinePrivateInstance(value, name, ctx)) {
-    // Handled: reconstructed via the class's reify factory (genuine `#private`).
   } else {
+    // Genuine-private instances are handled earlier in emitObject (before emitBuiltin).
     ctx.module.push(`const ${name} = ${objectBaseExpression(value, ctx)};`);
     emitOwnProperties(name, value, ctx);
     emitPrivateFields(name, value, ctx);
@@ -1892,7 +1909,10 @@ function emitGenuinePrivateInstance(value: object, name: string, ctx: Context): 
 
   // Phase 1: bare construct. Emitted before any private value so a private referencing this
   // instance (or a cycle through another instance) resolves to an already-declared binding.
+  // For a builtin subclass the factory's `super()` yields an empty Map/Set/Array; its content
+  // is restored onto the live instance next (the instance IS a Map/Set/Array).
   ctx.module.push(`const ${name} = ${reify.factory}();`);
+  const builtinSkip = restoreBuiltinContent(value, name, ctx);
 
   // Phase 2: install privates. Each genuine class in the chain that declares private fields
   // gets its own patch method (sharing the name across the chain, reached via its prototype),
@@ -1925,8 +1945,36 @@ function emitGenuinePrivateInstance(value: object, name: string, ctx: Context): 
       ctx.module.push(`${emitValue(c, ctx)}.prototype.${PATCH_METHOD}.call(${name}, ${valsName});`);
     }
   }
-  emitOwnProperties(name, value, ctx);
+  emitOwnProperties(name, value, ctx, builtinSkip);
   return true;
+}
+
+// Restores a genuine builtin subclass's content onto the already-constructed (empty) live
+// instance: Map entries via `.set`, Set values via `.add`, array elements by index. Returns
+// the own-property keys it handled (array indices + length) so the caller skips them.
+function restoreBuiltinContent(value: object, name: string, ctx: Context): Set<string> | undefined {
+  if (value instanceof Map) {
+    for (const [k, v] of value as Map<unknown, unknown>) {
+      const kx = emitValue(transform(value, "", k, ctx), ctx);
+      const vx = emitValue(transform(value, "", v, ctx), ctx);
+      ctx.module.push(`${name}.set(${kx}, ${vx});`);
+    }
+    return undefined;
+  }
+  if (value instanceof Set) {
+    for (const v of value as Set<unknown>) {
+      ctx.module.push(`${name}.add(${emitValue(transform(value, "", v, ctx), ctx)});`);
+    }
+    return undefined;
+  }
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) {
+      if (i in value) ctx.module.push(`${name}[${i}] = ${emitValue(transform(value, String(i), value[i], ctx), ctx)};`);
+    }
+    ctx.module.push(`${name}.length = ${value.length};`);
+    return arrayIndexSkip(value as unknown[]);
+  }
+  return undefined;
 }
 
 // Emits an instance's private (#name) field values (read natively) as the

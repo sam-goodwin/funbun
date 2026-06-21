@@ -4020,24 +4020,58 @@ describe("genuine #private reification", () => {
     expect(Object.getOwnPropertyNames(out).filter(k => k.includes("Private"))).toEqual([]);
   });
 
-  test("a class extending a builtin still falls back to mangling and round-trips", async () => {
+  // GP3b: a class extending a reconstructable builtin (Map/Set/Array) reifies genuinely —
+  // the factory's super() yields an empty Map, content is restored via .set, and the genuine
+  // #tag is patched. The builtin base is NOT reconstructed; super() calls the real one.
+  test("a class extending a builtin (Map) reifies genuinely with content + private", async () => {
     class TaggedMap extends Map<string, number> {
       #tag = "m";
       getTag() {
         return this.#tag;
       }
     }
-    const m = new TaggedMap();
-    m.set("a", 1);
+    const m = new TaggedMap([["a", 1]]);
+    m.set("b", 2);
     void m;
 
     const code = serialize(() => m);
-    // Builtin base ⇒ can't inject a reify branch into Map ⇒ mangled fallback.
-    expect(code).toContain("$bunClosurePrivate$");
+    expect(code).not.toContain("$bunClosurePrivate$"); // genuine
     const out = (await roundtrip(() => m))();
-    expect(out.getTag()).toBe("m");
-    expect(out.get("a")).toBe(1);
+    expect(out.getTag()).toBe("m"); // genuine private
+    expect(out.get("a")).toBe(1); // restored Map content
+    expect(out.get("b")).toBe(2);
+    expect(out.size).toBe(2);
     expect(out).toBeInstanceOf(Map);
+  });
+
+  test("classes extending Set and Array reify genuinely with content + private", async () => {
+    class TaggedSet extends Set<number> {
+      #label = "S";
+      lbl() {
+        return this.#label;
+      }
+    }
+    class NumList extends Array<number> {
+      #unit = "px";
+      unit() {
+        return this.#unit;
+      }
+    }
+    const s = new TaggedSet([1, 2, 3]);
+    const a = new NumList();
+    a.push(10, 20);
+    void [s, a];
+
+    const so = (await roundtrip(() => s))();
+    expect(so.lbl()).toBe("S");
+    expect(so.has(2)).toBe(true);
+    expect(so.size).toBe(3);
+    expect(so).toBeInstanceOf(Set);
+
+    const ao = (await roundtrip(() => a))();
+    expect(ao.unit()).toBe("px");
+    expect([...ao]).toEqual([10, 20]);
+    expect(Array.isArray(ao)).toBe(true);
   });
 
   // A bound base method on a subclass instance: the chain stays genuine (GP2b) and the
