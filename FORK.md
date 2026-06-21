@@ -310,14 +310,49 @@ Other notes:
 While testing source maps we found that **Bun does not apply a loaded file's own
 source map** — neither an external `.js.map` nor an inline
 `//# sourceMappingURL=data:` — to stack traces. Running a `.ts` directly works
-(Bun's internal transpile maps), but loading a pre-built `.js` shows the `.js`
-position, unmapped. The resolution logic *exists* in `src/sourcemap/lib.rs`
-(`get_source_map_impl`: scans for `sourceMappingURL`, decodes `data:` URLs,
-loads external `.map` JSON), but external loading is gated behind
-`SourceProvider::HAS_SOURCE_MAP_JSON` (true only for the bake dev-server
-provider), and the inline path isn't reached for plain loaded `.js`. The store is
-`src/jsc/SavedSourceMap.rs`; transpiled files register via `put_mappings`. This
-is a core-runtime fix, deliberately left out of this fork's scope.
+(Bun's internal transpile maps), but loading a pre-built `.js`/`.mjs` shows the
+generated position, unmapped. This means a reconstructed closure's own frame
+(e.g. a `throw` inside the reified function) resolves to the **reconstructed
+module**, not the original source — verified by the characterization test
+`thrown error's own frame currently resolves to the reconstructed module` in
+`test/js/bun/closure.test.ts`. The serializer's *emitted* map is correct (proven
+by the decode-verified suite in the same file); the gap is purely in runtime
+application.
+
+**Root cause (traced, three layers):**
+
+1. **The transpiler discards the inline comment on reprint.** The lexer parses
+   `//# sourceMappingURL=…` into `lexer.source_mapping_url`
+   (`src/js_parser/lexer.rs:266`), but the printer reprints the AST and does not
+   re-emit the pragma, so by the time `SourceProvider::create` sees the loaded
+   module its source carries no `sourceMappingURL=` comment to detect.
+
+2. **Provider registration is gated on `already_bundled`.** In
+   `src/jsc/bindings/ZigSourceProvider.cpp`, `Bun__addSourceProviderSourceMap`
+   is only called when `resolvedSource.already_bundled` (true only for
+   `bun build --target=bun` output / the bake dev-server provider). A plainly
+   `import()`ed `.mjs` is never registered, so `get_source_map_impl` is never
+   reached for it. (Confirmed empirically: a debug print in
+   `add_source_provider_source_map` fires for `[eval]`'s transpile map but never
+   for the loaded `mod.mjs`.)
+
+3. **`parse_url` rejects the most common inline form.** Even on the bundled path,
+   `src/sourcemap/lib.rs`'s `parse_url` only matched
+   `data:application/json;base64,` / `data:application/json,` — it returned
+   `UnsupportedFormat` for `data:application/json;charset=utf-8;base64,`, which is
+   what bun:closure and most tools (tsc/webpack/rollup) emit, because it compared
+   the whole header `charset=utf-8;base64` against `"base64"` instead of scanning
+   `;`-separated segments. (Bun's *own* bundler emits without `charset`, so this
+   bug is masked on the already_bundled path.)
+
+A real fix would re-emit/chain the input map through the transpile and register
+the provider for any module whose source (or parsed pragma) carries a map — i.e.
+ungate registration from `already_bundled` *and* fix the `charset` segment scan.
+Prototype patches for layers 2 and 3 were written and verified to be individually
+correct, but proved **insufficient in isolation** (layer 1 strips the comment
+before either runs) and were reverted rather than shipped as dead code. The store
+is `src/jsc/SavedSourceMap.rs`; transpiled files register via `put_mappings`.
+This remains a core-runtime fix, deliberately left out of this fork's scope.
 
 ---
 
