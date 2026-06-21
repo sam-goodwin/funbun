@@ -4736,6 +4736,31 @@ describe("genuine #private: general permutations", () => {
     expect([...out]).toEqual([8, 9]); // the Symbol.iterator method reads the genuine slot
   });
 
+  test("computed method/accessor keys captured ONLY as keys are recovered from the class", async () => {
+    const tag = Symbol("tag"); // a captured string/symbol used ONLY as a method key is pruned
+    const keyName = "dynamic"; // from the class's scope by JSC — recovered from the class's
+    const accName = "view"; // own keys instead (robustly, by the member source).
+    class C {
+      #x = 8;
+      [tag]() {
+        return this.#x;
+      }
+      [keyName]() {
+        return this.#x + 1;
+      }
+      get [accName]() {
+        return this.#x * 10;
+      }
+    }
+    const c = new C();
+    void c; // tag / keyName / accName are not referenced anywhere the closure captures
+    const out = (await roundtrip(() => c))();
+    const sym = Object.getOwnPropertySymbols(Object.getPrototypeOf(out))[0];
+    expect((out as any)[sym]()).toBe(8); // symbol-keyed computed method
+    expect((out as any).dynamic()).toBe(9); // string-keyed computed method
+    expect((out as any).view).toBe(80); // computed accessor
+  });
+
   test("public accessors coexist with genuine privates", async () => {
     class C {
       #x = 4;

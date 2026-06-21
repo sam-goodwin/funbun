@@ -1612,12 +1612,14 @@ function fieldInitializerBindings(fn: Function, source: string, boundNames: Set<
   const names = new Set<string>();
   for (const m of members) {
     if (!m || typeof m !== "object") continue;
-    // Field initializer values (`x = <expr>`). The value runs in the class's
-    // scope (per-instance for instance fields, at definition for static), so a
-    // captured var it references is resolvable. (Computed keys `[expr]` are
-    // consumed at definition and aren't in the class's runtime scope, so they
-    // can't be recovered this way.)
+    // Field initializer values (`x = <expr>`). The value runs in the class's scope
+    // (per-instance for instance fields, at definition for static), so a captured var it
+    // references is resolvable.
     if (m.type === "PropertyDefinition" && m.value) for (const n of freeIdentifiersOfNode(m.value)) names.add(n);
+    // Computed member keys (`[expr]() {}` / `[expr] = v`). The key expression is evaluated
+    // when the class definition runs, in the class's defining scope — so a captured var it
+    // references (e.g. a Symbol) is resolvable and must be bound BEFORE the class.
+    if (m.computed && m.key) for (const n of freeIdentifiersOfNode(m.key)) names.add(n);
   }
 
   const bindings: string[] = [];
@@ -1629,7 +1631,52 @@ function fieldInitializerBindings(fn: Function, source: string, boundNames: Set<
     const value = transform(undefined, name, resolved.value, ctx);
     bindings.push(`const ${name} = ${emitValue(value, ctx)};`);
   }
+
+  // Computed keys whose identifier is used ONLY as the key (`[mk]() {}` and `mk` is
+  // referenced nowhere else) are pruned from the class's scope by JSC, so the resolve above
+  // can't find them. Recover the ACTUAL evaluated key from the reconstructed class's own
+  // members and bind the identifier to it.
+  for (const [name, value] of recoverComputedKeyValues(fn, members, boundNames)) {
+    boundNames.add(name);
+    bindings.push(`const ${name} = ${emitValue(transform(undefined, name, value, ctx), ctx)};`);
+  }
   return bindings;
+}
+
+// For each member with a computed identifier key (`[mk]() {}`) whose identifier is still
+// unbound, recover the real evaluated key from the live class and bind the identifier to it.
+// Matching is robust (not order-based: Reflect.ownKeys groups strings before symbols): a
+// computed member's reconstructed source begins with `[name]`, so we find the holder key
+// whose own method/accessor `toString()` begins with `[name]`. Returns [name, key] entries.
+function recoverComputedKeyValues(fn: Function, members: any[], boundNames: Set<string>): Array<[string, unknown]> {
+  const out: Array<[string, unknown]> = [];
+  // `[name]` at the start of a member source, after any modifiers (async/*/get/set/static).
+  const startsWithComputed = (src: string, name: string): boolean =>
+    new RegExp(`^\\s*(?:static\\s+|async\\s+|get\\s+|set\\s+|\\*\\s*)*\\[\\s*${name}\\s*\\]`).test(src);
+  for (const m of members) {
+    if (!m.computed || m.key?.type !== "Identifier") continue;
+    const name = m.key.name as string;
+    if (boundNames.has(name)) continue;
+    const holder = m.static ? fn : fn.prototype;
+    if (holder == null) continue;
+    for (const k of Reflect.ownKeys(holder)) {
+      const d = Object.getOwnPropertyDescriptor(holder, k);
+      if (d === undefined) continue;
+      const f = d.value ?? d.get ?? d.set;
+      if (typeof f !== "function") continue;
+      let src: string;
+      try {
+        src = f.toString();
+      } catch {
+        continue;
+      }
+      if (startsWithComputed(src, name)) {
+        out.push([name, k]);
+        break;
+      }
+    }
+  }
+  return out;
 }
 
 // Applies the replacer (if any) to a value before it is serialized. `holder` is
