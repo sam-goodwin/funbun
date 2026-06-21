@@ -6097,3 +6097,168 @@ describe("documented limitations (skipped)", () => {
     expect(out.tag()).toBe("w");
   });
 });
+
+// Deterministic round-trip fuzz: a seeded generator builds random value graphs (data,
+// builtins, cycles, and genuine-private class instances across the supported matrix); each
+// is serialized → re-imported → deep-compared. Fixed seeds keep it reproducible (not
+// flaky). This guards against silent-corruption regressions across the whole machinery —
+// the class of bug this caught (undefined-property drop, inline-base collision).
+describe("round-trip fuzz (seeded, deterministic)", () => {
+  const mulberry32 = (a: number) => () => {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+
+  class P {
+    #x: any;
+    constructor(v: any) {
+      this.#x = v;
+    }
+    probe() {
+      return { x: this.#x };
+    }
+  }
+  class Self {
+    #me: any = null;
+    #v: any;
+    constructor(v: any) {
+      this.#me = this;
+      this.#v = v;
+    }
+    probe(): any {
+      return { isSelf: this.#me === this, v: this.#v };
+    }
+  }
+  class B {
+    #b: any;
+    constructor(v: any) {
+      this.#b = v;
+    }
+    gb() {
+      return this.#b;
+    }
+  }
+  class D extends B {
+    #d: any;
+    constructor(b: any, d: any) {
+      super(b);
+      this.#d = d;
+    }
+    probe() {
+      return { b: this.gb(), d: this.#d };
+    }
+  }
+  class Coll extends class A {
+    #x: any;
+    constructor(v: any) {
+      this.#x = v;
+    }
+    ax() {
+      return this.#x;
+    }
+  } {
+    #x: any;
+    constructor(a: any, b: any) {
+      super(a);
+      this.#x = b;
+    }
+    probe() {
+      return { a: this.ax(), x: this.#x };
+    }
+  }
+  class TM extends Map<string, any> {
+    #t: any;
+    constructor(e: any, t: any) {
+      super(e);
+      this.#t = t;
+    }
+    probe() {
+      return { t: this.#t, e: [...this] };
+    }
+  }
+  const SHAPES = [
+    (v: any) => new P(v),
+    (v: any) => new Self(v),
+    (v: any) => new D(v, v),
+    (v: any) => new Coll(v, v),
+    (v: any) => new TM([["k", v]], v),
+  ];
+
+  const genLeaf = (rng: () => number): any => {
+    const t = Math.floor(rng() * 6);
+    return t === 0
+      ? Math.floor(rng() * 1000) - 500
+      : t === 1
+        ? "s" + Math.floor(rng() * 999)
+        : t === 2
+          ? rng() > 0.5
+          : t === 3
+            ? null
+            : t === 4
+              ? undefined
+              : new Date(Math.floor(rng() * 1e12));
+  };
+  const genValue = (rng: () => number, depth: number): any => {
+    if (depth <= 0 || rng() < 0.4) return genLeaf(rng);
+    const t = Math.floor(rng() * 8);
+    if (t === 0) {
+      const n = Math.floor(rng() * 4);
+      const a: any[] = [];
+      for (let i = 0; i < n; i++) a.push(genValue(rng, depth - 1));
+      return a;
+    }
+    if (t === 1) {
+      const o: any = {};
+      const n = Math.floor(rng() * 4);
+      for (let i = 0; i < n; i++) o["k" + i] = genValue(rng, depth - 1);
+      return o;
+    }
+    if (t === 2) {
+      const m = new Map();
+      const n = Math.floor(rng() * 3);
+      for (let i = 0; i < n; i++) m.set("k" + i, genValue(rng, depth - 1));
+      return m;
+    }
+    if (t === 3) return SHAPES[Math.floor(rng() * SHAPES.length)](genValue(rng, depth - 1));
+    return genLeaf(rng);
+  };
+
+  const eq = (a: any, b: any, seen: Array<[any, any]>): boolean => {
+    if (a === b) return true;
+    if (typeof a === "bigint" || typeof b === "bigint") return a === b;
+    if (typeof a !== "object" || a === null || typeof b !== "object" || b === null) return Object.is(a, b);
+    for (const [x, y] of seen) if (x === a && y === b) return true;
+    seen.push([a, b]);
+    if (a instanceof Date) return b instanceof Date && a.getTime() === b.getTime();
+    if (typeof a.probe === "function" && typeof b.probe === "function") return eq(a.probe(), b.probe(), seen);
+    if (a instanceof Map)
+      return b instanceof Map && a.size === b.size && [...a].every(([k, v]) => b.has(k) && eq(v, b.get(k), seen));
+    if (Array.isArray(a)) {
+      if (!Array.isArray(b) || a.length !== b.length) return false;
+      for (let i = 0; i < a.length; i++) if (!eq(a[i], b[i], seen)) return false;
+      return true;
+    }
+    const ka = Object.keys(a),
+      kb = Object.keys(b);
+    if (ka.length !== kb.length) return false;
+    for (const k of ka) if (!(k in b) || !eq(a[k], b[k], seen)) return false;
+    return true;
+  };
+
+  test("100 seeded random graphs round-trip with deep equality", async () => {
+    let checked = 0;
+    for (let seed = 0; seed < 100; seed++) {
+      const rng = mulberry32(seed + 1);
+      const val = genValue(rng, 3);
+      const fn = await roundtrip(() => val);
+      const out = (fn as any)();
+      checked++;
+      // On mismatch, surface the seed so it can be reproduced.
+      expect(eq(val, out, []) ? "ok" : `seed ${seed} mismatch`).toBe("ok");
+    }
+    expect(checked).toBe(100);
+  });
+});
