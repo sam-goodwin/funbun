@@ -549,6 +549,16 @@ export const CATEGORIES: CoverageCategory[] = [
       S("map.v3-valid", "emitted map is a valid v3 structure", "is a structurally valid v3 map"),
       S("map.line-fidelity", "body maps back to its definition line", "a line maps to its definition line"),
       S(
+        "map.column-accurate",
+        "emitted columns are accurate (def column + body indentation)",
+        "columns are accurate: definition line maps to its column",
+      ),
+      S(
+        "map.multi-source-chain",
+        "multi-source map: cross-file frame chains to its own file",
+        "multi-source map: a captured cross-file function's frame chains to its own original file",
+      ),
+      S(
         "map.prelude-offset",
         "captured-value prelude offset stays correct",
         "captured-value prelude shifts generated lines but original lines stay correct",
