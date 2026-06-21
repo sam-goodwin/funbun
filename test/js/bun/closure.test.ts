@@ -4067,6 +4067,195 @@ describe("genuine #private reification", () => {
     expect(out.tri.sides()).toBe(3);
     expect(out.run()).toBe(3);
   });
+
+  test("public own fields are restored alongside genuine privates", async () => {
+    class Mixed {
+      label = "init"; // public field
+      #secret = 1; // private field
+      constructor() {
+        this.#secret = 7;
+        this.label = "set";
+      }
+      both() {
+        return `${this.label}:${this.#secret}`;
+      }
+    }
+    const x = new Mixed();
+    x.label = "mutated";
+    (x as any).extra = 99; // externally-assigned public prop
+    void x;
+
+    const code = serialize(() => x);
+    expect(code).not.toContain("$bunClosurePrivate$");
+    const out = (await roundtrip(() => x))();
+    expect(out.label).toBe("mutated"); // public field restored (post-construction value)
+    expect((out as any).extra).toBe(99); // externally-added public prop restored
+    expect(out.both()).toBe("mutated:7"); // genuine private + public together
+  });
+
+  test("a private field holding a complex value reifies by identity", async () => {
+    class Holder {
+      #data: { n: number[] };
+      constructor(d: { n: number[] }) {
+        this.#data = d;
+      }
+      get() {
+        return this.#data;
+      }
+    }
+    const shared = { n: [1, 2, 3] };
+    const h = new Holder(shared);
+    void h;
+
+    const out = (await roundtrip(() => h))();
+    expect(out.get()).toEqual({ n: [1, 2, 3] }); // nested object reified through the slot
+    out.get().n.push(4);
+    expect(out.get().n).toEqual([1, 2, 3, 4]); // it's a live object, not a copy
+  });
+
+  test("a class captured without an instance still constructs with genuine privates", async () => {
+    class Counter {
+      #n: number;
+      constructor(start: number) {
+        this.#n = start;
+      }
+      next() {
+        return ++this.#n;
+      }
+    }
+    void Counter;
+
+    const code = serialize(() => Counter);
+    expect(code).toContain("_reify"); // reconstructed genuine (reify branch present)
+    const Reconstructed = (await roundtrip(() => Counter))() as typeof Counter;
+    const inst = new Reconstructed(10); // normal `new` path (reify slot is null)
+    expect(inst.next()).toBe(11);
+    expect(inst.next()).toBe(12);
+    expect(Object.getOwnPropertyNames(inst)).not.toContain("$bunClosurePrivate$n");
+  });
+
+  test("a three-level inheritance chain reifies every level", async () => {
+    class A {
+      #a = 0;
+      constructor() {
+        this.#a = 1;
+      }
+      ga() {
+        return this.#a;
+      }
+    }
+    class B extends A {
+      #b = 0;
+      constructor() {
+        super();
+        this.#b = 2;
+      }
+      gb() {
+        return this.#b;
+      }
+    }
+    class C extends B {
+      #c = 0;
+      constructor() {
+        super();
+        this.#c = 3;
+      }
+      gc() {
+        return this.#c;
+      }
+    }
+    const c = new C();
+    void c;
+
+    const code = serialize(() => c);
+    expect(code).not.toContain("$bunClosurePrivate$");
+    const out = (await roundtrip(() => c))();
+    expect([out.ga(), out.gb(), out.gc()]).toEqual([1, 2, 3]);
+  });
+
+  test("an intermediate class with no private fields is bridged genuinely", async () => {
+    class Base {
+      #v: number;
+      constructor(v: number) {
+        this.#v = v;
+      }
+      val() {
+        return this.#v;
+      }
+    }
+    class Mid extends Base {} // no own privates, no explicit constructor
+    class Leaf extends Mid {
+      #w = 0;
+      constructor() {
+        super(10);
+        this.#w = 20;
+      }
+      sum() {
+        return this.val() + this.#w;
+      }
+    }
+    const leaf = new Leaf();
+    void leaf;
+
+    const code = serialize(() => leaf);
+    expect(code).not.toContain("$bunClosurePrivate$");
+    const out = (await roundtrip(() => leaf))();
+    expect(out.sum()).toBe(30); // base #v (10, through Mid) + leaf #w (20)
+  });
+
+  test("a derived class with no explicit constructor reifies and still constructs normally", async () => {
+    class Base {
+      #v: number;
+      constructor(v: number) {
+        this.#v = v;
+      }
+      val() {
+        return this.#v;
+      }
+    }
+    class Derived extends Base {} // synthesized constructor must forward super(...args)
+    const d = new Derived(5);
+    void Derived;
+
+    // Reified instance reads the genuine base private.
+    const out = (await roundtrip(() => d))();
+    expect(out.val()).toBe(5);
+
+    // The reconstructed class still constructs normally (reify slot null path).
+    const Reconstructed = (await roundtrip(() => Derived))() as typeof Derived;
+    expect(new Reconstructed(42).val()).toBe(42);
+  });
+
+  test("a throwing base-class method maps to the original base source line", async () => {
+    class Base {
+      #v = 0;
+      detonate() {
+        throw new Error("kapow");
+      }
+    }
+    class Sub extends Base {
+      #w = 1;
+    }
+    const s = new Sub();
+    void s;
+
+    const code = serialize(() => s);
+    expect(code).toContain("_reify");
+    using dir = tempDir("closure-gp-base-srcmap", { "mod.mjs": code });
+    const { default: fn } = await import(`${String(dir)}/mod.mjs`);
+    let caught: any;
+    try {
+      fn().detonate();
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught?.message).toBe("kapow");
+    const frame = caught.stack.split("\n").find((l: string) => l.includes("detonate"));
+    expect(frame).toBeDefined();
+    expect(frame).toContain("closure.test");
+    expect(frame).not.toContain("mod.mjs");
+    expect(frame).toMatch(/:\d+:\d+/);
+  });
 });
 
 describe("interactions: guards fire when nested", () => {
