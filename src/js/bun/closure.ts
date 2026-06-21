@@ -101,6 +101,14 @@ interface Context {
   // reference through the reconstructed class prototype — which reads the genuine `#x` —
   // instead of being rebuilt standalone (where `this.#x` would have to be mangled).
   genuineMethods: Map<Function, { classFn: Function; key: string | symbol; kind: "method" | "get" | "set" }>;
+  // Escaped arrows that read a `#private` through their lexical `this` and ARE hostable
+  // (their `this` is an instance of a genuine class, and they capture nothing but `this`/
+  // brands). Each maps to the recovered receiver instance, its class, and the synthetic
+  // host-method key injected into that class. emitFunction reconstructs the arrow as
+  // `<instance>.<hostKey>()`.
+  hostedArrows: Map<Function, { instance: object; classFn: Function; hostKey: string }>;
+  // Per genuine class, the host methods to inject into its body: `<hostKey>(){ return (<arrow source>); }`.
+  classHosts: Map<Function, Array<{ hostKey: string; source: string }>>;
   // For a genuine-private class actually emitted: the reify factory name + the private
   // field names its injected constructor branch installs. Consumed when emitting an
   // instance so it flows through the factory.
@@ -153,7 +161,7 @@ function serialize(fn: Function, replacer?: Replacer): string {
     const m = /^__bunClosure\$(\d+)$/.exec(variable.name);
     if (m !== null) counterStart = Math.max(counterStart, Number(m[1]) + 1);
   }
-  const genuineClasses = computeGenuineClasses(fn);
+  const genuinePlan = computeGenuineClasses(fn);
   const ctx: Context = {
     module: [],
     refs: new Map(),
@@ -165,8 +173,10 @@ function serialize(fn: Function, replacer?: Replacer): string {
     keepSets: computeKeepSets(fn),
     symbols: new Map(),
     alsContexts: [],
-    genuineClasses,
-    genuineMethods: computeGenuineMethods(genuineClasses),
+    genuineClasses: genuinePlan.genuine,
+    genuineMethods: computeGenuineMethods(genuinePlan.genuine),
+    hostedArrows: genuinePlan.hostedArrows,
+    classHosts: genuinePlan.classHosts,
     classReify: new Map(),
     needsReifySlot: false,
   };
@@ -658,15 +668,17 @@ function classStructure(source: string): ClassStructure | null {
 // Inject a guarded reify branch at the top of the class's constructor body:
 //   constructor(...) { if (REIFY_SLOT !== null) { super(); this.#x = REIFY_SLOT["#x"]; ...; return; } <orig> }
 // A derived class calls super() first (its base's own injected branch installs the base
-// privates from the same slot). The branch is a single line inserted right after the body
-// `{`, so the original body's lines (and thus source maps) are unchanged.
-function injectReifyConstructor(source: string, info: ClassStructure): string {
+// privates from the same slot). Also injects any host methods (for escaped `#x` arrows)
+// right after the class body `{`. All insertions are single-line, so the original body's
+// lines (and thus source maps) are unchanged.
+function injectReifyConstructor(source: string, info: ClassStructure, hostMethods: string[]): string {
   const { fields, isDerived, node, offset } = info;
   const branch =
     `if(${REIFY_SLOT}!==null){` +
     (isDerived ? "super();" : "") +
     fields.map(f => `this.${f}=${REIFY_SLOT}[${JSON.stringify(f)}];`).join("") +
     `return;}`;
+  const hosts = hostMethods.join("");
 
   const ctor = node.body.body.find(
     (m: any) => m.type === "MethodDefinition" && m.static !== true && m.key?.value === "constructor",
@@ -685,7 +697,14 @@ function injectReifyConstructor(source: string, info: ClassStructure): string {
       }
     }
     while (i < source.length && source[i] !== "{") i++;
-    return source.slice(0, i + 1) + branch + source.slice(i + 1);
+    // Insert the reify branch after the constructor body `{` (later position) first, then
+    // the host methods after the class body `{` (earlier position) so offsets stay valid.
+    let out = source.slice(0, i + 1) + branch + source.slice(i + 1);
+    if (hosts) {
+      const classBrace = out.indexOf("{");
+      out = out.slice(0, classBrace + 1) + hosts + out.slice(classBrace + 1);
+    }
+    return out;
   }
 
   // No explicit constructor: synthesize one right after the class body `{`. A derived
@@ -693,7 +712,7 @@ function injectReifyConstructor(source: string, info: ClassStructure): string {
   // constructor would otherwise never call super and throw.
   const brace = source.indexOf("{");
   const synthesized = isDerived ? `constructor(...a){${branch}super(...a);}` : `constructor(){${branch}}`;
-  return source.slice(0, brace + 1) + synthesized + source.slice(brace + 1);
+  return source.slice(0, brace + 1) + synthesized + hosts + source.slice(brace + 1);
 }
 
 // The reachability GATE. Genuine `#private` reconstruction only works in a closed world:
@@ -702,7 +721,12 @@ function injectReifyConstructor(source: string, info: ClassStructure): string {
 // (more mangling fallback is always safe) and clear a class for genuine reconstruction
 // only when its whole hierarchy is reconstructable and nothing in the graph would need its
 // privates elsewhere.
-function computeGenuineClasses(root: unknown): Set<Function> {
+interface GenuinePlan {
+  genuine: Set<Function>;
+  hostedArrows: Map<Function, { instance: object; classFn: Function; hostKey: string }>;
+  classHosts: Map<Function, Array<{ hostKey: string; source: string }>>;
+}
+function computeGenuineClasses(root: unknown): GenuinePlan {
   const funcs = new Set<Function>();
   const objs = new Set<object>();
   const seen = new Set<unknown>();
@@ -710,36 +734,54 @@ function computeGenuineClasses(root: unknown): Set<Function> {
   const push = (v: unknown) => {
     if (v !== null && (typeof v === "object" || typeof v === "function")) stack.push(v);
   };
-  while (stack.length) {
-    const v = stack.pop()!;
-    if (seen.has(v)) continue;
-    seen.add(v);
-    // Never walk a Proxy's internals (would trip its traps / observable side effects).
-    if ($isProxyObject(v as object)) continue;
-    if (typeof v === "function") {
-      funcs.add(v);
-      const fv = (v as any)[Symbol.freeVariables] as FreeVariable[] | undefined;
-      if (fv) for (const x of fv) push(x.value);
-      const bound = (v as any)[Symbol.boundFunction] as BoundDetails | undefined;
-      if (bound) {
-        push(bound.target);
-        push(bound.boundThis);
-        for (const a of bound.boundArgs) push(a);
+  const drain = (): void => {
+    while (stack.length) {
+      const v = stack.pop()!;
+      if (seen.has(v)) continue;
+      seen.add(v);
+      // Never walk a Proxy's internals (would trip its traps / observable side effects).
+      if ($isProxyObject(v as object)) continue;
+      if (typeof v === "function") {
+        funcs.add(v);
+        const fv = (v as any)[Symbol.freeVariables] as FreeVariable[] | undefined;
+        if (fv) for (const x of fv) push(x.value);
+        const bound = (v as any)[Symbol.boundFunction] as BoundDetails | undefined;
+        if (bound) {
+          push(bound.target);
+          push(bound.boundThis);
+          for (const a of bound.boundArgs) push(a);
+        }
+        if ((v as any).prototype) push((v as any).prototype);
+      } else {
+        objs.add(v as object);
+        // Intentionally NOT reading Symbol.privateFields here: it's only needed to push
+        // values hidden inside private fields (a rare disqualifier source), and reading it
+        // on an object with a private accessor (`get #x`) trips a native assertion.
       }
-      if ((v as any).prototype) push((v as any).prototype);
-    } else {
-      objs.add(v as object);
-      // Intentionally NOT reading Symbol.privateFields here: it's only needed to push
-      // values hidden inside private fields (a rare disqualifier source), and reading it
-      // on an object with a private accessor (`get #x`) trips a native assertion.
+      // Own DATA properties only — reading an accessor could fire a getter (side effect).
+      for (const key of Reflect.ownKeys(v as object)) {
+        const d = Object.getOwnPropertyDescriptor(v as object, key);
+        if (d !== undefined && "value" in d) push(d.value);
+      }
+      push(Object.getPrototypeOf(v as object));
     }
-    // Own DATA properties only — reading an accessor could fire a getter (side effect).
-    for (const key of Reflect.ownKeys(v as object)) {
-      const d = Object.getOwnPropertyDescriptor(v as object, key);
-      if (d !== undefined && "value" in d) push(d.value);
+  };
+  drain();
+
+  // Fold hostable escaped arrows' receivers into reachability: their `this` instance (and
+  // hence its class) is otherwise invisible (the arrow captures only the brand), but we
+  // recover it natively and host the arrow on the class. The instance must then be emitted
+  // and its class must qualify as genuine.
+  const arrowInstance = new Map<Function, object>();
+  for (const f of [...funcs]) {
+    if (!hostableEscapedArrow(f)) continue;
+    const r = $resolveClosureBinding(f, "this");
+    if (r?.found && r.value !== null && typeof r.value === "object") {
+      arrowInstance.set(f, r.value as object);
+      push(r.value);
     }
-    push(Object.getPrototypeOf(v as object));
   }
+  drain();
 
   // Cache each reachable class's parsed structure.
   const structure = new Map<Function, ClassStructure | null>();
@@ -754,10 +796,9 @@ function computeGenuineClasses(root: unknown): Set<Function> {
     return structure.get(C)!;
   };
 
-  // Structural candidates: every class in a hierarchy that (a) reaches Object through
-  // parseable user classes only (no builtin base), (b) has at least one private field
-  // somewhere in the chain, (c) has no same-name private collision across the chain, and
-  // (d) has no chain member with a bound/extracted method or escaped `#x` closure reachable.
+  // Structural candidates: every class in a hierarchy that reaches Object through parseable
+  // user classes only (no builtin base), has ≥1 private field, no same-name collision
+  // across the chain, and no chain member with a non-hostable escaped `#x` closure.
   const candidate = new Set<Function>();
   for (const f of funcs) {
     const chain = genuineChain(f, structOf, funcs);
@@ -780,7 +821,46 @@ function computeGenuineClasses(root: unknown): Set<Function> {
       }
     }
   }
-  return candidate;
+
+  // Assign hosting: an escaped arrow is hosted only when its receiver's DIRECT class is
+  // genuine and declares every private the arrow reads (so `this.#x` is legal in that
+  // class's body and the receiver carries the brand). Each gets a unique host-method key.
+  const hostedArrows: GenuinePlan["hostedArrows"] = new Map();
+  const classHosts: GenuinePlan["classHosts"] = new Map();
+  const hostCount = new Map<Function, number>();
+  for (const [arrow, instance] of arrowInstance) {
+    const proto = Object.getPrototypeOf(instance);
+    const classFn = (proto as any)?.constructor;
+    if (typeof classFn !== "function" || classFn.prototype !== proto || !candidate.has(classFn)) continue;
+    const reads = (((arrow as any)[Symbol.freeVariables] as FreeVariable[] | undefined) ?? [])
+      .filter(v => v.name.startsWith("#"))
+      .map(v => v.name);
+    const fields = structOf(classFn)?.fields ?? [];
+    if (!reads.every(name => fields.includes(name))) continue;
+    const n = hostCount.get(classFn) ?? 0;
+    hostCount.set(classFn, n + 1);
+    const hostKey = `__bunClosureHost$${n}`;
+    hostedArrows.set(arrow, { instance, classFn, hostKey });
+    let hosts = classHosts.get(classFn);
+    if (hosts === undefined) classHosts.set(classFn, (hosts = []));
+    hosts.push({ hostKey, source: arrow.toString() });
+  }
+  return { genuine: candidate, hostedArrows, classHosts };
+}
+
+// True if `fn` is an arrow that reads a `#private` through its lexical `this` AND captures
+// nothing but `this`/brands (so its host method needs no parameters) — the hostable shape.
+function hostableEscapedArrow(fn: Function): boolean {
+  let src: string;
+  try {
+    src = fn.toString();
+  } catch {
+    return false;
+  }
+  if (!src.includes("#")) return false;
+  if (!arrowReadsLexicalThisPrivate(parseFunctionNode(rewritePrivateMembers(src)))) return false;
+  const fv = (fn as any)[Symbol.freeVariables] as FreeVariable[] | undefined;
+  return (fv ?? []).every(v => v.name.startsWith("#"));
 }
 
 // Index the prototype methods/accessors of every genuine class by function identity, so a
@@ -862,14 +942,15 @@ function classOwnMethods(C: Function): Set<Function> {
 }
 
 // True if some reachable function — other than C's own methods — is an escaped closure
-// that textually references one of C's private fields. Such a closure can't be hosted in
-// a class body yet (GP3), so genuine reconstruction can't serve it. Bound/extracted
-// methods are NOT disqualifying: they are emitted as references through the reconstructed
-// prototype (see computeGenuineMethods / emitFunction), which read the genuine slot.
+// that textually references one of C's private fields and is NOT a hostable escaped arrow.
+// A hostable arrow is reconstructed by hosting it in C's body (see computeGenuineClasses /
+// emitFunction), so it doesn't disqualify; any other #-referencing non-method closure
+// can't be served by genuine reconstruction. Bound/extracted methods are NOT disqualifying:
+// they're emitted as references through the reconstructed prototype.
 function perClassDisqualified(C: Function, fields: string[], funcs: Set<Function>): boolean {
   const ownMethods = classOwnMethods(C);
   for (const g of funcs) {
-    if (g === C || ownMethods.has(g)) continue;
+    if (g === C || ownMethods.has(g) || hostableEscapedArrow(g)) continue;
     let src: string;
     try {
       src = g.toString();
@@ -1232,7 +1313,8 @@ function reconstructFunctionExpr(fn: Function, ctx: Context): ReconstructedFunct
   let genuinePrivate: { fields: string[] } | undefined;
   const gpInfo = ctx.genuineClasses.has(fn) ? classStructure(original) : null;
   if (gpInfo !== null) {
-    source = injectReifyConstructor(original, gpInfo);
+    const hosts = (ctx.classHosts.get(fn) ?? []).map(h => `${h.hostKey}(){return (${h.source});}`);
+    source = injectReifyConstructor(original, gpInfo, hosts);
     genuinePrivate = { fields: gpInfo.fields };
     ctx.needsReifySlot = true;
   } else {
@@ -1241,7 +1323,17 @@ function reconstructFunctionExpr(fn: Function, ctx: Context): ReconstructedFunct
     // the receiving instance is baked in lexically and is not recoverable. Reject it (the
     // mangled source IS parseable, unlike the `#x` original) instead of emitting
     // silently-broken output — a private read off an unbound `this`.
-    if (source.includes(PRIVATE_PREFIX) && arrowReadsLexicalThisPrivate(parseFunctionNode(source))) {
+    // An arrow that reads a `#private` through its lexical `this` is reconstructed by
+    // HOSTING: a synthetic method injected into the (genuine) class returns the arrow, and
+    // it's obtained by invoking that host on the reified instance (ctx.hostedArrows). If it
+    // wasn't hosted (its `this` class isn't genuine-reconstructable, or it captures more
+    // than `this`/brands), it cannot be reconstructed — reject it instead of emitting
+    // silently-broken output.
+    if (
+      source.includes(PRIVATE_PREFIX) &&
+      !ctx.hostedArrows.has(fn) &&
+      arrowReadsLexicalThisPrivate(parseFunctionNode(source))
+    ) {
       throw new TypeError(
         "Cannot serialize an arrow function that reads a #private field through its lexical `this`: " +
           "the receiving instance cannot be recovered. Capture the value first, e.g. " +
@@ -2075,6 +2167,17 @@ function emitFunction(fn: Function, ctx: Context): string {
   const name = REF_PREFIX + ctx.counter++;
   ctx.refs.set(fn, name);
 
+  // An escaped arrow that reads a `#private` through its lexical `this` is reconstructed by
+  // invoking its host method on the reified receiver instance: the host (injected into the
+  // genuine class body) returns a fresh arrow whose `this` is that instance, so `this.#x`
+  // reads the genuine slot.
+  const hosted = ctx.hostedArrows.get(fn);
+  if (hosted !== undefined) {
+    const instanceExpr = emitValue(hosted.instance, ctx);
+    ctx.module.push(`const ${name} = ${instanceExpr}.${hosted.hostKey}();`);
+    return name;
+  }
+
   // Bound functions stringify as native code; reconstruct them from their
   // internals instead: target.bind(boundThis, ...boundArgs).
   const bound = (fn as any)[Symbol.boundFunction] as BoundDetails | undefined;
@@ -2516,7 +2619,7 @@ async function bundle(fn: Function, replacer?: Replacer): Promise<string> {
   // 1. Captured state → a virtual module exporting each free variable. Reuses
   //    the existing value emitter (objects, prototypes, pruning, cycles, …).
   const { sharedIds } = analyzeSharedCells(fn);
-  const genuineClasses = computeGenuineClasses(fn);
+  const genuinePlan = computeGenuineClasses(fn);
   const ctx: Context = {
     module: [],
     refs: new Map(),
@@ -2528,8 +2631,10 @@ async function bundle(fn: Function, replacer?: Replacer): Promise<string> {
     keepSets: computeKeepSets(fn),
     symbols: new Map(),
     alsContexts: [],
-    genuineClasses,
-    genuineMethods: computeGenuineMethods(genuineClasses),
+    genuineClasses: genuinePlan.genuine,
+    genuineMethods: computeGenuineMethods(genuinePlan.genuine),
+    hostedArrows: genuinePlan.hostedArrows,
+    classHosts: genuinePlan.classHosts,
     classReify: new Map(),
     needsReifySlot: false,
   };

@@ -3049,6 +3049,42 @@ JSC_DEFINE_HOST_FUNCTION(functionResolveClosureBinding, (JSC::JSGlobalObject * g
     if (!nameImpl)
         return JSC::JSValue::encode(result);
 
+    // An arrow function's captured lexical `this` lives in the scope under the keyword
+    // identifier "this", but a keyword can't be matched by the pointer-based symbol-table
+    // find below (its interned impl differs). Match it by string instead: the nearest scope
+    // entry literally named "this" that holds a scoped value is the captured receiver.
+    if (nameId.string() == "this"_s) {
+        for (JSC::JSScope* current = function->scope(); current; current = current->next()) {
+            if (current->inherits<JSC::JSGlobalObject>() || current->inherits<JSC::JSGlobalLexicalEnvironment>())
+                break;
+            auto* sto = dynamicDowncast<JSC::JSSymbolTableObject>(current);
+            if (!sto)
+                continue;
+            JSC::SymbolTable* st = sto->symbolTable();
+            JSC::ScopeOffset thisOffset;
+            bool hasThis = false;
+            {
+                JSC::ConcurrentJSLocker locker(st->m_lock);
+                for (auto it = st->begin(locker); it != st->end(locker); ++it) {
+                    if (it->value.varOffset().isScope() && String(it->key.get()) == "this"_s) {
+                        thisOffset = it->value.scopeOffset();
+                        hasThis = true;
+                        break;
+                    }
+                }
+            }
+            if (hasThis) {
+                JSC::JSValue value = readEnvironmentVariable(current, thisOffset);
+                if (value && !value.isEmpty()) {
+                    result->putDirect(vm, JSC::Identifier::fromString(vm, "found"_s), JSC::jsBoolean(true), 0);
+                    result->putDirect(vm, JSC::Identifier::fromString(vm, "value"_s), value, 0);
+                    return JSC::JSValue::encode(result);
+                }
+            }
+        }
+        return JSC::JSValue::encode(result);
+    }
+
     for (JSC::JSScope* current = function->scope(); current; current = current->next()) {
         if (current->inherits<JSC::JSGlobalObject>() || current->inherits<JSC::JSGlobalLexicalEnvironment>())
             break;

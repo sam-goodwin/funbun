@@ -4257,10 +4257,11 @@ describe("genuine #private reification", () => {
     expect(frame).toMatch(/:\d+:\d+/);
   });
 
-  // An arrow that reads a #private through its lexical `this` cannot be reconstructed: the
-  // receiving instance is baked in lexically and is unrecoverable. Reject it at serialize
-  // time (clear error) rather than emitting code that reads off an unbound `this` and crashes.
-  test("an escaped arrow reading a private through lexical this is rejected", () => {
+  // GP3a: an escaped arrow that reads a #private through its lexical `this` is reconstructed
+  // by HOSTING — its receiver is recovered natively, the class is reconstructed genuinely
+  // with a synthetic host method returning the arrow, and the arrow is obtained by invoking
+  // that host on the reified instance. So `() => this.#x` round-trips with true privacy.
+  test("an escaped arrow reading a private through lexical this is hosted genuinely", async () => {
     class C {
       #x = 41;
       make() {
@@ -4269,22 +4270,43 @@ describe("genuine #private reification", () => {
     }
     const f = new C().make();
     void f;
-    expect(() => serialize(() => f)).toThrow(/#private field through its lexical `this`/);
+
+    const code = serialize(() => f);
+    expect(code).not.toContain("$bunClosurePrivate$"); // genuine, not mangled
+    expect(code).toContain("__bunClosureHost$"); // hosted on the class body
+    const out = (await roundtrip(() => f))();
+    expect(out()).toBe(42); // the reified arrow reads the genuine #x
   });
 
-  test("an escaped arrow doing a private brand check on lexical this is rejected", () => {
+  test("an escaped arrow doing a private brand check on lexical this is hosted genuinely", async () => {
     class C {
       #x = 1;
       make() {
-        return () => #x in this;
+        return () => #x in this; // a real brand check against the genuine slot
       }
     }
     const f = new C().make();
     void f;
+
+    const code = serialize(() => f);
+    expect(code).not.toContain("$bunClosurePrivate$");
+    const out = (await roundtrip(() => f))();
+    expect(out()).toBe(true); // `#x in this` is true on the reified genuine instance
+  });
+
+  test("an escaped arrow capturing more than `this` (an outer variable) is rejected", () => {
+    class C {
+      #x = 1;
+      make(offset: number) {
+        return () => this.#x + offset; // captures `offset` too — not hostable yet
+      }
+    }
+    const f = new C().make(10);
+    void f;
     expect(() => serialize(() => f)).toThrow(/lexical `this`/);
   });
 
-  test("capturing the private value first is the supported workaround and round-trips", async () => {
+  test("capturing the private value first also round-trips (no hosting needed)", async () => {
     class C {
       #x = 7;
       make() {
