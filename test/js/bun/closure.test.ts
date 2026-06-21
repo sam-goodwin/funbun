@@ -5923,3 +5923,117 @@ describe("ALS rich: root-shape limits (graceful, no context restoration)", () =>
     // (requires the consumer to run() around the call)
   });
 });
+
+// ===========================================================================
+// DOCUMENTED LIMITATIONS — cases the serializer does NOT fully handle yet.
+//
+// These tests are skipped on purpose: they document, as executable specs, what
+// we can and can't do. Each body asserts the IDEAL behavior (so when a case is
+// implemented the test un-skips and proves it); the comment records the CURRENT
+// behavior and whether the gap is FUNDAMENTAL (needs engine support / impossible)
+// or FIXABLE (a feature we just haven't built).
+//
+// VERIFIED current behavior (2026-06-21): every case below currently fails with a
+// clear error — a serialize-time TypeError for the suspended/live-state cases, or
+// an import-time ReferenceError for the computed-field-key case — never silent
+// corruption.
+// ===========================================================================
+describe("documented limitations (skipped)", () => {
+  // FUNDAMENTAL. A generator's suspended frame (resume point + locals) lives in
+  // engine slots not reachable via reflection. serialize() throws a clear
+  // TypeError("Cannot serialize a Generator object ..."). Reconstructing a
+  // PARTIALLY-consumed generator would need native VM support to snapshot/restore
+  // the frame. Workaround: serialize the generator FUNCTION and recreate the
+  // iterator (that round-trips today).
+  test.skip("a partially-consumed generator resumes where it left off", async () => {
+    function* g() {
+      yield 1;
+      yield 2;
+      yield 3;
+    }
+    const it = g();
+    it.next(); // consume the first value
+    void it;
+    const out = (await roundtrip(() => it))();
+    expect(out.next().value).toBe(2); // would resume at 2
+  });
+
+  // FUNDAMENTAL (same reason as generators).
+  test.skip("a partially-consumed async generator resumes where it left off", async () => {
+    async function* ag() {
+      yield 1;
+      yield 2;
+    }
+    const ait = ag();
+    await ait.next();
+    void ait;
+    const out = (await roundtrip(() => ait))();
+    expect((await out.next()).value).toBe(2);
+  });
+
+  // FUNDAMENTAL. A builtin iterator (Map/Set/array .entries()/.values()) holds the
+  // same kind of suspended cursor. serialize() throws a clear TypeError.
+  test.skip("a partially-consumed builtin iterator resumes where it left off", async () => {
+    const iter = new Map([
+      ["a", 1],
+      ["b", 2],
+    ]).entries();
+    iter.next();
+    void iter;
+    const out = (await roundtrip(() => iter))();
+    expect(out.next().value).toEqual(["b", 2]);
+  });
+
+  // FUNDAMENTAL / BY DESIGN. A pending Promise's resolution is tied to live I/O or
+  // timers — not expressible as source. serialize() throws a clear
+  // TypeError("Cannot serialize a pending Promise ..."). Await it first, then
+  // serialize the settled value (settled promises DO round-trip).
+  test.skip("a pending promise round-trips and later resolves", async () => {
+    let resolve!: (v: number) => void;
+    const pending = new Promise<number>(r => (resolve = r));
+    void pending;
+    const out = (await roundtrip(() => pending))();
+    resolve(42);
+    expect(await out).toBe(42);
+  });
+
+  // FIXABLE. A computed FIELD key whose variable is used ONLY as the key
+  // (`const k = "x"; class C { [k] = 1 }`) is pruned from the class's scope by JSC,
+  // and — unlike a computed METHOD key — there is no method source to match the key
+  // back to. serialize() currently succeeds but emits `[k]` referencing an unbound
+  // `k`, so the reconstructed module throws ReferenceError at import. TODO: recover
+  // the key from the instance's own keys (the analog of recoverComputedKeyValues for
+  // methods), or reject at serialize time so it fails loudly instead.
+  test.skip("a computed field key used only as the key round-trips", async () => {
+    const k = "dynamicField";
+    class C {
+      [k] = 5;
+      plain = 1;
+    }
+    const c = new C();
+    void c;
+    const out = (await roundtrip(() => c))();
+    expect((out as any).dynamicField).toBe(5);
+    expect((out as any).plain).toBe(1);
+  });
+
+  // FIXABLE-ish. Genuine #private reification of a subclass of WeakMap/WeakSet/Date/
+  // Error/Promise is not done (only Map/Set/Array bases are genuine). These still
+  // reconstruct CORRECTLY via the mangled fallback — they just don't get true
+  // slot-privacy. This test asserts the stronger GENUINE outcome (no mangled field),
+  // which we don't yet provide for these bases.
+  test.skip("a WeakMap subclass with a private field reifies genuinely", async () => {
+    class TaggedWeak extends WeakMap<object, number> {
+      #tag = "w";
+      tag() {
+        return this.#tag;
+      }
+    }
+    const w = new TaggedWeak();
+    void w;
+    const code = serialize(() => w);
+    expect(code).not.toContain("$bunClosurePrivate$"); // would be genuine
+    const out = (await roundtrip(() => w))();
+    expect(out.tag()).toBe("w");
+  });
+});
