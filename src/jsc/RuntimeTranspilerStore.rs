@@ -986,8 +986,9 @@ impl TranspilerJob {
             // that chains the module's own input map. The raw source still
             // carries the //# sourceMappingURL= comment, so scan it here to keep
             // input-map chaining working on cache hits (mirrors the parse path).
+            // The comment is at the file end, so the scan is bounded to the tail.
             if let Some(url) =
-                bun_sourcemap::find_source_mapping_url_u8(&parse_result.source.contents)
+                bun_sourcemap::find_source_mapping_url_in_tail(&parse_result.source.contents)
             {
                 // SAFETY: leaf-field `&mut` borrow on `*vm.source_mappings`.
                 unsafe { &mut (*vm).source_mappings }

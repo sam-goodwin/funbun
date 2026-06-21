@@ -1194,6 +1194,19 @@ pub fn append_source_map_chunk<'a>(
     Ok(())
 }
 
+/// Like [`find_source_mapping_url_u8`] but only scans the file's tail. The
+/// `//# sourceMappingURL=` comment is conventionally the last line, so this
+/// bounds the cost when re-scanning a large cached module that has no map (the
+/// common case) instead of walking the whole buffer. An inline `data:` map whose
+/// URL is longer than the window won't be found — acceptable on the cache-hit
+/// path, where the cache-miss parse path already captured it via the lexer.
+pub fn find_source_mapping_url_in_tail(source: &[u8]) -> Option<bun_core::zig_string::Slice> {
+    // Generous enough for realistic inline maps; external-map refs are tiny.
+    const MAX_TAIL: usize = 64 * 1024;
+    let start = source.len().saturating_sub(MAX_TAIL);
+    find_source_mapping_url_u8(&source[start..])
+}
+
 /// Always returns UTF-8.
 pub fn find_source_mapping_url_u8(source: &[u8]) -> Option<bun_core::zig_string::Slice> {
     const NEEDLE: &[u8] = b"\n//# sourceMappingURL=";

@@ -2696,10 +2696,10 @@ fn transpile_source_code_inner(
                     );
                     // A cache hit skips the print path that chains the module's
                     // own input map. The raw source still carries the
-                    // //# sourceMappingURL= comment, so scan it here to keep
-                    // input-map chaining working on cache hits.
+                    // //# sourceMappingURL= comment, so scan it here (bounded to
+                    // the file tail) to keep input-map chaining working on hits.
                     if let Some(url) =
-                        bun_sourcemap::find_source_mapping_url_u8(&source.contents)
+                        bun_sourcemap::find_source_mapping_url_in_tail(&source.contents)
                     {
                         // SAFETY: per fn contract — `jsc_vm` is the live per-thread VM.
                         unsafe { &mut (*jsc_vm).source_mappings }
