@@ -455,10 +455,22 @@ function analyzeSharedCells(root: Function): { sharedIds: Set<number>; cellInfo:
   const seenFns = new Set<Function>();
   const seenObjs = new Set<object>();
 
-  function visitValue(value: unknown): void {
+  // Function -> the functions it captures (free-var values that are functions).
+  const fnEdges = new Map<Function, Set<Function>>();
+  // Cell id -> its value, when that value is a function. Used to hoist cells
+  // whose function participates in a reference cycle.
+  const cellValueFn = new Map<number, Function>();
+
+  // Iterative graph walk (an explicit heap stack, not the JS call stack) so a deep object
+  // chain doesn't overflow. The result is order-independent (it only fills sets/maps), so any
+  // visit order is fine. `enqueue` pushes objects/functions; `processValue` pops and expands.
+  const stack: unknown[] = [];
+  function enqueue(value: unknown): void {
     if (value === null) return;
-    const type = typeof value;
-    if (type !== "function" && type !== "object") return;
+    const t = typeof value;
+    if (t === "function" || t === "object") stack.push(value);
+  }
+  function processValue(value: unknown): void {
     // An AsyncLocalStorage instance is reconstructed wholesale (fresh instance);
     // never walk its native internals (they reach unserializable functions).
     if (isAsyncLocalStorage(value as object)) return;
@@ -466,54 +478,48 @@ function analyzeSharedCells(root: Function): { sharedIds: Set<number>; cellInfo:
       // Don't trap through the proxy; analyze its real target and handler.
       const handler = $getProxyInternalField(value, $proxyFieldHandler);
       if (handler === null) return; // revoked: emit will throw later
-      visitValue($getProxyInternalField(value, $proxyFieldTarget));
-      visitValue(handler);
+      enqueue($getProxyInternalField(value, $proxyFieldTarget));
+      enqueue(handler);
       return;
     }
-    if (type === "function") {
+    if (typeof value === "function") {
       const bound = (value as any)[Symbol.boundFunction] as BoundDetails | undefined;
       if (bound !== undefined) {
-        visitValue(bound.target);
-        visitValue(bound.boundThis);
-        for (const arg of bound.boundArgs) visitValue(arg);
+        enqueue(bound.target);
+        enqueue(bound.boundThis);
+        for (const arg of bound.boundArgs) enqueue(arg);
         return;
       }
-      visitFn(value as Function);
+      processFn(value as Function);
     } else {
-      visitObj(value as object);
+      processObj(value as object);
     }
   }
-  function visitObj(o: object): void {
+  function processObj(o: object): void {
     if (seenObjs.has(o)) return;
     seenObjs.add(o);
     if (Array.isArray(o)) {
-      for (const el of o) visitValue(el);
+      for (const el of o) enqueue(el);
       return;
     }
     // Walk own properties via descriptors so getters aren't invoked here (their
     // values are reconstructed lazily, not eagerly).
     for (const key of Reflect.ownKeys(o)) {
       const descriptor = Object.getOwnPropertyDescriptor(o, key)!;
-      if (descriptor.get) visitValue(descriptor.get);
-      if (descriptor.set) visitValue(descriptor.set);
-      if ("value" in descriptor) visitValue(descriptor.value);
+      if (descriptor.get) enqueue(descriptor.get);
+      if (descriptor.set) enqueue(descriptor.set);
+      if ("value" in descriptor) enqueue(descriptor.value);
     }
     // A class instance is reconstructed via its class, so analyze that too.
     const proto = Object.getPrototypeOf(o);
     if (proto !== null && proto !== Object.prototype) {
       const ctor = (proto as any).constructor;
-      visitValue(typeof ctor === "function" && ctor.prototype === proto ? ctor : proto);
+      enqueue(typeof ctor === "function" && ctor.prototype === proto ? ctor : proto);
     }
     const privateFields = (o as any)[Symbol.privateFields] as Array<{ value: unknown }> | undefined;
-    if (privateFields) for (const field of privateFields) visitValue(field.value);
+    if (privateFields) for (const field of privateFields) enqueue(field.value);
   }
-  // Function -> the functions it captures (free-var values that are functions).
-  const fnEdges = new Map<Function, Set<Function>>();
-  // Cell id -> its value, when that value is a function. Used to hoist cells
-  // whose function participates in a reference cycle.
-  const cellValueFn = new Map<number, Function>();
-
-  function visitFn(fn: Function): void {
+  function processFn(fn: Function): void {
     if (seenFns.has(fn)) return;
     seenFns.add(fn);
     let source: string;
@@ -542,16 +548,17 @@ function analyzeSharedCells(root: Function): { sharedIds: Set<number>; cellInfo:
         edges.add(variable.value as Function);
         cellValueFn.set(variable.id, variable.value as Function);
       }
-      visitValue(variable.value);
+      enqueue(variable.value);
     }
     // A class's superclass is reconstructed too, so analyze it.
     const superclass = Object.getPrototypeOf(fn);
     if (typeof superclass === "function" && superclass !== Function.prototype) {
-      visitValue(superclass);
+      enqueue(superclass);
     }
   }
 
-  visitFn(root);
+  enqueue(root);
+  while (stack.length > 0) processValue(stack.pop());
 
   const cyclic = findCyclicFunctions(fnEdges);
 
@@ -1430,50 +1437,56 @@ function computeKeepSets(root: Function): Map<object, Set<string> | "all"> {
     apply(obj, thisNode); // its `this.X` reads are reads on `obj`
   }
 
-  function visitValueFns(value: unknown): void {
+  // Iterative graph walk (heap stack, not the JS call stack) so a deep object chain doesn't
+  // overflow. Order-independent: keep-sets only accumulate (union, with keepAll overriding).
+  // `apply`/this-follow recurse only over the shallow static access tree, never the graph.
+  const stack: unknown[] = [];
+  function enqueueFns(value: unknown): void {
     if (value === null) return;
-    const type = typeof value;
-    if (type !== "function" && type !== "object") return;
+    const t = typeof value;
+    if (t === "function" || t === "object") stack.push(value);
+  }
+  function processValueFns(value: unknown): void {
     if (isAsyncLocalStorage(value as object)) return; // reconstructed wholesale; opaque
     if ($isProxyObject(value)) {
       const handler = $getProxyInternalField(value, $proxyFieldHandler);
       if (handler === null) return;
-      visitValueFns($getProxyInternalField(value, $proxyFieldTarget));
-      visitValueFns(handler);
+      enqueueFns($getProxyInternalField(value, $proxyFieldTarget));
+      enqueueFns(handler);
       return;
     }
-    if (type === "function") {
+    if (typeof value === "function") {
       const bound = (value as any)[Symbol.boundFunction] as BoundDetails | undefined;
       if (bound !== undefined) {
-        visitValueFns(bound.target);
-        visitValueFns(bound.boundThis);
-        for (const arg of bound.boundArgs) visitValueFns(arg);
+        enqueueFns(bound.target);
+        enqueueFns(bound.boundThis);
+        for (const arg of bound.boundArgs) enqueueFns(arg);
         return;
       }
-      visitFn(value as Function);
+      processFn(value as Function);
       return;
     }
     const obj = value as object;
     if (seenObjs.has(obj)) return;
     seenObjs.add(obj);
     if ($isJSArray(obj)) {
-      for (const el of obj as unknown[]) visitValueFns(el);
+      for (const el of obj as unknown[]) enqueueFns(el);
       return;
     }
     for (const key of Reflect.ownKeys(obj)) {
       const d = Object.getOwnPropertyDescriptor(obj, key)!;
-      if (d.get) visitValueFns(d.get);
-      if (d.set) visitValueFns(d.set);
-      if ("value" in d) visitValueFns(d.value);
+      if (d.get) enqueueFns(d.get);
+      if (d.set) enqueueFns(d.set);
+      if ("value" in d) enqueueFns(d.value);
     }
     const proto = Object.getPrototypeOf(obj);
     if (proto !== null && proto !== Object.prototype) {
       const ctor = (proto as any).constructor;
-      visitValueFns(typeof ctor === "function" && ctor.prototype === proto ? ctor : proto);
+      enqueueFns(typeof ctor === "function" && ctor.prototype === proto ? ctor : proto);
     }
   }
 
-  function visitFn(fn: Function): void {
+  function processFn(fn: Function): void {
     if (seenFns.has(fn)) return;
     seenFns.add(fn);
     let source: string;
@@ -1489,14 +1502,15 @@ function computeKeepSets(root: Function): Map<object, Set<string> | "all"> {
     const table = fnNode === null ? null : analyzeAccess(fnNode, rootNames);
     for (const v of freeVariables) {
       apply(v.value, table === null ? undefined : table.get(v.name));
-      visitValueFns(v.value);
+      enqueueFns(v.value);
     }
     const superclass = Object.getPrototypeOf(fn);
-    if (typeof superclass === "function" && superclass !== Function.prototype) visitValueFns(superclass);
+    if (typeof superclass === "function" && superclass !== Function.prototype) enqueueFns(superclass);
   }
 
   try {
-    visitFn(root);
+    enqueueFns(root);
+    while (stack.length > 0) processValueFns(stack.pop());
   } catch {
     // Any analysis failure must not break serialization: fall back to emitting
     // everything (the pre-pruning behaviour) by discarding partial keep-sets.
