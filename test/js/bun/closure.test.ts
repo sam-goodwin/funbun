@@ -2,6 +2,7 @@ import { test, expect, describe, beforeAll } from "bun:test";
 import { serialize } from "bun:closure";
 import { tempDir, bunExe, bunEnv } from "harness";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { format as nodeUtilFormat } from "node:util";
 
 // Round-trip: serialize a function, write the resulting module, dynamic-import
 // it, and return its default export so we can exercise it.
@@ -6725,5 +6726,129 @@ describe("adversarial regressions: round 2", () => {
     void inst;
     const out = (await roundtrip(() => inst))() as any;
     expect(out.m()).toBe(1); // static block side effect not duplicated (would be 2)
+  });
+});
+
+// Round-3 subagent findings. Encoded as test.failing BEFORE their fixes; each flips red
+// (signalling the fix landed) once correct, at which point it becomes a plain test().
+describe("adversarial regressions: round 3", () => {
+  // BUG R: analyzeSharedCells walks an EXTERNAL import's value graph instead of skipping it,
+  // so a JS-implemented node builtin (node:util format) dives into native internals and throws.
+  test.failing("a closure referencing a JS-implemented node builtin re-emits the import", () => {
+    const fn = () => nodeUtilFormat("%s", "x");
+    expect(() => serialize(fn)).not.toThrow();
+  });
+
+  // BUG O: RegExp lastIndex (iteration cursor) is reset to 0; extra own props on RegExp/Date
+  // are dropped (own-prop restore only runs on the subclass path).
+  test.failing("a stateful global regex preserves lastIndex", async () => {
+    const re = /a/g;
+    re.lastIndex = 2;
+    const out = (await roundtrip(() => re))() as RegExp;
+    expect(out.lastIndex).toBe(2);
+    expect(out.exec("aaaa")!.index).toBe(2);
+  });
+  test.failing("extra own properties on a RegExp and a Date round-trip", async () => {
+    const re: any = /z/;
+    re.custom = 42;
+    const d: any = new Date(1000);
+    d.label = "hi";
+    const out = (await roundtrip(() => ({ re, d })))() as any;
+    expect(out.re.custom).toBe(42);
+    expect(out.d.label).toBe("hi");
+  });
+
+  // BUG P1: extra own properties on a bound function are dropped (the bound branch returns
+  // before emitOwnProperties).
+  test.failing("extra own properties on a bound function round-trip", async () => {
+    function g() {
+      return 42;
+    }
+    const bf: any = g.bind(null);
+    bf.extra = "hello";
+    const out = (await roundtrip(() => bf))() as any;
+    expect(out.extra).toBe("hello");
+  });
+
+  // BUG (name cluster): a function's reconstructed `.name` must match its live name —
+  // covering a block-scoped function (toString omits the name), a `.name` overridden via
+  // defineProperty, and the bound-function name (which derives "bound <name>").
+  test("a block-scoped function preserves its name and self-reference", async () => {
+    function makeSelf() {
+      function inner() {
+        return inner.name;
+      }
+      return inner;
+    }
+    const self = makeSelf();
+    const out = (await roundtrip(() => self))() as any;
+    expect(out.name).toBe("inner");
+    expect(out()).toBe("inner"); // self-reference resolves to the named function, not a ref
+  });
+  test.failing("a function with a defineProperty-overridden name preserves it", async () => {
+    function f1() {
+      return 1;
+    }
+    Object.defineProperty(f1, "name", { value: "renamed", configurable: true });
+    const out = (await roundtrip(() => f1))() as any;
+    expect(out.name).toBe("renamed");
+  });
+  test("a bound block-scoped function does not leak an internal name", async () => {
+    function makeBound() {
+      function foo(a: number, b: number, c: number) {
+        return a + b + c;
+      }
+      return foo.bind(null, 1);
+    }
+    const bf = makeBound();
+    const out = (await roundtrip(() => bf))() as any;
+    expect(out.name).not.toContain("__bunClosure");
+    expect(out.name).toBe("bound foo");
+  });
+
+  // BUG V: a property referenced ONLY inside an `eval` string is invisible to the access-path
+  // walker, so it's pruned away — silent data corruption. A function that may call `eval`
+  // must keep all its captured free variables whole.
+  test.failing("a property used only inside eval is not pruned away", async () => {
+    const config = { apiKey: "SECRET", region: "us" };
+    const fn = () => {
+      const r = config.region;
+      return r + ":" + eval("config.apiKey");
+    };
+    const out = (await roundtrip(fn))() as string;
+    expect(out).toBe("us:SECRET");
+  });
+
+  // BUG Q: an Error subclass INSTANCE loses subclass identity — its prototype is rebuilt as a
+  // standalone object instead of linking to the reconstructed constructor's prototype.
+  test.failing("an Error subclass instance keeps `instanceof` its reconstructed constructor", async () => {
+    class AppError extends Error {
+      constructor(m: string) {
+        super(m);
+        this.name = "AppError";
+      }
+    }
+    const e = new AppError("boom");
+    const out = (await roundtrip(() => e))() as any;
+    expect(out instanceof Error).toBe(true);
+    expect(out instanceof out.constructor).toBe(true);
+    expect(Object.getPrototypeOf(out)).toBe(out.constructor.prototype);
+  });
+
+  // BUG S: a method using `super`, extracted from its object, emits a module with bare `super`
+  // (a syntax error) — must be rejected clearly at serialize time, not emit unimportable output.
+  test.failing("extracting a method that uses super is rejected clearly", () => {
+    const proto = {
+      g() {
+        return "hi";
+      },
+    };
+    const o = {
+      __proto__: proto,
+      g() {
+        return (super.g as any)() + "!";
+      },
+    };
+    expect(() => serialize(o.g)).toThrow();
   });
 });
