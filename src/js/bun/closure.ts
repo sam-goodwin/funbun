@@ -1136,6 +1136,11 @@ function analyzeAccess(fnNode: any, rootNames: Set<string>): Map<string, AccessN
     }
     return n;
   };
+  // Dynamic code (`eval`, `new Function`) can reference any captured binding invisibly, so
+  // every tracked name must be kept whole — no pruning is sound past that point.
+  const markAllRoots = (): void => {
+    for (const name of rootNames) get(name).all = true;
+  };
 
   // If `node` is a member chain rooted at a tracked name, return the AccessNode
   // for that path (creating it); computed/dynamic access marks the base whole.
@@ -1184,8 +1189,22 @@ function analyzeAccess(fnNode: any, rootNames: Set<string>): Map<string, AccessN
         if (node.computed) walk(node.property);
         return;
       }
+      case "NewExpression":
+        // `new Function("...")` builds a function from a string we can't analyze; be safe.
+        if (node.callee?.type === "Identifier" && node.callee.name === "Function") markAllRoots();
+        for (const key in node) {
+          if (key === "type" || key === "start") continue;
+          walk(node[key]);
+        }
+        return;
       case "CallExpression": {
         const callee = node.callee;
+        // A direct `eval(...)` (or `Function(...)`) call can read captured bindings through a
+        // string the AST walker can't see; pruning would silently drop those properties. Mark
+        // every tracked name whole — the soundness floor for dynamic code.
+        if (callee?.type === "Identifier" && (callee.name === "eval" || callee.name === "Function")) {
+          markAllRoots();
+        }
         if (callee && callee.type === "MemberExpression" && !callee.computed) {
           const base = accessOf(callee.object);
           const method = callee.property?.name;

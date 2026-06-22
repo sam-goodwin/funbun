@@ -6809,7 +6809,7 @@ describe("adversarial regressions: round 3", () => {
   // BUG V: a property referenced ONLY inside an `eval` string is invisible to the access-path
   // walker, so it's pruned away — silent data corruption. A function that may call `eval`
   // must keep all its captured free variables whole.
-  test.failing("a property used only inside eval is not pruned away", async () => {
+  test("a property used only inside eval is not pruned away", async () => {
     const config = { apiKey: "SECRET", region: "us" };
     const fn = () => {
       const r = config.region;
