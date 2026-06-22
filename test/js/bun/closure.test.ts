@@ -3,6 +3,7 @@ import { serialize } from "bun:closure";
 import { tempDir, bunExe, bunEnv } from "harness";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { format as nodeUtilFormat } from "node:util";
+import { EOL } from "node:os";
 
 // Round-trip: serialize a function, write the resulting module, dynamic-import
 // it, and return its default export so we can exercise it.
@@ -7140,7 +7141,10 @@ describe("adversarial regressions: round 4", () => {
   test("the replacer is applied to plain Map values and Set elements", async () => {
     const m = new Map([["x", 2]]);
     const s = new Set([5, 6]);
-    const code = serialize(() => ({ m, s }), (_k, v) => (typeof v === "number" ? v * 100 : v));
+    const code = serialize(
+      () => ({ m, s }),
+      (_k, v) => (typeof v === "number" ? v * 100 : v),
+    );
     using dir = tempDir("closure-r4-replacer", { "mod.mjs": code });
     const out = ((await import(`${String(dir)}/mod.mjs`)).default as any)();
     expect(out.m.get("x")).toBe(200);
@@ -7195,5 +7199,93 @@ describe("adversarial regressions: round 4", () => {
     void [d, m];
     const out = (await roundtrip(() => ({ d, m })))() as any;
     expect(out.m.get("a")()).toBe(99);
+  });
+});
+
+describe("adversarial regressions: round 5", () => {
+  // An object that is `instanceof Map` (etc.) but lacks the internal slot — e.g.
+  // `Object.create(Map.prototype)` — used to crash when the builtin emitter called a slot
+  // method on it. Routing is now slot-checked (`hasSlot`), so it falls back to a plain object.
+  test("a fake builtin (Object.create(Map.prototype)) serializes as a plain object", async () => {
+    const fake: any = Object.create(Map.prototype);
+    fake.x = 1;
+    const out = (await roundtrip(() => fake))() as any;
+    expect(out.x).toBe(1);
+    expect(Object.getPrototypeOf(out)).toBe(Map.prototype);
+    expect(out instanceof Map).toBe(true);
+  });
+
+  // A huge, sparse array (`new Array(2**32 - 1)` with two set indices) used to hang: the
+  // analysis pre-passes and the emitter iterated `0..length` instead of the present indices.
+  test("a huge sparse array serializes by present indices (no DoS)", async () => {
+    const big: any = new Array(4294967295);
+    big[0] = "a";
+    big[4294967294] = "z";
+    const out = (await roundtrip(() => big))() as any;
+    expect(out.length).toBe(4294967295);
+    expect(out[0]).toBe("a");
+    expect(out[4294967294]).toBe("z");
+    expect(Object.keys(out)).toEqual(["0", "4294967294"]);
+  });
+
+  // A class whose heritage is a parenthesized expression (`class X extends (Base) {}`) — the
+  // heritage rewrite is now anchored on the AST `superClassStart`, consuming the clause cleanly.
+  test("a class with a parenthesized heritage clause round-trips", async () => {
+    class Base {
+      tag() {
+        return "b";
+      }
+    }
+    // prettier-ignore
+    class X extends (Base) {
+      who() {
+        return "x";
+      }
+    }
+    void Base;
+    const Out = (await roundtrip(() => X))() as any;
+    const inst = new Out();
+    expect(inst.who()).toBe("x");
+    expect(inst.tag()).toBe("b");
+    expect(inst instanceof Out).toBe(true);
+  });
+
+  // A genuine #private instance serialized once injects a module-level reify slot as a free
+  // variable. Re-serializing the RECONSTRUCTED function must not treat that internal slot as a
+  // real captured binding (it was leaking through and shadowing on the second pass).
+  test("a genuine #private instance survives a second serialization round", async () => {
+    class Secret {
+      #pw = "hunter2";
+      check(x: string) {
+        return x === this.#pw;
+      }
+    }
+    const s = new Secret();
+    void s;
+    const code1 = serialize(() => s);
+    using dir1 = tempDir("closure-r5-reify1", { "mod.mjs": code1 });
+    const fn1 = (await import(`${String(dir1)}/mod.mjs`)).default as any;
+    const code2 = serialize(fn1);
+    using dir2 = tempDir("closure-r5-reify2", { "mod.mjs": code2 });
+    const fn2 = (await import(`${String(dir2)}/mod.mjs`)).default as any;
+    const inst = fn2();
+    expect(Object.keys(inst)).toEqual([]); // #pw stays private across both rounds
+    expect(inst.check("hunter2")).toBe(true);
+    expect(inst.check("nope")).toBe(false);
+  });
+
+  // A captured function that references an external import (`EOL` from `node:os`) used to make
+  // `capturedFunctions` try to emit the import as a captured function. External imports are now
+  // skipped — the reconstructed module re-imports them.
+  test("a function capturing another that references an external import round-trips", async () => {
+    function g() {
+      return "eol=" + JSON.stringify(EOL);
+    }
+    function f() {
+      return g();
+    }
+    void g;
+    const out = (await roundtrip(f)) as any;
+    expect(out()).toBe("eol=" + JSON.stringify(EOL));
   });
 });

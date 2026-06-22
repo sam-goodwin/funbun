@@ -140,11 +140,16 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
     ) -> Result<G::Class, Error> {
         let p = self;
         let mut extends: Option<Expr> = None;
+        let mut extends_loc = bun_ast::Loc::EMPTY;
         let mut has_decorators: bool = false;
         let mut has_auto_accessor: bool = false;
 
         if p.lexer.token == T::TExtends {
             p.lexer.next()?;
+            // The heritage clause's first token (the `(` of a parenthesized heritage, or the
+            // expression itself). A consumer rewriting the heritage anchors here, not on the
+            // expression node — whose loc sits INSIDE any wrapping parens.
+            extends_loc = p.lexer.loc();
             extends = Some(p.parse_expr(Level::New)?);
 
             // TypeScript's type argument parser inside expressions backtracks if the
@@ -267,6 +272,7 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
         Ok(G::Class {
             class_name: name,
             extends,
+            extends_loc,
             close_brace_loc,
             ts_decorators,
             class_keyword,

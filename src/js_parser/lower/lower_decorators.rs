@@ -120,6 +120,7 @@ fn class_copy(c: &G::Class) -> G::Class {
         ts_decorators: unsafe { core::ptr::read(&raw const c.ts_decorators) },
         class_name: c.class_name,
         extends: c.extends,
+        extends_loc: c.extends_loc,
         body_loc: c.body_loc,
         close_brace_loc: c.close_brace_loc,
         properties: c.properties,

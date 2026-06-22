@@ -59,6 +59,9 @@ pub struct Class {
     pub ts_decorators: ExprNodeList,
     pub class_name: Option<LocRef>,
     pub extends: Option<ExprNodeIndex>,
+    // Start of the heritage clause (the first token after `extends`, before any wrapping parens).
+    // EMPTY when there's no `extends`.
+    pub extends_loc: crate::Loc,
     pub body_loc: crate::Loc,
     pub close_brace_loc: crate::Loc,
     pub properties: StoreSlice<Property>,
@@ -73,6 +76,7 @@ impl Default for Class {
             ts_decorators: bun_alloc::AstAlloc::vec(),
             class_name: None,
             extends: None,
+            extends_loc: crate::Loc::EMPTY,
             body_loc: crate::Loc::EMPTY,
             close_brace_loc: crate::Loc::EMPTY,
             properties: StoreSlice::EMPTY,

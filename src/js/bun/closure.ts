@@ -552,7 +552,8 @@ function analyzeSharedCells(root: Function): { sharedIds: Set<number>; cellInfo:
     if (seenObjs.has(o)) return;
     seenObjs.add(o);
     if (Array.isArray(o)) {
-      for (const el of o) enqueue(el);
+      const arr = o as unknown[];
+      for (const i of arrayPresentIndices(arr)) enqueue(arr[i]);
       return;
     }
     // Walk own properties via descriptors so getters aren't invoked here (their
@@ -1421,7 +1422,9 @@ function computeKeepSets(root: Function): Map<object, Set<string> | "all"> {
       if (isAsyncLocalStorage(o)) continue; // reconstructed wholesale; don't walk internals
       if ($isProxyObject(o)) continue; // emitted via emitProxy, not keep-sets
       if ($isJSArray(o)) {
-        for (const el of o as unknown[]) {
+        const arr = o as unknown[];
+        for (const i of arrayPresentIndices(arr)) {
+          const el = arr[i];
           if (el !== null && typeof el === "object") stack.push(el as object);
         }
         continue;
@@ -1549,7 +1552,8 @@ function computeKeepSets(root: Function): Map<object, Set<string> | "all"> {
     if (seenObjs.has(obj)) return;
     seenObjs.add(obj);
     if ($isJSArray(obj)) {
-      for (const el of obj as unknown[]) enqueueFns(el);
+      const arr = obj as unknown[];
+      for (const i of arrayPresentIndices(arr)) enqueueFns(arr[i]);
       return;
     }
     for (const key of Reflect.ownKeys(obj)) {
@@ -1908,18 +1912,26 @@ function allFreeVariables(fn: Function, source: string): FreeVariable[] {
   const refs = node !== null && !containsUnsupportedNode(node) ? freeIdentifiersOfNode(node) : null;
   const isRealRef = (v: FreeVariable) => refs === null || refs.has(v.name);
 
+  // The genuine-private reify slot (`$bunClosureReify$`) appears as a bare identifier in a
+  // reconstructed class's field-init guard `<key> = $bunClosureReify$ ? undefined : (<init>)`.
+  // On RE-serialization it would be reported as a free variable and bound to a LOCAL
+  // `const $bunClosureReify$ = false` inside the class's IIFE, shadowing the module-level slot
+  // the reify factory toggles — so the "bare" reify construct would re-run every initializer.
+  // It's reconstructed by the module itself (the hoisted `let`), never an external capture.
+  const isInternal = (name: string): boolean => name.startsWith("#") || name === REIFY_SLOT;
+
   if (!source.trimStart().startsWith("class")) {
     // `#name` private brands are recreated by the mangling rewrite (the receiver
     // carries the mangled field), never captured as an external free variable —
     // applies to a method extracted from a class just as to the class itself.
-    return own.filter(v => !v.name.startsWith("#") && isRealRef(v));
+    return own.filter(v => !isInternal(v.name) && isRealRef(v));
   }
 
   const byId = new Map<number, FreeVariable>();
   for (const variable of own) {
     // `#name` private brands are an internal mechanism recreated by the class
     // body itself — never an external capture.
-    if (variable.name.startsWith("#")) continue;
+    if (isInternal(variable.name)) continue;
     byId.set(variable.id, variable);
   }
   collectMemberFreeVariables(fn, fn, byId);
@@ -1938,7 +1950,7 @@ function collectMemberFreeVariables(holder: object, classFn: Function, byId: Map
         // A reference to the class's own name resolves to the class expression's
         // binding, and `#name` private brands are recreated by the class body —
         // neither should be bound externally.
-        if (variable.value === classFn || variable.name.startsWith("#")) continue;
+        if (variable.value === classFn || variable.name.startsWith("#") || variable.name === REIFY_SLOT) continue;
         if (!byId.has(variable.id)) byId.set(variable.id, variable);
       }
     }
@@ -1969,11 +1981,13 @@ function classHeritage(fn: Function, source: string, ctx: Context): { source: st
     return { source, binding: `const ${sc.name} = ${emitValue(superclass, ctx)};` };
   }
 
-  // Computed heritage (`extends mixin(Base)`, `extends ns.Base`): replace the
-  // heritage expression with a synthetic identifier bound to the captured value.
-  // The AST gives the heritage's start; its end is the class body `{` (the AST
-  // node positions are offset by the parse wrapper), trimmed back over whitespace.
-  const start = sc.start - parsed!.offset;
+  // Computed heritage (`extends mixin(Base)`, `extends ns.Base`, `extends (cond ? A : B)`):
+  // replace the WHOLE heritage clause with a synthetic identifier bound to the captured value.
+  // Anchor on the heritage-clause start (`superClassStart`, the first token after `extends`,
+  // surfaced by ast()) rather than the heritage EXPRESSION's start — the expression node's start
+  // sits INSIDE any wrapping parens, so replacing just it would consume the closing `)` (trimmed
+  // back from the brace) while leaving a dangling `(`.
+  const start = typeof node.superClassStart === "number" ? node.superClassStart - parsed!.offset : -1;
   const brace = node.body?.start === undefined ? -1 : node.body.start - parsed!.offset;
   if (start < 0 || brace <= start || brace > source.length) return undefined;
   let end = brace;
@@ -2179,9 +2193,11 @@ function emitObject(value: object, ctx: Context): string {
   const existing = ctx.refs.get(value);
   if (existing !== undefined) return existing;
 
-  // Built-ins whose contents can't be enumerated or whose state can't be
-  // captured: reject loudly rather than silently emitting an empty object.
-  if (value instanceof Promise && $peekPromiseStatus(value) === 0) {
+  // Built-ins whose contents can't be enumerated or whose state can't be captured: reject loudly
+  // rather than silently emitting an empty object. Detect them by INTERNAL SLOT ($-intrinsics),
+  // not `instanceof` / `Symbol.toStringTag` — a plain object can spoof those (forge the tag, or
+  // be `Object.create(Promise.prototype)`) and must not be misrouted/falsely rejected.
+  if ($isPromise(value) && $isPromisePending(value)) {
     // A pending promise's resolution is tied to live I/O / timers / a suspended
     // async frame in the event loop — not expressible as source. (Settled
     // promises are reconstructed in emitBuiltin.)
@@ -2190,11 +2206,13 @@ function emitObject(value: object, ctx: Context): string {
         "Await it first, or serialize the settled value.",
     );
   }
-  // Generator / async-generator objects and built-in iterator objects hold
-  // suspended execution state (the yield point and local frame) in engine slots
-  // that aren't reachable via reflection and can't be expressed as source.
-  // Reject clearly instead of walking their native prototype chain (which would
-  // throw an opaque "native function" error or silently emit a dead object).
+  // Generator / async-generator objects and built-in iterator objects hold suspended execution
+  // state (the yield point and local frame) in engine slots that aren't reachable via reflection
+  // and can't be expressed as source. Reject clearly instead of walking their native prototype
+  // chain (which would throw an opaque "native function" error or silently emit a dead object).
+  // (Detected via Symbol.toStringTag — a real generator/iterator. There is no $is* intrinsic for
+  // these available here, so a plain object can in principle forge the tag and be falsely
+  // rejected; that is an exotic, low-severity false-negative on serializability, not corruption.)
   const tag = objectToString.$call(value);
   if (tag === "[object Generator]" || tag === "[object AsyncGenerator]" || tag.endsWith(" Iterator]")) {
     throw new TypeError(
@@ -2267,9 +2285,21 @@ function restoreSubclass(value: object, name: string, ctx: Context, skip?: Set<s
   emitPrivateFields(name, value, ctx);
 }
 
+// The canonical array-INDEX keys actually present on `array` (a sparse array with a huge
+// `.length` but few elements has only those). Driven by the real own keys, NOT a `[0, length)`
+// scan — `new Array(4294967295)` must not take 4 billion iterations / allocate 4 billion strings.
+function arrayPresentIndices(array: unknown[]): number[] {
+  const out: number[] = [];
+  for (const key of Object.keys(array)) {
+    const n = +key;
+    if (Number.isInteger(n) && n >= 0 && n < 4294967295 && String(n) === key) out.push(n);
+  }
+  return out;
+}
+
 function arrayIndexSkip(value: unknown[]): Set<string> {
   const skip = new Set<string>(["length"]);
-  for (let i = 0; i < value.length; i++) skip.add(String(i));
+  for (const i of arrayPresentIndices(value)) skip.add(String(i));
   return skip;
 }
 
@@ -2281,14 +2311,12 @@ function emitObjectBody(value: object, name: string, ctx: Context): () => void {
     ctx.module.push(`const ${name} = [];`);
     const array = value as unknown[];
     return () => {
-      let presentIndices = 0;
-      for (let i = 0; i < array.length; i++) {
-        if (i in array) {
-          presentIndices++;
-          const child = transform(value, String(i), array[i], ctx);
-          ctx.module.push(`${name}[${i}] = ${emitValue(child, ctx)};`);
-        }
+      const indices = arrayPresentIndices(array);
+      for (const i of indices) {
+        const child = transform(value, String(i), array[i], ctx);
+        ctx.module.push(`${name}[${i}] = ${emitValue(child, ctx)};`);
       }
+      const presentIndices = indices.length;
       // Preserve the length, including trailing holes.
       ctx.module.push(`${name}.length = ${array.length};`);
       // An array can carry NON-index own properties (`a.foo = ...`, a symbol key, a
@@ -2418,8 +2446,8 @@ function restoreBuiltinContent(value: object, name: string, ctx: Context): Set<s
     return undefined;
   }
   if (Array.isArray(value)) {
-    for (let i = 0; i < value.length; i++) {
-      if (i in value) ctx.module.push(`${name}[${i}] = ${emitValue(transform(value, String(i), value[i], ctx), ctx)};`);
+    for (const i of arrayPresentIndices(value)) {
+      ctx.module.push(`${name}[${i}] = ${emitValue(transform(value, String(i), value[i], ctx), ctx)};`);
     }
     ctx.module.push(`${name}.length = ${value.length};`);
     return arrayIndexSkip(value as unknown[]);
@@ -2597,6 +2625,37 @@ function propertyKeyExpression(key: string | symbol, ctx: Context): string {
   return uniqueSymbolRef(key, ctx);
 }
 
+// Base methods captured at module load (tamper-proof) that throw on a receiver lacking the
+// built-in's internal slot — used to tell a real instance from a prototype-based look-alike
+// (`Object.create(Date.prototype)`) for the types with no `$is*` intrinsic.
+const slotProbeDate = Date.prototype.getTime;
+const slotProbeNumber = Number.prototype.valueOf;
+const slotProbeString = String.prototype.valueOf;
+const slotProbeBoolean = Boolean.prototype.valueOf;
+const slotProbeWeakRef = WeakRef.prototype.deref;
+const slotProbeWeakMapHas = WeakMap.prototype.has;
+const slotProbeWeakSetHas = WeakSet.prototype.has;
+const slotProbeMapHas = Map.prototype.has;
+const slotProbeSetHas = Set.prototype.has;
+const slotProbeArrayBuffer = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength")!.get!;
+// SharedArrayBuffer has its own [[SharedArrayBufferData]] slot; the ArrayBuffer byteLength getter
+// throws on it, so it needs its own probe. (May be absent if SharedArrayBuffer is unavailable.)
+const slotProbeSharedArrayBuffer =
+  typeof SharedArrayBuffer !== "undefined"
+    ? Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, "byteLength")?.get
+    : undefined;
+// The RegExp `source` getter returns "(?:)" for RegExp.prototype itself and throws for any other
+// non-RegExp receiver — a side-effect-free slot check (there's no $isRegExpObject intrinsic here).
+const slotProbeRegExp = Object.getOwnPropertyDescriptor(RegExp.prototype, "source")!.get!;
+function hasSlot(value: object, probe: Function): boolean {
+  try {
+    probe.$call(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // Reconstructs common built-in object types. Appends the construction to
 // ctx.module under `name` and returns the built-in's NATURAL prototype (so the
 // caller can detect and restore a subclass instance); returns null for plain
@@ -2606,12 +2665,19 @@ function propertyKeyExpression(key: string | symbol, ctx: Context): string {
 // if `value` isn't a recognized builtin. The content is deferred via emitObject so a deep
 // container chain serializes without overflowing.
 function emitBuiltin(value: object, name: string, ctx: Context): { proto: object; body: () => void } | null {
+  // Built-ins are routed by INTERNAL SLOT, not `instanceof` — a plain object whose prototype is
+  // a built-in's `.prototype` (`Object.create(Map.prototype)`, a prototype-based "Map-like") is
+  // `instanceof Map` but has no [[MapData]] slot. Routing it into the Map branch would crash with
+  // a raw "Map operation called on non-Map object"; instead it falls through here to the plain
+  // object path (emitted with that exotic prototype). $-intrinsics check the slot directly (also
+  // spoof-proof against a forged `Symbol.hasInstance`); types without an intrinsic ($isDate etc.
+  // don't exist) use `instanceof` plus a slot probe (a base method that throws on a non-instance).
   // A settled promise reconstructs from its result: Promise.resolve(value) /
   // Promise.reject(reason). Rejected promises are pre-handled (`.catch(...)`) so
   // module load doesn't raise an unhandled-rejection — the reason is still
   // delivered to anyone who awaits/catches `name`. (Pending promises already
   // threw in emitObject.)
-  if (value instanceof Promise) {
+  if ($isPromise(value)) {
     const status = $peekPromiseStatus(value);
     const settled = $peekPromiseSettledValue(value);
     if (status === 2) {
@@ -2622,7 +2688,7 @@ function emitBuiltin(value: object, name: string, ctx: Context): { proto: object
     }
     return { proto: Promise.prototype, body: NOOP_BODY };
   }
-  if (value instanceof Date) {
+  if (value instanceof Date && hasSlot(value, slotProbeDate)) {
     ctx.module.push(`const ${name} = new Date(${(value as Date).getTime()});`);
     return {
       proto: Date.prototype,
@@ -2634,7 +2700,7 @@ function emitBuiltin(value: object, name: string, ctx: Context): { proto: object
       },
     };
   }
-  if (value instanceof RegExp) {
+  if (value instanceof RegExp && hasSlot(value, slotProbeRegExp)) {
     const re = value as RegExp;
     ctx.module.push(`const ${name} = new RegExp(${JSON.stringify(re.source)}, ${JSON.stringify(re.flags)});`);
     // lastIndex is the iteration cursor of a global/sticky regex — stateful, must be restored.
@@ -2652,7 +2718,7 @@ function emitBuiltin(value: object, name: string, ctx: Context): { proto: object
   // instance's own (possibly user-overridden) Symbol.iterator / set / add — an override
   // would let the walk observe forged entries or re-run a transform on restore (and a
   // throwing override would escape serialize() raw). Mirrors restoreBuiltinContent.
-  if (value instanceof Map) {
+  if (value instanceof Map && hasSlot(value, slotProbeMapHas)) {
     ctx.module.push(`const ${name} = new Map();`);
     return {
       proto: Map.prototype,
@@ -2668,7 +2734,7 @@ function emitBuiltin(value: object, name: string, ctx: Context): { proto: object
       },
     };
   }
-  if (value instanceof Set) {
+  if (value instanceof Set && hasSlot(value, slotProbeSetHas)) {
     ctx.module.push(`const ${name} = new Set();`);
     return {
       proto: Set.prototype,
@@ -2726,8 +2792,11 @@ function emitBuiltin(value: object, name: string, ctx: Context): { proto: object
     };
   }
   if (
-    value instanceof ArrayBuffer ||
-    (typeof SharedArrayBuffer !== "undefined" && value instanceof SharedArrayBuffer)
+    (value instanceof ArrayBuffer && hasSlot(value, slotProbeArrayBuffer)) ||
+    (typeof SharedArrayBuffer !== "undefined" &&
+      value instanceof SharedArrayBuffer &&
+      slotProbeSharedArrayBuffer !== undefined &&
+      hasSlot(value, slotProbeSharedArrayBuffer))
   ) {
     const ctor = value instanceof ArrayBuffer ? "ArrayBuffer" : "SharedArrayBuffer";
     const bytes = [...new Uint8Array(value as ArrayBufferLike)];
@@ -2742,11 +2811,11 @@ function emitBuiltin(value: object, name: string, ctx: Context): { proto: object
   }
   // Boxed primitives (new Number/String/Boolean) — objects wrapping a primitive. Extra own props
   // are restored here for the natural-prototype case (a subclass goes through restoreSubclass).
-  if (value instanceof Number) {
+  if (value instanceof Number && hasSlot(value, slotProbeNumber)) {
     ctx.module.push(`const ${name} = new Number(${serializeNumber((value as Number).valueOf())});`);
     return { proto: Number.prototype, body: () => emitBuiltinOwnProps(name, value, ctx, Number.prototype) };
   }
-  if (value instanceof String) {
+  if (value instanceof String && hasSlot(value, slotProbeString)) {
     ctx.module.push(`const ${name} = new String(${JSON.stringify((value as String).valueOf())});`);
     return {
       proto: String.prototype,
@@ -2760,14 +2829,14 @@ function emitBuiltin(value: object, name: string, ctx: Context): { proto: object
       },
     };
   }
-  if (value instanceof Boolean) {
+  if (value instanceof Boolean && hasSlot(value, slotProbeBoolean)) {
     ctx.module.push(`const ${name} = new Boolean(${(value as Boolean).valueOf()});`);
     return { proto: Boolean.prototype, body: () => emitBuiltinOwnProps(name, value, ctx, Boolean.prototype) };
   }
   // A WeakRef snapshots its live referent. If already collected at serialize
   // time, emit a WeakRef to a fresh (immediately collectable) object — best
   // effort, since "already collected" can't be reproduced.
-  if (value instanceof WeakRef) {
+  if (value instanceof WeakRef && hasSlot(value, slotProbeWeakRef)) {
     const target = (value as WeakRef<any>).deref();
     ctx.module.push(`const ${name} = new WeakRef(${target === undefined ? "{}" : emitValue(target, ctx)});`);
     return { proto: WeakRef.prototype, body: () => emitBuiltinOwnProps(name, value, ctx, WeakRef.prototype) };
@@ -2776,7 +2845,7 @@ function emitBuiltin(value: object, name: string, ctx: Context): { proto: object
   // snapshotted natively. Reconstruct as a fresh weak collection with those
   // entries (keys keep their identity with other captures). Snapshot semantics:
   // the keys alive at serialize time.
-  if (value instanceof WeakMap) {
+  if (value instanceof WeakMap && hasSlot(value, slotProbeWeakMapHas)) {
     ctx.module.push(`const ${name} = new WeakMap();`);
     return {
       proto: WeakMap.prototype,
@@ -2789,7 +2858,7 @@ function emitBuiltin(value: object, name: string, ctx: Context): { proto: object
       },
     };
   }
-  if (value instanceof WeakSet) {
+  if (value instanceof WeakSet && hasSlot(value, slotProbeWeakSetHas)) {
     ctx.module.push(`const ${name} = new WeakSet();`);
     return {
       proto: WeakSet.prototype,
@@ -2943,6 +3012,10 @@ function capturedFunctions(fn: Function, ctx: Context): Function[] {
   if (isNativeFunctionSource(source)) return [];
   const out: Function[] = [];
   for (const v of allFreeVariables(fn, source)) {
+    // An external import (node:*, a package) is re-emitted as an `import` statement by
+    // reconstructFunctionExpr — never expand its (native) value as a dependency. Mirrors the
+    // skip every other allFreeVariables consumer has.
+    if (v.import?.external) continue;
     if (typeof v.value === "function") out.push(v.value as Function);
   }
   const superclass = Object.getPrototypeOf(fn);

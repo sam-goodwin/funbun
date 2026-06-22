@@ -2038,6 +2038,10 @@ impl<'a> AstJsConverter<'a> {
             None => JSValue::NULL,
         };
         node.put(self.global, "superClass", superclass);
+        // Start of the heritage clause (first token after `extends`, before any wrapping parens),
+        // so a source-rewriting consumer can replace `extends (cond ? A : B)` symmetrically — the
+        // superClass expression's own start sits inside the parens. -1 when there's no heritage.
+        node.put(self.global, "superClassStart", JSValue::js_number(class.extends_loc.start as f64));
         let members = class.properties.slice();
         let arr = JSValue::create_empty_array(self.global, members.len())?;
         for (i, p) in members.iter().enumerate() {
