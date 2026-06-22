@@ -3463,11 +3463,16 @@ JSC_DEFINE_CUSTOM_GETTER(functionSourceLocationGetter, (JSC::JSGlobalObject * gl
     JSC::SourceProvider* provider = source.provider();
     WTF::String url = provider ? provider->sourceURL() : WTF::String();
 
-    // Generated position (1-based, in the transpiled output).
+    // Generated position (1-based, in the transpiled output). `lastLine` is the definition's
+    // final line — a serializer uses it to bound a source map when `toString()` reprints the
+    // source onto more lines than the original spans.
     int line = executable->firstLine();
     int column = executable->startColumn();
+    int endLine = executable->lastLine();
 
-    // Remap to the original source through the module's source map when present.
+    // Remap to the original source through the module's source map when present. Both the
+    // start and end lines are remapped with the SAME (generated-file) url, BEFORE `url` is
+    // reassigned to any map-named original source.
     if (!url.isEmpty()) {
         BunString pathStr = Bun::toString(url);
         int mappedLine = 0;
@@ -3478,6 +3483,15 @@ JSC_DEFINE_CUSTOM_GETTER(functionSourceLocationGetter, (JSC::JSGlobalObject * gl
         if (Bun__resolveSourceMapPosition(defaultGlobalObject(globalObject)->bunVM(), &pathStr, line - 1, column - 1, &mappedLine, &mappedColumn, &mappedUrl)) {
             line = mappedLine + 1;
             column = mappedColumn + 1;
+            int mappedEndLine = 0;
+            int mappedEndColumn = 0;
+            BunString endUrl = BunStringEmpty;
+            if (Bun__resolveSourceMapPosition(defaultGlobalObject(globalObject)->bunVM(), &pathStr, endLine - 1, 0, &mappedEndLine, &mappedEndColumn, &endUrl)) {
+                endLine = mappedEndLine + 1;
+                if (endUrl.tag != BunStringTag::Empty && endUrl.tag != BunStringTag::Dead) {
+                    endUrl.deref();
+                }
+            }
             if (mappedUrl.tag != BunStringTag::Empty && mappedUrl.tag != BunStringTag::Dead) {
                 url = mappedUrl.toWTFString();
                 mappedUrl.deref();
@@ -3489,6 +3503,7 @@ JSC_DEFINE_CUSTOM_GETTER(functionSourceLocationGetter, (JSC::JSGlobalObject * gl
     result->putDirect(vm, JSC::Identifier::fromString(vm, "url"_s), JSC::jsString(vm, url), 0);
     result->putDirect(vm, JSC::Identifier::fromString(vm, "line"_s), JSC::jsNumber(line), 0);
     result->putDirect(vm, JSC::Identifier::fromString(vm, "column"_s), JSC::jsNumber(column), 0);
+    result->putDirect(vm, JSC::Identifier::fromString(vm, "endLine"_s), JSC::jsNumber(endLine), 0);
     return JSC::JSValue::encode(result);
 }
 

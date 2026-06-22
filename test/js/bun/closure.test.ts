@@ -656,7 +656,7 @@ describe("source maps: emitted inline map is decode-correct", () => {
   // straightforward for functions, but classes derive their anchor from a method, so a
   // complete fix is deferred. Workaround: none needed at runtime; stack traces still land in
   // the right FILE, only the line can be off for single-line definitions.
-  test.skip("a compact single-line definition maps every generated line to its definition line", () => {
+  test("a compact single-line definition maps every generated line to its definition line", () => {
     // prettier-ignore
     function f(){const a=1;const b=2;return a+b;} // entire function on ONE source line
     const loc = (f as any)[Symbol.sourceLocation];

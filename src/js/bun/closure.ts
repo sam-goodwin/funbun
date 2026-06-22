@@ -139,6 +139,11 @@ interface SourceBlock {
   url: string;
   line: number;
   column: number;
+  // The definition's last original line (1-based), when known. `fn.toString()` reprints from
+  // the AST, so a compact (e.g. single-line) definition is emitted across more generated lines
+  // than the original spans; clamping the per-line walk to this bound stops the source map from
+  // pointing past the definition onto unrelated lines. Undefined for classes (anchor derived).
+  endLine?: number;
   lineCount: number;
   // The verbatim source emitted for this block. Its body lines keep their
   // original indentation (so their columns map identity), while the first line
@@ -267,6 +272,7 @@ function serialize(fn: Function, replacer?: Replacer): string {
       url: exportReconstructed.location.url,
       line: exportReconstructed.location.line,
       column: exportReconstructed.location.column,
+      endLine: exportReconstructed.location.endLine,
       lineCount: exportReconstructed.sourceLineCount,
       source: exportReconstructed.source,
     });
@@ -364,11 +370,14 @@ function buildSourceMap(
         genColumn = ws;
         srcColumn = ws;
       }
-      // Clamp to a valid 0-based line. `block.line` can be unreliable when the engine's
-      // `toString()` reformats a class onto more lines than the original (so a member's
-      // toString-relative line exceeds its file line) — a negative line would crash the
-      // runtime source-map parser (debug) or corrupt the map (release).
-      const srcLine = Math.max(0, block.line - 1 + k);
+      // Map generated body line `k` to original line `block.line - 1 + k`. `fn.toString()`
+      // reprints from the AST, so a compact definition is emitted across MORE generated lines
+      // than the original spans; without a bound the walk runs past the definition onto
+      // unrelated later lines (or past EOF). Clamp to the definition's last original line when
+      // known (functions expose it via Symbol.sourceLocation.endLine; classes don't, so they
+      // fall back to the unclamped walk). Also clamp ≥ 0 (a negative line crashes the parser).
+      const upper = block.endLine !== undefined ? block.endLine - 1 : Infinity;
+      const srcLine = Math.max(0, Math.min(upper, block.line - 1 + k));
       mapped.set(genLine, [sourceIndex, srcLine, genColumn, srcColumn]);
       if (genLine > maxLine) maxLine = genLine;
     }
@@ -1471,7 +1480,7 @@ interface ReconstructedFunction {
   // The verbatim source as emitted (post `#private`/heritage rewrite); used to
   // derive per-line columns for the source map.
   source: string;
-  location: { url: string; line: number; column: number } | undefined;
+  location: { url: string; line: number; column: number; endLine?: number } | undefined;
   // Set when this is a class reconstructed with GENUINE `#private` fields: the field
   // names its injected constructor reify branch installs. emitFunction emits a reify
   // factory for it; instances are reconstructed through that factory.
@@ -2719,6 +2728,7 @@ function recordSourceBlock(ctx: Context, moduleIndex: number, reconstructed: Rec
     url: location.url,
     line: location.line,
     column: location.column,
+    endLine: location.endLine,
     lineCount: reconstructed.sourceLineCount,
     source: reconstructed.source,
   });
