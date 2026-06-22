@@ -7073,4 +7073,23 @@ describe("adversarial regressions: round 4", () => {
     expect(out.refs.length).toBe(3);
     expect(out.refs[2]).toBe(out); // the shared back-edge to node 0 keeps its identity
   });
+
+  // RESIDUAL (documented): function emission is still recursive — reconstructFunctionExpr emits
+  // a function's captured free-variable values inline — so a chain of functions nested tens of
+  // thousands deep through their captures overflows the stack (serialize() maps it to the clear
+  // "too deeply nested" error). Astronomically rare; a deep DATA graph IS handled (see above).
+  // TODO: convert emitFunction to the iterative decl/body-worklist pattern (like emitObject) if
+  // this case is ever deemed important; then this becomes a passing test().
+  // NOTE: `skip` (not `failing`) only because building+analyzing a 30k-function chain is far too
+  // slow in the debug build until the parse cache (BUG1) lands — flip to `test.failing` after that.
+  test.skip("a deep chain of functions captured through each other serializes", async () => {
+    let f: any = () => 0;
+    for (let i = 1; i < 30000; i++) {
+      const prev = f;
+      f = () => prev();
+    }
+    const out = (await roundtrip(() => f))() as any;
+    expect(typeof out).toBe("function");
+    expect(out()).toBe(0);
+  });
 });

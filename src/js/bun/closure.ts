@@ -2770,6 +2770,15 @@ interface BoundDetails {
   boundArgs: unknown[];
 }
 
+// NOTE: unlike emitObject, function emission is still RECURSIVE — reconstructFunctionExpr emits
+// a function's captured free-variable values inline (emitValue), so a chain of functions nested
+// tens-of-thousands deep through their captures (`f0` closes over `f1` closes over `f2` …)
+// recurses that deep and can overflow the stack. This is astronomically rare in real closures
+// (a deep DATA graph under a function own-property IS handled — emitValue defers objects), and
+// serialize()'s guard maps the overflow to a clear "too deeply nested" error. See the
+// `test.failing` "a deep chain of functions captured through each other" in the suite.
+// TODO: if this ever matters, convert this path to the same decl/body-worklist pattern emitObject
+// uses (emit the function declaration at discovery, defer its captures/own-props to ctx.bodyQueue).
 function emitFunction(fn: Function, ctx: Context): string {
   const existing = ctx.refs.get(fn);
   if (existing !== undefined) return existing;
