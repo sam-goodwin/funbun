@@ -643,6 +643,33 @@ describe("source maps: emitted inline map is decode-correct", () => {
     for (const sl of srcLines) expect(sl).toBeGreaterThanOrEqual(0);
   });
 
+  // DOCUMENTED LIMITATION (crash-safe, fidelity-only). `fn.toString()` REPRINTS the
+  // captured source from the AST, so a definition written on FEWER lines than its canonical
+  // form (e.g. a one-line `function f(){const a=1;return a;}`) is emitted across MORE
+  // generated lines than the original spans. buildSourceMap maps generated body line `k` to
+  // original line `defLine + k` (closure.ts, the `block.line - 1 + k` distribution), which
+  // then walks PAST the definition onto unrelated later statements (or past EOF). The
+  // negative-line case is already clamped (no crash); the positive over-run mis-points stack
+  // lines for compact-source definitions only. A faithful fix needs the definition's original
+  // END line (e.g. `executable->lastLine()` exposed natively) to clamp the per-line walk —
+  // straightforward for functions, but classes derive their anchor from a method, so a
+  // complete fix is deferred. Workaround: none needed at runtime; stack traces still land in
+  // the right FILE, only the line can be off for single-line definitions.
+  test.skip("a compact single-line definition maps every generated line to its definition line", () => {
+    // prettier-ignore
+    function f(){const a=1;const b=2;return a+b;} // entire function on ONE source line
+    const loc = (f as any)[Symbol.sourceLocation];
+    const { json, decoded } = decodeInlineMap(serialize(f));
+    const srcIdx = json.sources.findIndex((s: string) => s.includes("closure.test"));
+    const srcLines = decoded
+      .flat()
+      .filter(s => s.srcIdx === srcIdx)
+      .map(s => s.srcLine);
+    // Ideal: since the whole definition is on one source line, every generated line of it
+    // maps back to that single line. Today they walk forward (loc.line-1, loc.line, ...).
+    for (const sl of srcLines) expect(sl).toBe(loc.line - 1);
+  });
+
   // --- Indirection: the same edge cases explored for ALS, applied to maps. ---
   // The transforms (nesting, #private rewrite, ALS-wrapping) all reshape the
   // generated text; the map must keep pointing every body at its true origin.
