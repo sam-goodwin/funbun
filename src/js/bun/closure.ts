@@ -2532,6 +2532,16 @@ function emitFunction(fn: Function, ctx: Context): string {
     }
   }
 
+  // Map this function's own `.prototype` object to `<name>.prototype` so a DIRECT capture of
+  // it (e.g. `Class.prototype` held as a value) dedups to the reconstructed class's prototype
+  // — the same object the class's instances are `Object.create`d from — instead of being
+  // rebuilt as a fresh duplicate `{}`. (Native/bound/hosted/genuine-method functions returned
+  // above; only normally-reconstructed functions reach here.)
+  const ownProto = (fn as { prototype?: object }).prototype;
+  if (typeof ownProto === "object" && ownProto !== null && !ctx.refs.has(ownProto)) {
+    ctx.refs.set(ownProto, `${name}.prototype`);
+  }
+
   const reconstructed = reconstructFunctionExpr(fn, ctx);
   // `const <name> = ` adds no newlines, so the source offset within the entry is
   // the offset within the expression.
@@ -2553,8 +2563,19 @@ function emitFunction(fn: Function, ctx: Context): string {
   // ones — that skips `name`/`length`/`prototype` and non-enumerable static
   // methods (already reconstructed from the class source).
   emitOwnProperties(name, fn, ctx, undefined, true);
+  // Imperatively-assigned prototype members (`Ctor.prototype.method = ...`, the classic
+  // pre-ES6 pattern, or a monkey-patched class prototype) live on the `.prototype` object,
+  // not in the function's source — so emit its ENUMERABLE own properties onto
+  // `<name>.prototype`. Class methods declared in source are non-enumerable and skipped;
+  // `constructor` is non-enumerable too. (`Function.prototype` itself is shared and has no
+  // such additions; arrows/methods have no `.prototype`.)
+  if (typeof ownProto === "object" && ownProto !== null) {
+    emitOwnProperties(`${name}.prototype`, ownProto, ctx, PROTOTYPE_SKIP_KEYS, true);
+  }
   return name;
 }
+
+const PROTOTYPE_SKIP_KEYS = new Set(["constructor"]);
 
 function recordSourceBlock(ctx: Context, moduleIndex: number, reconstructed: ReconstructedFunction): void {
   const location = reconstructed.location;

@@ -6634,7 +6634,7 @@ describe("adversarial regressions: round 2", () => {
   // pattern) are dropped — the reconstructed prototype carries only `constructor`, because
   // emission relies on the function's source text and never serializes `fn.prototype`'s own
   // properties.
-  test.failing("imperatively-assigned prototype properties on a constructor function round-trip", async () => {
+  test("imperatively-assigned prototype properties on a constructor function round-trip", async () => {
     function Animal(this: any, name: string) {
       this.name = name;
     }
@@ -6650,7 +6650,7 @@ describe("adversarial regressions: round 2", () => {
   });
 
   // BUG L (class variant): a class prototype monkey-patched after declaration.
-  test.failing("imperatively-added class prototype members round-trip", async () => {
+  test("imperatively-added class prototype members round-trip", async () => {
     class K {}
     (K.prototype as any).extra = function () {
       return 7;
@@ -6664,7 +6664,7 @@ describe("adversarial regressions: round 2", () => {
   // BUG M: a directly-captured `Class.prototype` must keep its identity — the same object as
   // the reconstructed class's `.prototype` and the instance's [[Prototype]] — not a fresh
   // duplicate `{}`.
-  test.failing("a directly-captured class prototype keeps shared identity", async () => {
+  test("a directly-captured class prototype keeps shared identity", async () => {
     class Foo {
       hello() {
         return "hi";
