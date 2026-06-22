@@ -6415,3 +6415,111 @@ describe("round-trip fuzz (seeded, deterministic)", () => {
     expect(checked).toBe(100);
   });
 });
+
+// Regressions surfaced by the adversarial fuzz/subagent campaign.
+describe("adversarial regressions", () => {
+  // An own data property literally named `__proto__` must round-trip as an OWN property, not
+  // reparent the object. The generated `name["__proto__"] = v` form would invoke the
+  // Object.prototype `__proto__` setter (reparenting on an object value, silently dropping a
+  // primitive); it's now routed through Object.defineProperty.
+  test("an own `__proto__` data property round-trips without reparenting (plain object)", async () => {
+    const marker = { iAmData: true };
+    const obj: any = {};
+    Object.defineProperty(obj, "__proto__", { value: marker, writable: true, enumerable: true, configurable: true });
+    const out = (await roundtrip(() => obj))() as any;
+    expect(Object.getPrototypeOf(out)).toBe(Object.prototype); // NOT reparented to marker
+    expect(Object.getOwnPropertyDescriptor(out, "__proto__")?.value).toEqual({ iAmData: true });
+  });
+
+  test("an own `__proto__` data property round-trips on a genuine #private instance", async () => {
+    class C {
+      #s: string;
+      constructor() {
+        this.#s = "sek";
+      }
+      get() {
+        return this.#s;
+      }
+    }
+    const inst: any = new C();
+    Object.defineProperty(inst, "__proto__", {
+      value: { data: 1 },
+      writable: true,
+      enumerable: true,
+      configurable: true,
+    });
+    const out = (await roundtrip(() => inst))() as any;
+    // The reconstructed instance belongs to a freshly-rebuilt class, so `instanceof` the
+    // original C is naturally false; assert the prototype was NOT reparented to `{data:1}`.
+    expect(Object.getPrototypeOf(out).constructor.name).toBe("C"); // still the rebuilt C, not reparented
+    expect(out.get()).toBe("sek"); // prototype method + genuine #private still reachable
+    expect(Object.getOwnPropertyDescriptor(out, "__proto__")?.value).toEqual({ data: 1 });
+  });
+
+  // A replacer returning undefined drops the property. On a genuine instance the reify factory
+  // runs the real constructor, so a field-initialized public property already exists — the drop
+  // must `delete` it, not merely skip re-assignment (which left the constructor's value).
+  test("a replacer dropping a field-initialized public property removes it on a genuine instance", async () => {
+    class C {
+      #s = "S";
+      pub = "PUB";
+      get() {
+        return this.#s;
+      }
+    }
+    const c = new C();
+    void c;
+    const code = serialize(
+      () => c,
+      (_k, v) => (v === "PUB" ? undefined : v),
+    );
+    using dir = tempDir("closure-proto-drop", { "mod.mjs": code });
+    const out = ((await import(`${String(dir)}/mod.mjs`)).default as any)();
+    expect("pub" in out).toBe(false); // dropped for real
+    expect(out.get()).toBe("S"); // the #private (not dropped) survives
+  });
+
+  // restoreBuiltinContent restores a genuine Map/Set subclass's entries via the BASE
+  // set/add, not the subclass override — restoring through an override would re-apply its
+  // transform / re-run its side effects on top of the already-final contents.
+  test("a genuine Map subclass overriding set() restores exact entries (no double transform)", async () => {
+    class Doubler extends Map {
+      #tag: string;
+      constructor() {
+        super();
+        this.#tag = "T";
+      }
+      set(k: any, v: any) {
+        return super.set(k, v * 2); // stores doubled
+      }
+    }
+    const m = new Doubler();
+    m.set("a", 5); // stores 10
+    void m;
+    const out = (await roundtrip(() => m))() as any;
+    expect(out instanceof Map).toBe(true);
+    expect(out.get("a")).toBe(10); // restored value is the live 10, NOT re-doubled to 20
+  });
+
+  test("a genuine Set subclass overriding add() does not re-run side effects on restore", async () => {
+    const flog: string[] = [];
+    class Logged extends Set {
+      #n: number;
+      constructor() {
+        super();
+        this.#n = 7;
+      }
+      add(v: any) {
+        flog.push(v);
+        return super.add(v);
+      }
+    }
+    const s = new Logged();
+    s.add("x");
+    s.add("y"); // flog === ["x","y"]
+    void [s, flog];
+    const out = (await roundtrip(() => ({ s, flog })))() as any;
+    expect([...out.s]).toEqual(["x", "y"]);
+    expect(out.flog).toEqual(["x", "y"]); // add() override NOT re-invoked during restore
+  });
+});

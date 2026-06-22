@@ -2052,17 +2052,21 @@ function emitGenuinePrivateInstance(value: object, name: string, ctx: Context): 
 // instance: Map entries via `.set`, Set values via `.add`, array elements by index. Returns
 // the own-property keys it handled (array indices + length) so the caller skips them.
 function restoreBuiltinContent(value: object, name: string, ctx: Context): Set<string> | undefined {
+  // A user subclass may OVERRIDE `set`/`add` (e.g. to transform values or log) — restoring
+  // through the override would re-apply that transform/side effect on top of the already-final
+  // entries. Call the base method directly so restore reproduces the exact live contents. (The
+  // array branch already assigns indices directly, sidestepping any overridden mutators.)
   if (value instanceof Map) {
     for (const [k, v] of value as Map<unknown, unknown>) {
       const kx = emitValue(transform(value, "", k, ctx), ctx);
       const vx = emitValue(transform(value, "", v, ctx), ctx);
-      ctx.module.push(`${name}.set(${kx}, ${vx});`);
+      ctx.module.push(`Map.prototype.set.call(${name}, ${kx}, ${vx});`);
     }
     return undefined;
   }
   if (value instanceof Set) {
     for (const v of value as Set<unknown>) {
-      ctx.module.push(`${name}.add(${emitValue(transform(value, "", v, ctx), ctx)});`);
+      ctx.module.push(`Set.prototype.add.call(${name}, ${emitValue(transform(value, "", v, ctx), ctx)});`);
     }
     return undefined;
   }
@@ -2149,10 +2153,24 @@ function emitOwnProperties(
     // A genuinely-undefined own value is kept (faithful: `{a: undefined}` keeps `a`), so this
     // only fires when the replacer changed it (descriptor.value was not already undefined).
     if (child === undefined && descriptor.value !== undefined && typeof key === "string" && descriptor.enumerable) {
+      // On the genuine-instance path the reify factory runs the real constructor, so a
+      // field-initialized property already exists on `name`; not emitting it would leave the
+      // constructor's value. `delete` drops it for real. On the plain-object path the property
+      // was never assigned, so the delete is a harmless no-op.
+      ctx.module.push(`delete ${name}[${keyExpr}];`);
       continue;
     }
 
-    if (typeof key === "string" && descriptor.enumerable && descriptor.writable && descriptor.configurable) {
+    // `name["__proto__"] = v` invokes the Object.prototype `__proto__` setter (reparents the
+    // object / silently drops a primitive) instead of defining an own property — route it
+    // through defineProperty so an own `__proto__` data property round-trips faithfully.
+    if (
+      typeof key === "string" &&
+      key !== "__proto__" &&
+      descriptor.enumerable &&
+      descriptor.writable &&
+      descriptor.configurable
+    ) {
       ctx.module.push(`${name}[${keyExpr}] = ${emitValue(child, ctx)};`);
     } else {
       ctx.module.push(
