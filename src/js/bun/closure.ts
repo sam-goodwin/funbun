@@ -5,11 +5,11 @@
 //
 // Handles: captured primitives; objects/arrays with cycles and shared
 // references (deduped by identity); nested functions; shared mutable cells
-// across closures (hoisted once, by Symbol.freeVariables id); a JSON.stringify
+// across closures (hoisted once, by Symbol.freeVariables id); a JSONStringify
 // `replacer(key, value)`; built-ins (Date/RegExp/Map/Set/typed arrays/Error);
 // Proxies and bound functions; property descriptors (getters/setters,
 // non-enumerable, registered/well-known symbol keys); prototypes (class
-// instances via Object.create(Class.prototype), null-proto objects); and class
+// instances via ObjectCreate(Class.prototype), null-proto objects); and class
 // values incl. statics, method-level captures, and `extends` inheritance. An
 // inline source map points stack traces back at the original source.
 //
@@ -49,11 +49,56 @@ interface FreeVariable {
 // variable name; chosen to be extremely unlikely in user code.
 const REF_PREFIX = "__bunClosure$";
 
+// Primordials. A serialize() call must not be subvertible by a caller that has reassigned global
+// builtins (e.g. `ObjectKeys = evil`, `Map = class {}`, `JSONStringify = …`). $-intrinsics
+// (`$getPrototypeOf`, `$isArray`, `$toString`) bind the originals at bytecode-compile time and are
+// immune even to tampering done before this module is first imported; the statics/constructors
+// below are snapshotted at module load. Use these everywhere internally — never the live globals.
+// Destructured (not `Object.x = …`) so an internal `ObjectCreate`-style call site can never
+// alias back to one of these captures during a mechanical rename.
+const {
+  getPrototypeOf: ObjectGetPrototypeOf,
+  getOwnPropertyDescriptor: ObjectGetOwnPropertyDescriptor,
+  getOwnPropertyNames: ObjectGetOwnPropertyNames,
+  getOwnPropertySymbols: ObjectGetOwnPropertySymbols,
+  keys: ObjectKeys,
+  create: ObjectCreate,
+  defineProperty: ObjectDefineProperty,
+  freeze: ObjectFreeze,
+  isFrozen: ObjectIsFrozen,
+  isSealed: ObjectIsSealed,
+  isExtensible: ObjectIsExtensible,
+  seal: ObjectSeal,
+  preventExtensions: ObjectPreventExtensions,
+  setPrototypeOf: ObjectSetPrototypeOf,
+} = Object;
+const { ownKeys: ReflectOwnKeys } = Reflect;
+const { stringify: JSONStringify, parse: JSONParse } = JSON;
+const { isInteger: NumberIsInteger } = Number;
+const { isView: ArrayBufferIsView } = ArrayBuffer;
+const { from: ArrayFrom, isArray: ArrayIsArray } = Array;
+// Constructors captured so `instanceof` / `new` can't be redirected by reassigning the global.
+const MapCtor = Map;
+const SetCtor = Set;
+const WeakMapCtor = WeakMap;
+const WeakSetCtor = WeakSet;
+const WeakRefCtor = WeakRef;
+const DateCtor = Date;
+const RegExpCtor = RegExp;
+const NumberCtor = Number;
+const StringCtor = String;
+const BooleanCtor = Boolean;
+const PromiseCtor = Promise;
+const ArrayBufferCtor = ArrayBuffer;
+const SharedArrayBufferCtor = typeof SharedArrayBuffer !== "undefined" ? SharedArrayBuffer : undefined;
+const ArrayCtor = Array;
+const Uint8ArrayCtor = Uint8Array;
+
 // An `import` statement re-creating an external import binding (native / node:*
 // / builtin) that can't be inlined.
 function importStatement(variable: FreeVariable): string {
   const info = variable.import!;
-  const src = JSON.stringify(info.source);
+  const src = JSONStringify(info.source);
   if (info.kind === "default") return `import ${variable.name} from ${src};`;
   if (info.kind === "namespace") return `import * as ${variable.name} from ${src};`;
   const spec = info.importedName === variable.name ? variable.name : `${info.importedName} as ${variable.name}`;
@@ -220,31 +265,31 @@ function serializeImpl(fn: Function, replacer?: Replacer): string {
   const genuinePlan = computeGenuineClasses(fn, sharedIds);
   const ctx: Context = {
     module: [],
-    refs: new Map(),
+    refs: new MapCtor(),
     counter: counterStart,
     sharedIds,
-    imports: new Set(),
+    imports: new SetCtor(),
     replacer: typeof replacer === "function" ? replacer : undefined,
     sourceBlocks: [],
     keepSets: computeKeepSets(fn),
-    symbols: new Map(),
+    symbols: new MapCtor(),
     alsContexts: [],
     genuineClasses: genuinePlan.genuine,
     genuineMethods: computeGenuineMethods(genuinePlan.genuine),
     hostedArrows: genuinePlan.hostedArrows,
     classHosts: genuinePlan.classHosts,
-    classReify: new Map(),
-    genuineClassId: new Map(),
+    classReify: new MapCtor(),
+    genuineClassId: new MapCtor(),
     needsReifySlot: false,
     deferredPatches: [],
     bodyQueue: [],
-    emittedFns: new Set(),
-    inProgressFns: new Set(),
+    emittedFns: new SetCtor(),
+    inProgressFns: new SetCtor(),
   };
 
   // Emit shared cells at module scope (deduped by id) before any function that
   // closes over them. Distinct shared cells with the same name can't coexist.
-  const namesById = new Map<string, number>();
+  const namesById = new MapCtor<string, number>();
   for (const id of sharedIds) {
     const cell = cellInfo.get(id)!;
     // External imports are re-emitted as `import` statements, not inlined.
@@ -384,9 +429,9 @@ function buildSourceMap(
   if (blocks.length === 0) return undefined;
 
   const sources: string[] = [];
-  const sourceIndexByUrl = new Map<string, number>();
+  const sourceIndexByUrl = new MapCtor<string, number>();
   // genLine -> [sourceIndex, srcLine0, genColumn, srcColumn]
-  const mapped = new Map<number, [number, number, number, number]>();
+  const mapped = new MapCtor<number, [number, number, number, number]>();
   let maxLine = 0;
 
   for (const block of blocks) {
@@ -456,7 +501,7 @@ function buildSourceMap(
     prevSrcColumn = srcColumn;
   }
 
-  return JSON.stringify({ version: 3, sources, names: [], mappings: lines.join(";") });
+  return JSONStringify({ version: 3, sources, names: [], mappings: lines.join(";") });
 }
 
 function countLines(text: string): number {
@@ -489,13 +534,13 @@ function forEachMapSetEntry(o: object, visit: (v: unknown) => void): void {
   // prototypes), so the base iterator throws on it. Guard with try/catch — a non-real receiver
   // simply has no entries to walk.
   try {
-    if (o instanceof Map) {
-      for (const entry of Map.prototype.entries.$call(o as Map<unknown, unknown>)) {
+    if (o instanceof MapCtor) {
+      for (const entry of MapCtor.prototype.entries.$call(o as Map<unknown, unknown>)) {
         visit(entry[0]);
         visit(entry[1]);
       }
-    } else if (o instanceof Set) {
-      for (const el of Set.prototype.values.$call(o as Set<unknown>)) visit(el);
+    } else if (o instanceof SetCtor) {
+      for (const el of SetCtor.prototype.values.$call(o as Set<unknown>)) visit(el);
     }
   } catch {}
 }
@@ -503,16 +548,16 @@ function forEachMapSetEntry(o: object, visit: (v: unknown) => void): void {
 // Walks the function graph reachable from `root` and finds cells referenced by
 // more than one function — those must share a single binding.
 function analyzeSharedCells(root: Function): { sharedIds: Set<number>; cellInfo: Map<number, FreeVariable> } {
-  const cellFunctions = new Map<number, Set<Function>>();
-  const cellInfo = new Map<number, FreeVariable>();
-  const seenFns = new Set<Function>();
-  const seenObjs = new Set<object>();
+  const cellFunctions = new MapCtor<number, Set<Function>>();
+  const cellInfo = new MapCtor<number, FreeVariable>();
+  const seenFns = new SetCtor<Function>();
+  const seenObjs = new SetCtor<object>();
 
   // Function -> the functions it captures (free-var values that are functions).
-  const fnEdges = new Map<Function, Set<Function>>();
+  const fnEdges = new MapCtor<Function, Set<Function>>();
   // Cell id -> its value, when that value is a function. Used to hoist cells
   // whose function participates in a reference cycle.
-  const cellValueFn = new Map<number, Function>();
+  const cellValueFn = new MapCtor<number, Function>();
 
   // Iterative graph walk (an explicit heap stack, not the JS call stack) so a deep object
   // chain doesn't overflow. The result is order-independent (it only fills sets/maps), so any
@@ -551,21 +596,21 @@ function analyzeSharedCells(root: Function): { sharedIds: Set<number>; cellInfo:
   function processObj(o: object): void {
     if (seenObjs.has(o)) return;
     seenObjs.add(o);
-    if (Array.isArray(o)) {
+    if (ArrayIsArray(o)) {
       const arr = o as unknown[];
       for (const i of arrayPresentIndices(arr)) enqueue(arr[i]);
       return;
     }
     // Walk own properties via descriptors so getters aren't invoked here (their
     // values are reconstructed lazily, not eagerly).
-    for (const key of Reflect.ownKeys(o)) {
-      const descriptor = Object.getOwnPropertyDescriptor(o, key)!;
+    for (const key of ReflectOwnKeys(o)) {
+      const descriptor = ObjectGetOwnPropertyDescriptor(o, key)!;
       if (descriptor.get) enqueue(descriptor.get);
       if (descriptor.set) enqueue(descriptor.set);
       if ("value" in descriptor) enqueue(descriptor.value);
     }
     // A class instance is reconstructed via its class, so analyze that too.
-    const proto = Object.getPrototypeOf(o);
+    const proto = ObjectGetPrototypeOf(o);
     if (proto !== null && proto !== Object.prototype) {
       const ctor = (proto as any).constructor;
       enqueue(typeof ctor === "function" && ctor.prototype === proto ? ctor : proto);
@@ -583,13 +628,13 @@ function analyzeSharedCells(root: Function): { sharedIds: Set<number>; cellInfo:
     } catch {
       return;
     }
-    const edges = new Set<Function>();
+    const edges = new SetCtor<Function>();
     fnEdges.set(fn, edges);
     const freeVariables = allFreeVariables(fn, source);
     for (const variable of freeVariables) {
       let set = cellFunctions.get(variable.id);
       if (set === undefined) {
-        set = new Set();
+        set = new SetCtor();
         cellFunctions.set(variable.id, set);
         cellInfo.set(variable.id, variable);
       }
@@ -606,7 +651,7 @@ function analyzeSharedCells(root: Function): { sharedIds: Set<number>; cellInfo:
       enqueue(variable.value);
     }
     // A class's superclass is reconstructed too, so analyze it.
-    const superclass = Object.getPrototypeOf(fn);
+    const superclass = ObjectGetPrototypeOf(fn);
     if (typeof superclass === "function" && superclass !== Function.prototype) {
       enqueue(superclass);
     }
@@ -617,7 +662,7 @@ function analyzeSharedCells(root: Function): { sharedIds: Set<number>; cellInfo:
 
   const cyclic = findCyclicFunctions(fnEdges);
 
-  const sharedIds = new Set<number>();
+  const sharedIds = new SetCtor<number>();
   for (const [id, fns] of cellFunctions) {
     // A cell is hoisted to module scope (referenced live by name) if it is
     // shared by 2+ functions, OR if its value is a function in a reference
@@ -645,7 +690,7 @@ interface AccessNode {
   calledMethods: Set<string>; // props invoked as `base.prop(...)` (this is bound to base)
 }
 function newAccessNode(): AccessNode {
-  return { all: false, children: new Map(), calledMethods: new Set() };
+  return { all: false, children: new MapCtor(), calledMethods: new SetCtor() };
 }
 function accessChild(node: AccessNode, prop: string): AccessNode {
   let c = node.children.get(prop);
@@ -686,7 +731,7 @@ function extractCallableNode(prog: any): any | null {
 // identical-source closures parsed each one anew. Bounded (FIFO eviction) so a long-lived process
 // serializing many DISTINCT closures doesn't grow it without limit; a single serialize() of a
 // large same-source graph keeps its one entry hot.
-const parseCache = new Map<string, { node: any; offset: number } | null>();
+const parseCache = new MapCtor<string, { node: any; offset: number } | null>();
 const PARSE_CACHE_CAP = 4096;
 
 // Parse a function's source (in any form `Function.prototype.toString` yields)
@@ -861,7 +906,7 @@ const REIFY_SLOT = "$bunClosureReify$";
 const PATCH_METHOD = "__bunReifyPatch";
 // Builtin bases a genuine subclass can extend: their no-arg `super()` yields a valid empty
 // instance and their content is restorable (Map.set/Set.add/array indices) after construction.
-const RECONSTRUCTABLE_BUILTIN_BASES: Set<unknown> = new Set([Map, Set, Array]);
+const RECONSTRUCTABLE_BUILTIN_BASES: Set<unknown> = new SetCtor([MapCtor, SetCtor, ArrayCtor]);
 
 // Parse `source` and, if it is a base class (no heritage) declaring `#private` data
 // fields, return those field names plus the parse offset; else null. This is the
@@ -911,7 +956,7 @@ function injectReifyConstructor(
   // Patch keys are namespaced by class id so a same-named private across an inheritance
   // chain still maps to this class's own genuine slot.
   const patch = fields.length
-    ? `${PATCH_METHOD}(v){${fields.map(f => `this.${f}=v[${JSON.stringify(keyPrefix + f)}];`).join("")}}`
+    ? `${PATCH_METHOD}(v){${fields.map(f => `this.${f}=v[${JSONStringify(keyPrefix + f)}];`).join("")}}`
     : "";
   const classBodyInjections = patch + hostMethods.join("");
   // The class body `{` — `node.body` (ClassBody) start is reliable and, crucially, points at
@@ -1008,10 +1053,10 @@ function computeGenuineClasses(root: unknown, sharedIdsArg?: Set<number>): Genui
   // mutations shared. The caller (serialize) already ran analyzeSharedCells — reuse its result
   // rather than walk the whole graph a second time.
   const sharedIds =
-    sharedIdsArg ?? (typeof root === "function" ? analyzeSharedCells(root).sharedIds : new Set<number>());
-  const funcs = new Set<Function>();
-  const objs = new Set<object>();
-  const seen = new Set<unknown>();
+    sharedIdsArg ?? (typeof root === "function" ? analyzeSharedCells(root).sharedIds : new SetCtor<number>());
+  const funcs = new SetCtor<Function>();
+  const objs = new SetCtor<object>();
+  const seen = new SetCtor<unknown>();
   const stack: unknown[] = [root];
   const push = (v: unknown) => {
     if (v !== null && (typeof v === "object" || typeof v === "function")) stack.push(v);
@@ -1044,11 +1089,11 @@ function computeGenuineClasses(root: unknown, sharedIdsArg?: Set<number>): Genui
         forEachMapSetEntry(v as object, push);
       }
       // Own DATA properties only — reading an accessor could fire a getter (side effect).
-      for (const key of Reflect.ownKeys(v as object)) {
-        const d = Object.getOwnPropertyDescriptor(v as object, key);
+      for (const key of ReflectOwnKeys(v as object)) {
+        const d = ObjectGetOwnPropertyDescriptor(v as object, key);
         if (d !== undefined && "value" in d) push(d.value);
       }
-      push(Object.getPrototypeOf(v as object));
+      push(ObjectGetPrototypeOf(v as object));
     }
   };
   drain();
@@ -1057,7 +1102,7 @@ function computeGenuineClasses(root: unknown, sharedIdsArg?: Set<number>): Genui
   // hence its class) is otherwise invisible (the arrow captures only the brand), but we
   // recover it natively and host the arrow on the class. The instance must then be emitted
   // and its class must qualify as genuine.
-  const arrowInstance = new Map<Function, object>();
+  const arrowInstance = new MapCtor<Function, object>();
   for (const f of [...funcs]) {
     if (!hostableEscapedArrow(f)) continue;
     const r = $resolveClosureBinding(f, "this");
@@ -1069,7 +1114,7 @@ function computeGenuineClasses(root: unknown, sharedIdsArg?: Set<number>): Genui
   drain();
 
   // Cache each reachable class's parsed structure.
-  const structure = new Map<Function, ClassStructure | null>();
+  const structure = new MapCtor<Function, ClassStructure | null>();
   const structOf = (C: Function): ClassStructure | null => {
     if (!structure.has(C)) {
       let s: ClassStructure | null = null;
@@ -1083,7 +1128,7 @@ function computeGenuineClasses(root: unknown, sharedIdsArg?: Set<number>): Genui
 
   // Every reachable class's own methods — a method legitimately reading a private (even an
   // inherited one with a same-named field) must not be mistaken for an escaped closure.
-  const allMethods = new Set<Function>();
+  const allMethods = new SetCtor<Function>();
   for (const f of funcs) {
     if (structOf(f) !== null) for (const m of classOwnMethods(f)) allMethods.add(m);
   }
@@ -1092,7 +1137,7 @@ function computeGenuineClasses(root: unknown, sharedIdsArg?: Set<number>): Genui
   // user classes only (no builtin base), has ≥1 private field, and no chain member with a
   // non-hostable escaped `#x` closure. (Same-name private collisions across the chain are
   // allowed — keys are namespaced by class id.)
-  const candidate = new Set<Function>();
+  const candidate = new SetCtor<Function>();
   for (const f of funcs) {
     const chain = genuineChain(f, structOf, funcs, allMethods);
     if (chain) for (const c of chain) candidate.add(c);
@@ -1101,7 +1146,7 @@ function computeGenuineClasses(root: unknown, sharedIdsArg?: Set<number>): Genui
   // Instance-leaf fixpoint: a genuine class is safe only if EVERY reachable instance with
   // it in its prototype chain is constructed by a genuine class (so the full constructor
   // chain installs every brand). If an instance's chain includes a non-candidate class, it
-  // would be rebuilt via Object.create — unable to brand a genuine ancestor — so none of
+  // would be rebuilt via ObjectCreate — unable to brand a genuine ancestor — so none of
   // its chain classes can be genuine; remove them all and repeat until stable.
   let changed = true;
   while (changed) {
@@ -1120,11 +1165,11 @@ function computeGenuineClasses(root: unknown, sharedIdsArg?: Set<number>): Genui
   // class's body and the receiver carries the brand). The arrow's non-`this` captures are
   // threaded as host-method parameters (passed the captured values at the call site). Each
   // gets a unique host-method key.
-  const hostedArrows: GenuinePlan["hostedArrows"] = new Map();
-  const classHosts: GenuinePlan["classHosts"] = new Map();
-  const hostCount = new Map<Function, number>();
+  const hostedArrows: GenuinePlan["hostedArrows"] = new MapCtor();
+  const classHosts: GenuinePlan["classHosts"] = new MapCtor();
+  const hostCount = new MapCtor<Function, number>();
   for (const [arrow, instance] of arrowInstance) {
-    const proto = Object.getPrototypeOf(instance);
+    const proto = ObjectGetPrototypeOf(instance);
     const classFn = (proto as any)?.constructor;
     if (typeof classFn !== "function" || classFn.prototype !== proto || !candidate.has(classFn)) continue;
     const fv = ((arrow as any)[Symbol.freeVariables] as FreeVariable[] | undefined) ?? [];
@@ -1170,13 +1215,13 @@ function hostableEscapedArrow(fn: Function): boolean {
 function computeGenuineMethods(
   genuineClasses: Set<Function>,
 ): Map<Function, { classFn: Function; key: string | symbol; kind: "method" | "get" | "set" }> {
-  const map = new Map<Function, { classFn: Function; key: string | symbol; kind: "method" | "get" | "set" }>();
+  const map = new MapCtor<Function, { classFn: Function; key: string | symbol; kind: "method" | "get" | "set" }>();
   for (const C of genuineClasses) {
     const proto = C.prototype;
     if (proto == null) continue;
-    for (const key of Reflect.ownKeys(proto)) {
+    for (const key of ReflectOwnKeys(proto)) {
       if (key === "constructor") continue;
-      const d = Object.getOwnPropertyDescriptor(proto, key);
+      const d = ObjectGetOwnPropertyDescriptor(proto, key);
       if (d === undefined) continue;
       // First writer wins: a method is indexed to the class that declares it, not a
       // subclass that inherits the same identity (subclasses don't redefine it).
@@ -1212,7 +1257,7 @@ function genuineChain(
     if (s.fields.length > 0) hasField = true;
     if (perClassDisqualified(cur, s.fields, funcs, allMethods)) return null;
     chain.push(cur);
-    cur = Object.getPrototypeOf(cur);
+    cur = ObjectGetPrototypeOf(cur);
   }
   return hasField ? chain : null;
 }
@@ -1228,27 +1273,27 @@ function genuineClassId(fn: Function, ctx: Context): number {
 // constructor chain that built `o`.
 function instanceChainClasses(o: object): Function[] {
   const classes: Function[] = [];
-  let p = Object.getPrototypeOf(o);
+  let p = ObjectGetPrototypeOf(o);
   while (p !== null && p !== Object.prototype) {
     const c = (p as any).constructor;
     if (typeof c === "function" && c.prototype === p) {
-      // Stop at a builtin/native base (reconstructed via super(), not Object.create) — only
+      // Stop at a builtin/native base (reconstructed via super(), not ObjectCreate) — only
       // the user-class portion of the chain must be genuine for the fixpoint.
       if (isNativeFunctionSource(c.toString())) break;
       classes.push(c);
     }
-    p = Object.getPrototypeOf(p);
+    p = ObjectGetPrototypeOf(p);
   }
   return classes;
 }
 
 // The own (prototype + static) method/accessor function identities of class `C`.
 function classOwnMethods(C: Function): Set<Function> {
-  const methods = new Set<Function>();
+  const methods = new SetCtor<Function>();
   for (const holder of [C.prototype, C] as object[]) {
     if (holder == null) continue;
-    for (const key of Reflect.ownKeys(holder)) {
-      const d = Object.getOwnPropertyDescriptor(holder, key);
+    for (const key of ReflectOwnKeys(holder)) {
+      const d = ObjectGetOwnPropertyDescriptor(holder, key);
       if (d === undefined) continue;
       for (const m of [d.value, d.get, d.set]) if (typeof m === "function") methods.add(m);
     }
@@ -1279,7 +1324,7 @@ function perClassDisqualified(C: Function, fields: string[], funcs: Set<Function
 // Walk a function AST and record how each `rootNames` identifier (free variable
 // names, or "this") is used. Returns name → AccessNode.
 function analyzeAccess(fnNode: any, rootNames: Set<string>): Map<string, AccessNode> {
-  const table = new Map<string, AccessNode>();
+  const table = new MapCtor<string, AccessNode>();
   const get = (name: string): AccessNode => {
     let n = table.get(name);
     if (n === undefined) {
@@ -1389,9 +1434,9 @@ function analyzeAccess(fnNode: any, rootNames: Set<string>): Map<string, AccessN
 function lookupDescriptor(obj: object, key: string): PropertyDescriptor | undefined {
   let o: object | null = obj;
   while (o !== null) {
-    const d = Object.getOwnPropertyDescriptor(o, key);
+    const d = ObjectGetOwnPropertyDescriptor(o, key);
     if (d !== undefined) return d;
-    o = Object.getPrototypeOf(o);
+    o = ObjectGetPrototypeOf(o);
   }
   return undefined;
 }
@@ -1400,11 +1445,11 @@ function lookupDescriptor(obj: object, key: string): PropertyDescriptor | undefi
 // keys to serialize (or "all"). Walks every reachable function, analyzes its
 // access paths, and follows `this` into invoked methods so their reads are kept.
 function computeKeepSets(root: Function): Map<object, Set<string> | "all"> {
-  const keepSets = new Map<object, Set<string> | "all">();
-  const seenFns = new Set<Function>();
-  const seenObjs = new Set<object>();
-  const followed = new Map<object, Set<string>>(); // receiver → methods already this-followed
-  const followedFns = new Map<object, Set<Function>>(); // receiver → getter/method fns already this-followed
+  const keepSets = new MapCtor<object, Set<string> | "all">();
+  const seenFns = new SetCtor<Function>();
+  const seenObjs = new SetCtor<object>();
+  const followed = new MapCtor<object, Set<string>>(); // receiver → methods already this-followed
+  const followedFns = new MapCtor<object, Set<Function>>(); // receiver → getter/method fns already this-followed
 
   // Mark a value — and everything reachable through its object graph — as
   // serialized whole. Keep-all must propagate: if an object escapes, every
@@ -1429,8 +1474,8 @@ function computeKeepSets(root: Function): Map<object, Set<string> | "all"> {
         }
         continue;
       }
-      for (const key of Reflect.ownKeys(o)) {
-        const d = Object.getOwnPropertyDescriptor(o, key)!;
+      for (const key of ReflectOwnKeys(o)) {
+        const d = ObjectGetOwnPropertyDescriptor(o, key)!;
         if ("value" in d && d.value !== null && typeof d.value === "object") stack.push(d.value);
       }
     }
@@ -1449,7 +1494,7 @@ function computeKeepSets(root: Function): Map<object, Set<string> | "all"> {
     if (keepSets.get(obj) === "all") return;
     let cur = keepSets.get(obj) as Set<string> | undefined;
     if (cur === undefined) {
-      cur = new Set();
+      cur = new SetCtor();
       keepSets.set(obj, cur);
     }
     for (const [prop, childNode] of node.children) {
@@ -1473,7 +1518,7 @@ function computeKeepSets(root: Function): Map<object, Set<string> | "all"> {
   function thisFollow(obj: object, method: string): void {
     let done = followed.get(obj);
     if (done === undefined) {
-      done = new Set();
+      done = new SetCtor();
       followed.set(obj, done);
     }
     if (done.has(method)) return;
@@ -1495,7 +1540,7 @@ function computeKeepSets(root: Function): Map<object, Set<string> | "all"> {
     if (typeof fn !== "function") return;
     let done = followedFns.get(obj);
     if (done === undefined) {
-      done = new Set();
+      done = new SetCtor();
       followedFns.set(obj, done);
     }
     if (done.has(fn as Function)) return;
@@ -1514,7 +1559,7 @@ function computeKeepSets(root: Function): Map<object, Set<string> | "all"> {
       keepAll(obj);
       return;
     }
-    const thisNode = analyzeAccess(fnNode, new Set(["this"])).get("this");
+    const thisNode = analyzeAccess(fnNode, new SetCtor(["this"])).get("this");
     if (thisNode === undefined) return; // doesn't touch `this`
     apply(obj, thisNode); // its `this.X` reads are reads on `obj`
   }
@@ -1556,13 +1601,13 @@ function computeKeepSets(root: Function): Map<object, Set<string> | "all"> {
       for (const i of arrayPresentIndices(arr)) enqueueFns(arr[i]);
       return;
     }
-    for (const key of Reflect.ownKeys(obj)) {
-      const d = Object.getOwnPropertyDescriptor(obj, key)!;
+    for (const key of ReflectOwnKeys(obj)) {
+      const d = ObjectGetOwnPropertyDescriptor(obj, key)!;
       if (d.get) enqueueFns(d.get);
       if (d.set) enqueueFns(d.set);
       if ("value" in d) enqueueFns(d.value);
     }
-    const proto = Object.getPrototypeOf(obj);
+    const proto = ObjectGetPrototypeOf(obj);
     if (proto !== null && proto !== Object.prototype) {
       const ctor = (proto as any).constructor;
       enqueueFns(typeof ctor === "function" && ctor.prototype === proto ? ctor : proto);
@@ -1581,14 +1626,14 @@ function computeKeepSets(root: Function): Map<object, Set<string> | "all"> {
     }
     const freeVariables = allFreeVariables(fn, source);
     if (freeVariables.length === 0) return;
-    const rootNames = new Set(freeVariables.map(v => v.name));
+    const rootNames = new SetCtor(freeVariables.map(v => v.name));
     const fnNode = parseFunctionNode(source);
     const table = fnNode === null ? null : analyzeAccess(fnNode, rootNames);
     for (const v of freeVariables) {
       apply(v.value, table === null ? undefined : table.get(v.name));
       enqueueFns(v.value);
     }
-    const superclass = Object.getPrototypeOf(fn);
+    const superclass = ObjectGetPrototypeOf(fn);
     if (typeof superclass === "function" && superclass !== Function.prototype) enqueueFns(superclass);
   }
 
@@ -1598,7 +1643,7 @@ function computeKeepSets(root: Function): Map<object, Set<string> | "all"> {
   } catch {
     // Any analysis failure must not break serialization: fall back to emitting
     // everything (the pre-pruning behaviour) by discarding partial keep-sets.
-    return new Map();
+    return new MapCtor();
   }
   return keepSets;
 }
@@ -1608,10 +1653,10 @@ function computeKeepSets(root: Function): Map<object, Set<string> | "all"> {
 // node with a self-edge. Iterative Tarjan SCC: O(V+E) (the old per-node DFS was O(V·E), minutes
 // on a large graph) and non-recursive (a deep capture chain can't overflow it).
 function findCyclicFunctions(edges: Map<Function, Set<Function>>): Set<Function> {
-  const cyclic = new Set<Function>();
-  const index = new Map<Function, number>();
-  const lowlink = new Map<Function, number>();
-  const onStack = new Set<Function>();
+  const cyclic = new SetCtor<Function>();
+  const index = new MapCtor<Function, number>();
+  const lowlink = new MapCtor<Function, number>();
+  const onStack = new SetCtor<Function>();
   const sccStack: Function[] = [];
   let counter = 0;
 
@@ -1721,7 +1766,7 @@ function reconstructFunctionExpr(fn: Function, ctx: Context): ReconstructedFunct
   } else {
     // A mangled class still re-evaluates its static blocks / static field initializers when the
     // class is defined; strip those so their side effects don't re-run (instance fields never
-    // run on the Object.create path, so they're left alone). Non-class functions: no-op.
+    // run on the ObjectCreate path, so they're left alone). Non-class functions: no-op.
     const ms = classStructure(original);
     const pre = ms !== null ? neutralizeClassInitializers(original, ms.node, ms.offset, false) : original;
     source = rewritePrivateMembers(pre);
@@ -1774,7 +1819,7 @@ function reconstructFunctionExpr(fn: Function, ctx: Context): ReconstructedFunct
   // Names already resolvable in the reconstructed output (so a field-initializer
   // capture below doesn't re-bind them): every free variable (inlined, shared at
   // module scope, or re-imported all resolve by name).
-  const boundNames = new Set<string>();
+  const boundNames = new SetCtor<string>();
   for (const variable of freeVariables) {
     boundNames.add(variable.name);
     // Shared cells are declared once at module scope; the source resolves to
@@ -1859,7 +1904,7 @@ function classSourceAnchor(
     const key = m.key?.value;
     if (typeof key !== "string" || key === "constructor") continue;
     if (typeof m.value?.start !== "number") continue;
-    const d = Object.getOwnPropertyDescriptor(proto, key);
+    const d = ObjectGetOwnPropertyDescriptor(proto, key);
     const method = d?.value ?? d?.get ?? d?.set;
     const loc = (method as any)?.[Symbol.sourceLocation] as
       | { url?: string; line?: number; endLine?: number }
@@ -1892,7 +1937,7 @@ function containsUnsupportedNode(node: any): boolean {
   }
   if (!node || typeof node !== "object") return false;
   if (node.type === "Unsupported") return true;
-  for (const k of Object.keys(node)) if (k !== "type" && containsUnsupportedNode(node[k])) return true;
+  for (const k of ObjectKeys(node)) if (k !== "type" && containsUnsupportedNode(node[k])) return true;
   return false;
 }
 
@@ -1927,7 +1972,7 @@ function allFreeVariables(fn: Function, source: string): FreeVariable[] {
     return own.filter(v => !isInternal(v.name) && isRealRef(v));
   }
 
-  const byId = new Map<number, FreeVariable>();
+  const byId = new MapCtor<number, FreeVariable>();
   for (const variable of own) {
     // `#name` private brands are an internal mechanism recreated by the class
     // body itself — never an external capture.
@@ -1940,8 +1985,8 @@ function allFreeVariables(fn: Function, source: string): FreeVariable[] {
 }
 
 function collectMemberFreeVariables(holder: object, classFn: Function, byId: Map<number, FreeVariable>): void {
-  for (const key of Reflect.ownKeys(holder)) {
-    const descriptor = Object.getOwnPropertyDescriptor(holder, key)!;
+  for (const key of ReflectOwnKeys(holder)) {
+    const descriptor = ObjectGetOwnPropertyDescriptor(holder, key)!;
     for (const member of [descriptor.value, descriptor.get, descriptor.set]) {
       if (typeof member !== "function") continue;
       const memberVars = (member as any)[Symbol.freeVariables] as FreeVariable[] | undefined;
@@ -1965,7 +2010,7 @@ function collectMemberFreeVariables(holder: object, classFn: Function, byId: Map
 // the class's own prototype, reliable even though it isn't a free variable.
 function classHeritage(fn: Function, source: string, ctx: Context): { source: string; binding: string } | undefined {
   if (!source.trimStart().startsWith("class")) return undefined;
-  const superclass = Object.getPrototypeOf(fn);
+  const superclass = ObjectGetPrototypeOf(fn);
   if (typeof superclass !== "function" || superclass === Function.prototype) return undefined;
 
   const parsed = parseWithOffset(source);
@@ -2006,8 +2051,8 @@ function classHeritage(fn: Function, source: string, ctx: Context): { source: st
 // The free identifier names referenced by an AST node, excluding names bound
 // within it (params, declarators, nested function/class names, destructuring).
 function freeIdentifiersOfNode(node: any): Set<string> {
-  const refs = new Set<string>();
-  const bound = new Set<string>();
+  const refs = new SetCtor<string>();
+  const bound = new SetCtor<string>();
   const bindNames = (n: any): void => {
     if (!n || typeof n !== "object") return;
     switch (n.type) {
@@ -2074,7 +2119,7 @@ function fieldInitializerBindings(fn: Function, source: string, boundNames: Set<
   if (!$isJSArray(members)) return [];
   if (classNode.id?.name) boundNames.add(classNode.id.name);
 
-  const names = new Set<string>();
+  const names = new SetCtor<string>();
   for (const m of members) {
     if (!m || typeof m !== "object") continue;
     // Field initializer values (`x = <expr>`). The value runs in the class's scope
@@ -2110,7 +2155,7 @@ function fieldInitializerBindings(fn: Function, source: string, boundNames: Set<
 
 // For each member with a computed identifier key (`[mk]() {}`) whose identifier is still
 // unbound, recover the real evaluated key from the live class and bind the identifier to it.
-// Matching is robust (not order-based: Reflect.ownKeys groups strings before symbols): a
+// Matching is robust (not order-based: ReflectOwnKeys groups strings before symbols): a
 // computed member's reconstructed source begins with `[name]`, so we find the holder key
 // whose own method/accessor `toString()` begins with `[name]`. Returns [name, key] entries.
 function recoverComputedKeyValues(fn: Function, members: any[], boundNames: Set<string>): Array<[string, unknown]> {
@@ -2124,8 +2169,8 @@ function recoverComputedKeyValues(fn: Function, members: any[], boundNames: Set<
     if (boundNames.has(name)) continue;
     const holder = m.static ? fn : fn.prototype;
     if (holder == null) continue;
-    for (const k of Reflect.ownKeys(holder)) {
-      const d = Object.getOwnPropertyDescriptor(holder, k);
+    for (const k of ReflectOwnKeys(holder)) {
+      const d = ObjectGetOwnPropertyDescriptor(holder, k);
       if (d === undefined) continue;
       const f = d.value ?? d.get ?? d.set;
       if (typeof f !== "function") continue;
@@ -2146,7 +2191,7 @@ function recoverComputedKeyValues(fn: Function, members: any[], boundNames: Set<
 
 // Applies the replacer (if any) to a value before it is serialized. `holder` is
 // the object/array the value came from (the replacer's `this`), matching
-// JSON.stringify; it is undefined for top-level free-variable values.
+// JSONStringify; it is undefined for top-level free-variable values.
 function transform(holder: unknown, key: string, value: unknown, ctx: Context): unknown {
   return ctx.replacer ? ctx.replacer.$call(holder, key, value) : value;
 }
@@ -2156,7 +2201,7 @@ function transform(holder: unknown, key: string, value: unknown, ctx: Context): 
 function emitValue(value: unknown, ctx: Context): string {
   switch (typeof value) {
     case "string":
-      return JSON.stringify(value);
+      return JSONStringify(value);
     case "boolean":
       return value ? "true" : "false";
     case "undefined":
@@ -2231,7 +2276,7 @@ function emitObject(value: object, ctx: Context): string {
   // later mutation). A genuine-private class instance (incl. a genuine subclass of a builtin
   // like Map) goes through its reify factory + patch methods, not the builtin/object paths.
   const finishExtensibility = (): void => {
-    if (!Object.isExtensible(value)) emitNonExtensible(name, value, ctx);
+    if (!ObjectIsExtensible(value)) emitNonExtensible(name, value, ctx);
   };
   const genuineBody = emitGenuinePrivateInstance(value, name, ctx);
   if (genuineBody !== null) {
@@ -2247,7 +2292,7 @@ function emitObject(value: object, ctx: Context): string {
       builtin.body();
       // A built-in subclass (`class X extends Map/Set/...`): the base data is built; restore the
       // subclass prototype + its own/private instance fields.
-      if (Object.getPrototypeOf(value) !== builtin.proto) restoreSubclass(value, name, ctx);
+      if (ObjectGetPrototypeOf(value) !== builtin.proto) restoreSubclass(value, name, ctx);
       finishExtensibility();
     });
     return name;
@@ -2257,7 +2302,7 @@ function emitObject(value: object, ctx: Context): string {
     objBody();
     // An array subclass (`class X extends Array`) is constructed as a plain array above; restore
     // its prototype and any extra (non-index) own/private fields.
-    if (Array.isArray(value) && Object.getPrototypeOf(value) !== Array.prototype) {
+    if (ArrayIsArray(value) && ObjectGetPrototypeOf(value) !== ArrayCtor.prototype) {
       restoreSubclass(value, name, ctx, arrayIndexSkip(value));
     }
     finishExtensibility();
@@ -2272,7 +2317,7 @@ function restoreSubclass(value: object, name: string, ctx: Context, skip?: Set<s
   // Point at the reconstructed class's own `.prototype` (not a standalone copy)
   // so `instanceof` and the shared prototype identity survive — same shape as
   // objectBaseExpression's class-instance case.
-  const proto = Object.getPrototypeOf(value);
+  const proto = ObjectGetPrototypeOf(value);
   const ctor = (proto as any)?.constructor;
   const protoExpr =
     typeof ctor === "function" && ctor.prototype === proto
@@ -2288,15 +2333,15 @@ function restoreSubclass(value: object, name: string, ctx: Context, skip?: Set<s
 // scan — `new Array(4294967295)` must not take 4 billion iterations / allocate 4 billion strings.
 function arrayPresentIndices(array: unknown[]): number[] {
   const out: number[] = [];
-  for (const key of Object.keys(array)) {
+  for (const key of ObjectKeys(array)) {
     const n = +key;
-    if (Number.isInteger(n) && n >= 0 && n < 4294967295 && String(n) === key) out.push(n);
+    if (NumberIsInteger(n) && n >= 0 && n < 4294967295 && String(n) === key) out.push(n);
   }
   return out;
 }
 
 function arrayIndexSkip(value: unknown[]): Set<string> {
-  const skip = new Set<string>(["length"]);
+  const skip = new SetCtor<string>(["length"]);
   for (const i of arrayPresentIndices(value)) skip.add(String(i));
   return skip;
 }
@@ -2305,7 +2350,7 @@ function arrayIndexSkip(value: unknown[]): Set<string> {
 // `name` always sees a declared binding) and returns a thunk that emits the BODY (property
 // assignments / members) — deferred via emitObject so emission depth lives on the heap.
 function emitObjectBody(value: object, name: string, ctx: Context): () => void {
-  if (Array.isArray(value)) {
+  if (ArrayIsArray(value)) {
     ctx.module.push(`const ${name} = [];`);
     const array = value as unknown[];
     return () => {
@@ -2322,8 +2367,8 @@ function emitObjectBody(value: object, name: string, ctx: Context): () => void {
       // exist: own names beyond the present indices + `length`, or any symbol key. (The common
       // dense array has none, and an unconditional emitOwnProperties walk is a measurable cost.)
       if (
-        Object.getOwnPropertyNames(array).length > presentIndices + 1 ||
-        Object.getOwnPropertySymbols(array).length > 0
+        ObjectGetOwnPropertyNames(array).length > presentIndices + 1 ||
+        ObjectGetOwnPropertySymbols(array).length > 0
       ) {
         emitOwnProperties(name, value, ctx, arrayIndexSkip(array));
       }
@@ -2338,12 +2383,12 @@ function emitObjectBody(value: object, name: string, ctx: Context): () => void {
     ctx.module.push(`const ${name} = {};`);
     return () => {
       const keep = ctx.keepSets.get(value);
-      for (const key of Reflect.ownKeys(value)) {
+      for (const key of ReflectOwnKeys(value)) {
         if (typeof key !== "string") continue;
         if (keep !== undefined && keep !== "all" && !keep.has(key)) continue;
         const child = transform(value, key, (value as any)[key], ctx);
         if (child === undefined) continue;
-        ctx.module.push(`${name}[${JSON.stringify(key)}] = ${emitValue(child, ctx)};`);
+        ctx.module.push(`${name}[${JSONStringify(key)}] = ${emitValue(child, ctx)};`);
       }
     };
   }
@@ -2363,9 +2408,9 @@ function emitObjectBody(value: object, name: string, ctx: Context): () => void {
 // values so cycles/self-references can refer back to it; (2) install the genuine `#private`
 // slots by calling each chain class's patch method (after all instances exist). Public own
 // properties are restored last. Real `#private` slots preserve privacy, brand checks, and
-// `instanceof`. Returns false (caller uses the default Object.create path) when not applicable.
+// `instanceof`. Returns false (caller uses the default ObjectCreate path) when not applicable.
 function emitGenuinePrivateInstance(value: object, name: string, ctx: Context): (() => void) | null {
-  const proto = Object.getPrototypeOf(value);
+  const proto = ObjectGetPrototypeOf(value);
   const ctor = (proto as any)?.constructor;
   if (typeof ctor !== "function" || ctor.prototype !== proto) return null;
   if (!ctx.genuineClasses.has(ctor)) return null;
@@ -2386,7 +2431,7 @@ function emitGenuinePrivateInstance(value: object, name: string, ctx: Context): 
   // and the patch CALLS are deferred to the end of the prelude — a private value can reference a
   // binding declared after this instance (e.g. a hosted arrow held in its own private slot).
   const patchClasses: Function[] = [];
-  for (let p: object | null = proto; p && p !== Object.prototype; p = Object.getPrototypeOf(p)) {
+  for (let p: object | null = proto; p && p !== Object.prototype; p = ObjectGetPrototypeOf(p)) {
     const c = (p as any).constructor;
     if (typeof c === "function" && c.prototype === p && (ctx.classReify.get(c)?.fields.length ?? 0) > 0) {
       patchClasses.push(c);
@@ -2404,7 +2449,7 @@ function emitGenuinePrivateInstance(value: object, name: string, ctx: Context): 
       for (const fname of ctx.classReify.get(c)?.fields ?? []) {
         const pf = privateFields[idx++];
         if (pf === undefined) continue;
-        entries.push(`${JSON.stringify(prefix + fname)}: ${emitValue(transform(value, pf.name, pf.value, ctx), ctx)}`);
+        entries.push(`${JSONStringify(prefix + fname)}: ${emitValue(transform(value, pf.name, pf.value, ctx), ctx)}`);
       }
     }
     const valsName = REF_PREFIX + ctx.counter++;
@@ -2429,21 +2474,21 @@ function restoreBuiltinContent(value: object, name: string, ctx: Context): Set<s
   // that transform/side effect on top of the already-final entries. Both the read (base
   // Symbol.iterator) and the restore (base set/add) go through the prototype directly so
   // restore reproduces the exact live contents. (The array branch assigns indices directly.)
-  if (value instanceof Map) {
-    for (const [k, v] of Map.prototype.entries.$call(value as Map<unknown, unknown>)) {
+  if (value instanceof MapCtor) {
+    for (const [k, v] of MapCtor.prototype.entries.$call(value as Map<unknown, unknown>)) {
       const kx = emitValue(transform(value, "", k, ctx), ctx);
       const vx = emitValue(transform(value, "", v, ctx), ctx);
       ctx.module.push(`Map.prototype.set.call(${name}, ${kx}, ${vx});`);
     }
     return undefined;
   }
-  if (value instanceof Set) {
-    for (const v of Set.prototype.values.$call(value as Set<unknown>)) {
+  if (value instanceof SetCtor) {
+    for (const v of SetCtor.prototype.values.$call(value as Set<unknown>)) {
       ctx.module.push(`Set.prototype.add.call(${name}, ${emitValue(transform(value, "", v, ctx), ctx)});`);
     }
     return undefined;
   }
-  if (Array.isArray(value)) {
+  if (ArrayIsArray(value)) {
     for (const i of arrayPresentIndices(value)) {
       ctx.module.push(`${name}[${i}] = ${emitValue(transform(value, String(i), value[i], ctx), ctx)};`);
     }
@@ -2460,7 +2505,7 @@ function emitPrivateFields(name: string, value: object, ctx: Context): void {
   if (!privateFields || privateFields.length === 0) return;
   for (const field of privateFields) {
     const child = transform(value, field.name, field.value, ctx);
-    ctx.module.push(`${name}[${JSON.stringify(mangledPrivateName(field.name))}] = ${emitValue(child, ctx)};`);
+    ctx.module.push(`${name}[${JSONStringify(mangledPrivateName(field.name))}] = ${emitValue(child, ctx)};`);
   }
 }
 
@@ -2471,7 +2516,7 @@ function emitPrivateFields(name: string, value: object, ctx: Context): void {
 // then assigned by the caller). NOTE: `#private` fields are invisible to
 // reflection and are not captured, and the constructor is not re-run.
 function objectBaseExpression(value: object, ctx: Context): string {
-  const proto = Object.getPrototypeOf(value);
+  const proto = ObjectGetPrototypeOf(value);
   if (proto === Object.prototype) return "{}";
   if (proto === null) return "Object.create(null)";
 
@@ -2485,7 +2530,7 @@ function objectBaseExpression(value: object, ctx: Context): string {
 // Emits each own property of `value` onto the hoisted `name`, preserving
 // accessor (get/set) properties, non-enumerable/non-writable flags, and
 // symbol keys. Plain enumerable writable data properties use a simple
-// assignment; everything else uses Object.defineProperty.
+// assignment; everything else uses ObjectDefineProperty.
 function emitOwnProperties(
   name: string,
   value: object,
@@ -2503,21 +2548,21 @@ function emitOwnProperties(
   // `__proto__` (handled separately), and a null prototype has none — so skip the per-key
   // prototype walk for those common cases (it's a measurable cost on large graphs).
   const accessorProto = (() => {
-    const p = Object.getPrototypeOf(value);
+    const p = ObjectGetPrototypeOf(value);
     return p !== null && p !== Object.prototype ? p : null;
   })();
-  for (const key of Reflect.ownKeys(value)) {
+  for (const key of ReflectOwnKeys(value)) {
     if (skip !== undefined && typeof key === "string" && skip.has(key)) {
       continue;
     }
-    if (enumerableOnly && !Object.getOwnPropertyDescriptor(value, key)!.enumerable) {
+    if (enumerableOnly && !ObjectGetOwnPropertyDescriptor(value, key)!.enumerable) {
       continue;
     }
     if (keep !== undefined && keep !== "all" && typeof key === "string" && !keep.has(key)) {
       continue;
     }
     const keyExpr = propertyKeyExpression(key, ctx);
-    const descriptor = Object.getOwnPropertyDescriptor(value, key)!;
+    const descriptor = ObjectGetOwnPropertyDescriptor(value, key)!;
 
     if (descriptor.get !== undefined || descriptor.set !== undefined) {
       const parts: string[] = [];
@@ -2546,7 +2591,7 @@ function emitOwnProperties(
     // same key lives there, the assignment fires its setter (or throws for a getter-only
     // accessor) instead of creating an own data property. `name["__proto__"] = v` similarly
     // hits the Object.prototype `__proto__` setter. In both cases route through
-    // Object.defineProperty (which always defines an own property and never invokes a setter).
+    // ObjectDefineProperty (which always defines an own property and never invokes a setter).
     const inherited =
       accessorProto !== null && typeof key === "string" ? lookupDescriptor(accessorProto, key) : undefined;
     const inheritedAccessor = inherited !== undefined && (inherited.get !== undefined || inherited.set !== undefined);
@@ -2599,7 +2644,7 @@ function emitSymbol(value: symbol, ctx: Context): string {
 
 function stableSymbolExpression(value: symbol): string | undefined {
   const registered = Symbol.keyFor(value);
-  if (registered !== undefined) return `Symbol.for(${JSON.stringify(registered)})`;
+  if (registered !== undefined) return `Symbol.for(${JSONStringify(registered)})`;
   for (const entry of WELL_KNOWN_SYMBOLS) {
     if (entry[0] === value) return entry[1];
   }
@@ -2612,12 +2657,12 @@ function uniqueSymbolRef(value: symbol, ctx: Context): string {
   const name = REF_PREFIX + ctx.counter++;
   ctx.symbols.set(value, name);
   const desc = value.description;
-  ctx.module.push(`const ${name} = Symbol(${desc === undefined ? "" : JSON.stringify(desc)});`);
+  ctx.module.push(`const ${name} = Symbol(${desc === undefined ? "" : JSONStringify(desc)});`);
   return name;
 }
 
 function propertyKeyExpression(key: string | symbol, ctx: Context): string {
-  if (typeof key === "string") return JSON.stringify(key);
+  if (typeof key === "string") return JSONStringify(key);
   const stable = stableSymbolExpression(key);
   if (stable !== undefined) return stable;
   return uniqueSymbolRef(key, ctx);
@@ -2626,25 +2671,25 @@ function propertyKeyExpression(key: string | symbol, ctx: Context): string {
 // Base methods captured at module load (tamper-proof) that throw on a receiver lacking the
 // built-in's internal slot — used to tell a real instance from a prototype-based look-alike
 // (`Object.create(Date.prototype)`) for the types with no `$is*` intrinsic.
-const slotProbeDate = Date.prototype.getTime;
-const slotProbeNumber = Number.prototype.valueOf;
-const slotProbeString = String.prototype.valueOf;
-const slotProbeBoolean = Boolean.prototype.valueOf;
-const slotProbeWeakRef = WeakRef.prototype.deref;
-const slotProbeWeakMapHas = WeakMap.prototype.has;
-const slotProbeWeakSetHas = WeakSet.prototype.has;
-const slotProbeMapHas = Map.prototype.has;
-const slotProbeSetHas = Set.prototype.has;
-const slotProbeArrayBuffer = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength")!.get!;
+const slotProbeDate = DateCtor.prototype.getTime;
+const slotProbeNumber = NumberCtor.prototype.valueOf;
+const slotProbeString = StringCtor.prototype.valueOf;
+const slotProbeBoolean = BooleanCtor.prototype.valueOf;
+const slotProbeWeakRef = WeakRefCtor.prototype.deref;
+const slotProbeWeakMapHas = WeakMapCtor.prototype.has;
+const slotProbeWeakSetHas = WeakSetCtor.prototype.has;
+const slotProbeMapHas = MapCtor.prototype.has;
+const slotProbeSetHas = SetCtor.prototype.has;
+const slotProbeArrayBuffer = ObjectGetOwnPropertyDescriptor(ArrayBufferCtor.prototype, "byteLength")!.get!;
 // SharedArrayBuffer has its own [[SharedArrayBufferData]] slot; the ArrayBuffer byteLength getter
 // throws on it, so it needs its own probe. (May be absent if SharedArrayBuffer is unavailable.)
 const slotProbeSharedArrayBuffer =
   typeof SharedArrayBuffer !== "undefined"
-    ? Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, "byteLength")?.get
+    ? ObjectGetOwnPropertyDescriptor(SharedArrayBuffer.prototype, "byteLength")?.get
     : undefined;
 // The RegExp `source` getter returns "(?:)" for RegExp.prototype itself and throws for any other
 // non-RegExp receiver — a side-effect-free slot check (there's no $isRegExpObject intrinsic here).
-const slotProbeRegExp = Object.getOwnPropertyDescriptor(RegExp.prototype, "source")!.get!;
+const slotProbeRegExp = ObjectGetOwnPropertyDescriptor(RegExpCtor.prototype, "source")!.get!;
 function hasSlot(value: object, probe: Function): boolean {
   try {
     probe.$call(value);
@@ -2684,31 +2729,31 @@ function emitBuiltin(value: object, name: string, ctx: Context): { proto: object
     } else {
       ctx.module.push(`const ${name} = Promise.resolve(${emitValue(settled, ctx)});`);
     }
-    return { proto: Promise.prototype, body: NOOP_BODY };
+    return { proto: PromiseCtor.prototype, body: NOOP_BODY };
   }
-  if (value instanceof Date && hasSlot(value, slotProbeDate)) {
+  if (value instanceof DateCtor && hasSlot(value, slotProbeDate)) {
     ctx.module.push(`const ${name} = new Date(${(value as Date).getTime()});`);
     return {
-      proto: Date.prototype,
+      proto: DateCtor.prototype,
       // Extra own properties (`d.label = ...`) are only otherwise restored on the subclass
       // path; emit them here for a plain Date too. (A subclass's own props go through
       // restoreSubclass instead, so only do this when the prototype is the natural one.)
       body: () => {
-        if (Object.getPrototypeOf(value) === Date.prototype) emitOwnProperties(name, value, ctx);
+        if (ObjectGetPrototypeOf(value) === DateCtor.prototype) emitOwnProperties(name, value, ctx);
       },
     };
   }
-  if (value instanceof RegExp && hasSlot(value, slotProbeRegExp)) {
+  if (value instanceof RegExpCtor && hasSlot(value, slotProbeRegExp)) {
     const re = value as RegExp;
-    ctx.module.push(`const ${name} = new RegExp(${JSON.stringify(re.source)}, ${JSON.stringify(re.flags)});`);
+    ctx.module.push(`const ${name} = new RegExp(${JSONStringify(re.source)}, ${JSONStringify(re.flags)});`);
     // lastIndex is the iteration cursor of a global/sticky regex — stateful, must be restored.
     if (re.lastIndex !== 0) ctx.module.push(`${name}.lastIndex = ${re.lastIndex};`);
     return {
-      proto: RegExp.prototype,
+      proto: RegExpCtor.prototype,
       // Extra own props (`re.custom = ...`) — same rationale as Date; skip the lastIndex own
       // slot (already set above, and it's non-configurable so defineProperty would fail).
       body: () => {
-        if (Object.getPrototypeOf(value) === RegExp.prototype) emitOwnProperties(name, value, ctx, REGEXP_SKIP_KEYS);
+        if (ObjectGetPrototypeOf(value) === RegExpCtor.prototype) emitOwnProperties(name, value, ctx, REGEXP_SKIP_KEYS);
       },
     };
   }
@@ -2716,31 +2761,31 @@ function emitBuiltin(value: object, name: string, ctx: Context): { proto: object
   // instance's own (possibly user-overridden) Symbol.iterator / set / add — an override
   // would let the walk observe forged entries or re-run a transform on restore (and a
   // throwing override would escape serialize() raw). Mirrors restoreBuiltinContent.
-  if (value instanceof Map && hasSlot(value, slotProbeMapHas)) {
+  if (value instanceof MapCtor && hasSlot(value, slotProbeMapHas)) {
     ctx.module.push(`const ${name} = new Map();`);
     return {
-      proto: Map.prototype,
+      proto: MapCtor.prototype,
       body: () => {
-        for (const entry of Map.prototype.entries.$call(value as Map<unknown, unknown>)) {
+        for (const entry of MapCtor.prototype.entries.$call(value as Map<unknown, unknown>)) {
           const k = emitValue(transform(value, "", entry[0], ctx), ctx);
           const v = emitValue(transform(value, "", entry[1], ctx), ctx);
           ctx.module.push(`Map.prototype.set.call(${name}, ${k}, ${v});`);
         }
         // A plain Map can also carry extra own properties (`m.meta = ...`); a subclass's go
         // through restoreSubclass, so only emit them here when the prototype is the natural one.
-        if (Object.getPrototypeOf(value) === Map.prototype) emitOwnProperties(name, value, ctx);
+        if (ObjectGetPrototypeOf(value) === MapCtor.prototype) emitOwnProperties(name, value, ctx);
       },
     };
   }
-  if (value instanceof Set && hasSlot(value, slotProbeSetHas)) {
+  if (value instanceof SetCtor && hasSlot(value, slotProbeSetHas)) {
     ctx.module.push(`const ${name} = new Set();`);
     return {
-      proto: Set.prototype,
+      proto: SetCtor.prototype,
       body: () => {
-        for (const element of Set.prototype.values.$call(value as Set<unknown>)) {
+        for (const element of SetCtor.prototype.values.$call(value as Set<unknown>)) {
           ctx.module.push(`Set.prototype.add.call(${name}, ${emitValue(transform(value, "", element, ctx), ctx)});`);
         }
-        if (Object.getPrototypeOf(value) === Set.prototype) emitOwnProperties(name, value, ctx);
+        if (ObjectGetPrototypeOf(value) === SetCtor.prototype) emitOwnProperties(name, value, ctx);
       },
     };
   }
@@ -2749,7 +2794,7 @@ function emitBuiltin(value: object, name: string, ctx: Context): { proto: object
   // over it, preserving byteOffset/length. DataView and every typed-array kind go
   // through here. (Subclassing these is not supported — return the live prototype
   // so no subclass-restore is attempted.)
-  if (ArrayBuffer.isView(value)) {
+  if (ArrayBufferIsView(value)) {
     const view = value as ArrayBufferView & { length?: number; constructor: { name: string } };
     const bufferExpr = emitValue(view.buffer, ctx);
     const buf = view.buffer as ArrayBufferLike & { resizable?: boolean; growable?: boolean };
@@ -2774,14 +2819,14 @@ function emitBuiltin(value: object, name: string, ctx: Context): { proto: object
       );
     }
     return {
-      proto: Object.getPrototypeOf(value),
+      proto: ObjectGetPrototypeOf(value),
       // Typed arrays / DataView aren't subclass-restored (the live prototype is returned), so
       // emit any extra own properties here. Skip a typed array's integer-index elements (already
       // materialized via the shared buffer); a DataView has none.
       body: () => {
         let skip: Set<string> | undefined;
         if (!(value instanceof DataView)) {
-          skip = new Set<string>();
+          skip = new SetCtor<string>();
           const len = (value as ArrayBufferView & { length: number }).length;
           for (let i = 0; i < len; i++) skip.add(String(i));
         }
@@ -2790,14 +2835,14 @@ function emitBuiltin(value: object, name: string, ctx: Context): { proto: object
     };
   }
   if (
-    (value instanceof ArrayBuffer && hasSlot(value, slotProbeArrayBuffer)) ||
-    (typeof SharedArrayBuffer !== "undefined" &&
-      value instanceof SharedArrayBuffer &&
+    (value instanceof ArrayBufferCtor && hasSlot(value, slotProbeArrayBuffer)) ||
+    (SharedArrayBufferCtor !== undefined &&
+      value instanceof SharedArrayBufferCtor &&
       slotProbeSharedArrayBuffer !== undefined &&
       hasSlot(value, slotProbeSharedArrayBuffer))
   ) {
-    const ctor = value instanceof ArrayBuffer ? "ArrayBuffer" : "SharedArrayBuffer";
-    const bytes = [...new Uint8Array(value as ArrayBufferLike)];
+    const ctor = value instanceof ArrayBufferCtor ? "ArrayBuffer" : "SharedArrayBuffer";
+    const bytes = [...new Uint8ArrayCtor(value as ArrayBufferLike)];
     // A resizable/growable buffer needs its maxByteLength forwarded, or the reconstructed
     // buffer is fixed-size and .resize()/.grow() (and any length-tracking view) break.
     const ab = value as ArrayBufferLike & { resizable?: boolean; growable?: boolean; maxByteLength?: number };
@@ -2805,65 +2850,65 @@ function emitBuiltin(value: object, name: string, ctx: Context): { proto: object
     ctx.module.push(`const ${name} = new ${ctor}(${(value as ArrayBufferLike).byteLength}${resizeOpts});`);
     if (bytes.some(b => b !== 0)) ctx.module.push(`new Uint8Array(${name}).set([${bytes.join(", ")}]);`);
     // Not subclass-restored (live prototype returned) — emit extra own props here.
-    return { proto: Object.getPrototypeOf(value), body: () => emitOwnProperties(name, value, ctx) };
+    return { proto: ObjectGetPrototypeOf(value), body: () => emitOwnProperties(name, value, ctx) };
   }
   // Boxed primitives (new Number/String/Boolean) — objects wrapping a primitive. Extra own props
   // are restored here for the natural-prototype case (a subclass goes through restoreSubclass).
-  if (value instanceof Number && hasSlot(value, slotProbeNumber)) {
+  if (value instanceof NumberCtor && hasSlot(value, slotProbeNumber)) {
     ctx.module.push(`const ${name} = new Number(${serializeNumber((value as Number).valueOf())});`);
-    return { proto: Number.prototype, body: () => emitBuiltinOwnProps(name, value, ctx, Number.prototype) };
+    return { proto: NumberCtor.prototype, body: () => emitBuiltinOwnProps(name, value, ctx, NumberCtor.prototype) };
   }
-  if (value instanceof String && hasSlot(value, slotProbeString)) {
-    ctx.module.push(`const ${name} = new String(${JSON.stringify((value as String).valueOf())});`);
+  if (value instanceof StringCtor && hasSlot(value, slotProbeString)) {
+    ctx.module.push(`const ${name} = new String(${JSONStringify((value as String).valueOf())});`);
     return {
-      proto: String.prototype,
+      proto: StringCtor.prototype,
       body: () => {
-        if (Object.getPrototypeOf(value) !== String.prototype) return;
+        if (ObjectGetPrototypeOf(value) !== StringCtor.prototype) return;
         // A boxed String's own keys are its index chars + `length` (all intrinsic) — skip them.
-        const skip = new Set<string>(["length"]);
+        const skip = new SetCtor<string>(["length"]);
         const len = (value as String).length;
         for (let i = 0; i < len; i++) skip.add(String(i));
         emitOwnProperties(name, value, ctx, skip);
       },
     };
   }
-  if (value instanceof Boolean && hasSlot(value, slotProbeBoolean)) {
+  if (value instanceof BooleanCtor && hasSlot(value, slotProbeBoolean)) {
     ctx.module.push(`const ${name} = new Boolean(${(value as Boolean).valueOf()});`);
-    return { proto: Boolean.prototype, body: () => emitBuiltinOwnProps(name, value, ctx, Boolean.prototype) };
+    return { proto: BooleanCtor.prototype, body: () => emitBuiltinOwnProps(name, value, ctx, BooleanCtor.prototype) };
   }
   // A WeakRef snapshots its live referent. If already collected at serialize
   // time, emit a WeakRef to a fresh (immediately collectable) object — best
   // effort, since "already collected" can't be reproduced.
-  if (value instanceof WeakRef && hasSlot(value, slotProbeWeakRef)) {
+  if (value instanceof WeakRefCtor && hasSlot(value, slotProbeWeakRef)) {
     const target = (value as WeakRef<any>).deref();
     ctx.module.push(`const ${name} = new WeakRef(${target === undefined ? "{}" : emitValue(target, ctx)});`);
-    return { proto: WeakRef.prototype, body: () => emitBuiltinOwnProps(name, value, ctx, WeakRef.prototype) };
+    return { proto: WeakRefCtor.prototype, body: () => emitBuiltinOwnProps(name, value, ctx, WeakRefCtor.prototype) };
   }
   // WeakMap / WeakSet entries aren't JS-enumerable, but their live entries can be
   // snapshotted natively. Reconstruct as a fresh weak collection with those
   // entries (keys keep their identity with other captures). Snapshot semantics:
   // the keys alive at serialize time.
-  if (value instanceof WeakMap && hasSlot(value, slotProbeWeakMapHas)) {
+  if (value instanceof WeakMapCtor && hasSlot(value, slotProbeWeakMapHas)) {
     ctx.module.push(`const ${name} = new WeakMap();`);
     return {
-      proto: WeakMap.prototype,
+      proto: WeakMapCtor.prototype,
       body: () => {
         const snap = $weakCollectionSnapshot(value); // [k, v, k, v, ...]
         for (let i = 0; i + 1 < snap.length; i += 2) {
           ctx.module.push(`${name}.set(${emitValue(snap[i], ctx)}, ${emitValue(snap[i + 1], ctx)});`);
         }
-        emitBuiltinOwnProps(name, value, ctx, WeakMap.prototype);
+        emitBuiltinOwnProps(name, value, ctx, WeakMapCtor.prototype);
       },
     };
   }
-  if (value instanceof WeakSet && hasSlot(value, slotProbeWeakSetHas)) {
+  if (value instanceof WeakSetCtor && hasSlot(value, slotProbeWeakSetHas)) {
     ctx.module.push(`const ${name} = new WeakSet();`);
     return {
-      proto: WeakSet.prototype,
+      proto: WeakSetCtor.prototype,
       body: () => {
         const snap = $weakCollectionSnapshot(value); // [k, k, ...]
         for (const element of snap) ctx.module.push(`${name}.add(${emitValue(element, ctx)});`);
-        emitBuiltinOwnProps(name, value, ctx, WeakSet.prototype);
+        emitBuiltinOwnProps(name, value, ctx, WeakSetCtor.prototype);
       },
     };
   }
@@ -2898,7 +2943,7 @@ const NOOP_BODY = (): void => {};
 // but only when its prototype is the natural one. A subclass instance has those restored by
 // restoreSubclass instead, so emitting here too would double-emit.
 function emitBuiltinOwnProps(name: string, value: object, ctx: Context, naturalProto: object): void {
-  if (Object.getPrototypeOf(value) === naturalProto) emitOwnProperties(name, value, ctx);
+  if (ObjectGetPrototypeOf(value) === naturalProto) emitOwnProperties(name, value, ctx);
 }
 
 // Known builtin Error constructors, in priority order (most specific first).
@@ -2917,7 +2962,7 @@ const ERROR_BASES = [
 // subclass instance is recreated from the right base (and its own prototype is
 // restored separately).
 function builtinErrorBase(value: object): string {
-  for (let p: object | null = value; p; p = Object.getPrototypeOf(p)) {
+  for (let p: object | null = value; p; p = ObjectGetPrototypeOf(p)) {
     const ctor = (p as any).constructor;
     if (typeof ctor === "function" && ERROR_BASES.includes(ctor.name) && (globalThis as any)[ctor.name] === ctor) {
       return ctor.name;
@@ -2936,13 +2981,13 @@ function builtinErrorBase(value: object): string {
 function emitErrorBody(value: Error, name: string, ctx: Context): () => void {
   const base = builtinErrorBase(value);
   if (base === "AggregateError") {
-    ctx.module.push(`const ${name} = new AggregateError([], ${JSON.stringify(value.message)});`);
+    ctx.module.push(`const ${name} = new AggregateError([], ${JSONStringify(value.message)});`);
   } else {
-    ctx.module.push(`const ${name} = new ${base}(${JSON.stringify(value.message)});`);
+    ctx.module.push(`const ${name} = new ${base}(${JSONStringify(value.message)});`);
   }
   return () => {
     emitOwnProperties(name, value, ctx, ERROR_SKIP_KEYS);
-    const proto = Object.getPrototypeOf(value);
+    const proto = ObjectGetPrototypeOf(value);
     if (proto !== (globalThis as any)[base].prototype) {
       // Link to the reconstructed subclass's OWN `.prototype` (not a standalone rebuilt copy)
       // so `instanceof e.constructor` and shared prototype identity survive — same shape as
@@ -2957,8 +3002,8 @@ function emitErrorBody(value: Error, name: string, ctx: Context): () => void {
   };
 }
 
-const ERROR_SKIP_KEYS = new Set(["stack"]);
-const REGEXP_SKIP_KEYS = new Set(["lastIndex"]);
+const ERROR_SKIP_KEYS = new SetCtor(["stack"]);
+const REGEXP_SKIP_KEYS = new SetCtor(["lastIndex"]);
 
 // Reconstructs a Proxy as `new Proxy(target, handler)`. Both the target and the
 // handler (whose traps are themselves serialized functions) recurse through the
@@ -3016,7 +3061,7 @@ function capturedFunctions(fn: Function, ctx: Context): Function[] {
     if (v.import?.external) continue;
     if (typeof v.value === "function") out.push(v.value as Function);
   }
-  const superclass = Object.getPrototypeOf(fn);
+  const superclass = ObjectGetPrototypeOf(fn);
   if (typeof superclass === "function" && superclass !== Function.prototype) out.push(superclass);
   return out;
 }
@@ -3106,7 +3151,7 @@ function emitFunctionContent(fn: Function, name: string, ctx: Context): void {
     if (gm.kind === "method") {
       ctx.module.push(`const ${name} = ${classRef}.prototype[${keyExpr}];`);
     } else {
-      ctx.module.push(`const ${name} = Object.getOwnPropertyDescriptor(${classRef}.prototype, ${keyExpr}).${gm.kind};`);
+      ctx.module.push(`const ${name} = Object.getOwnPropertyDescriptor(.prototype, ${keyExpr}).${gm.kind};`);
     }
     return;
   }
@@ -3148,7 +3193,7 @@ function emitFunctionContent(fn: Function, name: string, ctx: Context): void {
     const declaredName = parseFunctionNode(reconstructed.source)?.id?.name;
     if (fn.name !== declaredName) {
       ctx.module.push(
-        `Object.defineProperty(${name}, "name", { value: ${JSON.stringify(fn.name)}, writable: false, enumerable: false, configurable: true });`,
+        `Object.defineProperty(${name}, "name", { value: ${JSONStringify(fn.name)}, writable: false, enumerable: false, configurable: true });`,
       );
     }
   }
@@ -3180,22 +3225,22 @@ function emitFunctionContent(fn: Function, name: string, ctx: Context): void {
   // A frozen/sealed/non-extensible class prototype or constructor is emitted via this function
   // path, never through emitObject, so its extensibility state would otherwise be lost. Apply
   // it LAST, after the prototype's own properties are wired (freeze rejects later mutation).
-  if (typeof ownProto === "object" && ownProto !== null && !Object.isExtensible(ownProto)) {
+  if (typeof ownProto === "object" && ownProto !== null && !ObjectIsExtensible(ownProto)) {
     emitNonExtensible(`${name}.prototype`, ownProto, ctx);
   }
-  if (!Object.isExtensible(fn)) {
+  if (!ObjectIsExtensible(fn)) {
     emitNonExtensible(name, fn, ctx);
   }
   return;
 }
 
-const PROTOTYPE_SKIP_KEYS = new Set(["constructor"]);
+const PROTOTYPE_SKIP_KEYS = new SetCtor(["constructor"]);
 
 // Emits the call that reproduces a value's non-extensible state (frozen > sealed >
-// preventExtensions). Caller has already checked `!Object.isExtensible(value)`.
+// preventExtensions). Caller has already checked `!ObjectIsExtensible(value)`.
 function emitNonExtensible(targetExpr: string, value: object, ctx: Context): void {
-  if (Object.isFrozen(value)) ctx.module.push(`Object.freeze(${targetExpr});`);
-  else if (Object.isSealed(value)) ctx.module.push(`Object.seal(${targetExpr});`);
+  if (ObjectIsFrozen(value)) ctx.module.push(`Object.freeze(${targetExpr});`);
+  else if (ObjectIsSealed(value)) ctx.module.push(`Object.seal(${targetExpr});`);
   else ctx.module.push(`Object.preventExtensions(${targetExpr});`);
 }
 
@@ -3233,9 +3278,9 @@ function emitAsyncLocalStorage(value: object, ctx: Context): string {
   if (existing !== undefined) return existing;
   const name = REF_PREFIX + ctx.counter++;
   ctx.refs.set(value, name);
-  // The source is built via JSON.stringify so the builtin-module preprocessor
+  // The source is built via JSONStringify so the builtin-module preprocessor
   // doesn't treat this template literal as a real import and strip it.
-  ctx.imports.add(`import { AsyncLocalStorage } from ${JSON.stringify("node:async_hooks")};`);
+  ctx.imports.add(`import { AsyncLocalStorage } from ${JSONStringify("node:async_hooks")};`);
   ctx.module.push(`const ${name} = new AsyncLocalStorage();`);
   // Snapshot the store active in this ALS at serialize time (e.g. set by an
   // enclosing `als.run(store, () => serialize(fn))`). The root is wrapped to
@@ -3260,7 +3305,7 @@ function nativeFunctionPath(fn: Function): string | undefined {
   return nativePathMap.get(fn);
 }
 function buildNativePathMap(): Map<Function, string> {
-  const map = new Map<Function, string>();
+  const map = new MapCtor<Function, string>();
   const g = globalThis as any;
   const record = (f: unknown, path: string): void => {
     if (typeof f === "function" && !map.has(f)) map.set(f, path);
@@ -3270,7 +3315,7 @@ function buildNativePathMap(): Map<Function, string> {
   const walkMembers = (obj: any, base: string): void => {
     let keys: string[];
     try {
-      keys = Object.getOwnPropertyNames(obj);
+      keys = ObjectGetOwnPropertyNames(obj);
     } catch {
       return;
     }
@@ -3278,14 +3323,14 @@ function buildNativePathMap(): Map<Function, string> {
       if (key === "caller" || key === "arguments" || key === "callee") continue;
       let d: PropertyDescriptor | undefined;
       try {
-        d = Object.getOwnPropertyDescriptor(obj, key);
+        d = ObjectGetOwnPropertyDescriptor(obj, key);
       } catch {
         continue;
       }
       if (d !== undefined && typeof d.value === "function") record(d.value, `${base}.${key}`);
     }
   };
-  for (const name of Object.getOwnPropertyNames(g)) {
+  for (const name of ObjectGetOwnPropertyNames(g)) {
     if (name === "globalThis" || name === "global" || name === "window" || name === "self") continue;
     let v: any;
     try {
@@ -3295,10 +3340,10 @@ function buildNativePathMap(): Map<Function, string> {
     }
     if (typeof v === "function") {
       record(v, name); // the constructor / global function itself
-      walkMembers(v, name); // static methods (Object.keys, Array.from, ...)
+      walkMembers(v, name); // static methods (ObjectKeys, ArrayFrom, ...)
       if (v.prototype) walkMembers(v.prototype, `${name}.prototype`); // instance methods
     } else if (typeof v === "object" && v !== null) {
-      walkMembers(v, name); // namespace methods (Math.max, JSON.parse, console.log, ...)
+      walkMembers(v, name); // namespace methods (Math.max, JSONParse, console.log, ...)
     }
   }
   return map;
@@ -3326,7 +3371,7 @@ function functionSourceToExpression(source: string, name: string): string {
   if (parsed === null) {
     // Unparseable (an extracted method still referencing `this.#x`, or exotic
     // input) — wrap as an object member and pull it back out by name.
-    return `({ ${source} })[${JSON.stringify(name)}]`;
+    return `({ ${source} })[${JSONStringify(name)}]`;
   }
   const { node, offset } = parsed;
   // function / arrow / class — already a valid expression once parenthesized.
@@ -3341,7 +3386,7 @@ function functionSourceToExpression(source: string, name: string): string {
     }
   }
   // Position sanity failed — fall back to wrap-by-name (always valid).
-  return `({ ${source} })[${JSON.stringify(name)}]`;
+  return `({ ${source} })[${JSONStringify(name)}]`;
 }
 
 // Private (#name) members can't be set from outside the class, so a serialized
@@ -3370,7 +3415,7 @@ function rewritePrivateMembers(source: string): string {
   const parsed = parseWithOffset(source);
   if (parsed !== null) {
     const edits: Array<{ start: number; end: number; text: string }> = [];
-    const handled = new Set<number>();
+    const handled = new SetCtor<number>();
     // Replace the `#name` at a PrivateIdentifier's position. A brand check
     // (`#x in obj`) becomes `"mangled" in obj` — string property membership, not
     // a bare (undefined) identifier; every other position is the bare name.
@@ -3381,7 +3426,7 @@ function rewritePrivateMembers(source: string): string {
       // Sanity: the bytes at the mapped position must be the `#name` itself.
       if (start < 0 || end > source.length || source.slice(start, end) !== pid.name) return;
       const mangled = mangledPrivateName(pid.name);
-      edits.push({ start, end, text: quoted ? JSON.stringify(mangled) : mangled });
+      edits.push({ start, end, text: quoted ? JSONStringify(mangled) : mangled });
     };
     // Only mangle privates whose nearest enclosing class IS the top-level node being
     // reconstructed (a mangle-fallback class). A class NESTED inside the reconstructed
@@ -3405,7 +3450,7 @@ function rewritePrivateMembers(source: string): string {
           pushPid(node, false);
         }
       }
-      for (const k of Object.keys(node)) if (k !== "type") walk(node[k], next);
+      for (const k of ObjectKeys(node)) if (k !== "type") walk(node[k], next);
     })(top, top.type === "ClassExpression" || top.type === "ClassDeclaration" ? top : null);
     if (edits.length === 0) return source;
     // Apply right-to-left so earlier edits don't shift later positions.
@@ -3523,7 +3568,7 @@ function rewritePrivateMembersScanner(source: string): string {
         let k = j;
         while (k < n && /\s/.test(source[k]!)) k++;
         if (source[k] === "i" && source[k + 1] === "n" && !isIdentPart(source[k + 2])) {
-          out += JSON.stringify(mangled);
+          out += JSONStringify(mangled);
         } else {
           out += mangled;
         }
@@ -3553,7 +3598,7 @@ function collectReferencedNames(transpiler: any, source: string): Set<string> {
   try {
     ast = transpiler.ast("(" + source + ")");
   } catch {
-    return new Set();
+    return new SetCtor();
   }
   return freeIdentifiersOfNode(ast);
 }
@@ -3590,30 +3635,30 @@ async function bundle(fn: Function, replacer?: Replacer): Promise<string> {
   const genuinePlan = computeGenuineClasses(fn, sharedIds);
   const ctx: Context = {
     module: [],
-    refs: new Map(),
+    refs: new MapCtor(),
     counter: 0,
     sharedIds,
-    imports: new Set(),
+    imports: new SetCtor(),
     replacer: typeof replacer === "function" ? replacer : undefined,
     sourceBlocks: [],
     keepSets: computeKeepSets(fn),
-    symbols: new Map(),
+    symbols: new MapCtor(),
     alsContexts: [],
     genuineClasses: genuinePlan.genuine,
     genuineMethods: computeGenuineMethods(genuinePlan.genuine),
     hostedArrows: genuinePlan.hostedArrows,
     classHosts: genuinePlan.classHosts,
-    classReify: new Map(),
-    genuineClassId: new Map(),
+    classReify: new MapCtor(),
+    genuineClassId: new MapCtor(),
     needsReifySlot: false,
     deferredPatches: [],
     bodyQueue: [],
-    emittedFns: new Set(),
-    inProgressFns: new Set(),
+    emittedFns: new SetCtor(),
+    inProgressFns: new SetCtor(),
   };
   // 2. Recover the closure module's import bindings: localName → original source.
   type Binding = { source: string; imported?: string; default?: boolean; star?: boolean };
-  const bindings = new Map<string, Binding>();
+  const bindings = new MapCtor<string, Binding>();
   if (url && fs.existsSync(url)) {
     const moduleAst = transpiler.ast(fs.readFileSync(url, "utf8"));
     for (const stmt of moduleAst.body) {
@@ -3628,15 +3673,15 @@ async function bundle(fn: Function, replacer?: Replacer): Promise<string> {
   }
 
   const importLines: string[] = [];
-  const emitted = new Set<string>();
+  const emitted = new SetCtor<string>();
   const emitImport = (name: string, b: Binding): void => {
     if (emitted.has(name)) return;
     emitted.add(name);
-    if (b.default) importLines.push(`import ${name} from ${JSON.stringify(b.source)};`);
-    else if (b.star) importLines.push(`import * as ${name} from ${JSON.stringify(b.source)};`);
+    if (b.default) importLines.push(`import ${name} from ${JSONStringify(b.source)};`);
+    else if (b.star) importLines.push(`import * as ${name} from ${JSONStringify(b.source)};`);
     else
       importLines.push(
-        `import { ${b.imported === name ? name : `${b.imported} as ${name}`} } from ${JSON.stringify(b.source)};`,
+        `import { ${b.imported === name ? name : `${b.imported} as ${name}`} } from ${JSONStringify(b.source)};`,
       );
   };
 
@@ -3647,7 +3692,7 @@ async function bundle(fn: Function, replacer?: Replacer): Promise<string> {
   //    rather than us value-walking the whole namespace object.
   const freeVariables = allFreeVariables(fn, source);
   const stateExports: string[] = [];
-  const stateNames = new Set<string>();
+  const stateNames = new SetCtor<string>();
   for (const variable of freeVariables) {
     if (stateNames.has(variable.name) || emitted.has(variable.name)) continue;
     const binding = bindings.get(variable.name);

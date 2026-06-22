@@ -7315,3 +7315,61 @@ describe("adversarial regressions: round 5", () => {
     expect(() => serialize(() => it)).toThrow(/Cannot serialize a Map Iterator object/);
   });
 });
+
+describe("tamper resistance (hostile primordials)", () => {
+  // serialize() must not be subvertible by a caller that has reassigned global builtins
+  // (Object.keys/getPrototypeOf, Reflect.ownKeys, Array.isArray, JSON.stringify, Map, Set, ...).
+  // It captures primordials at module load, so it keeps producing correct output. The
+  // serialization and the reconstruction run in SEPARATE processes — the reconstructed module
+  // needs a clean Map/Set (the serializing process clobbered the globals).
+  test("a closure serializes correctly even when every primordial is reassigned", async () => {
+    using dir = tempDir("closure-tamper", {
+      "serialize.mjs": `
+        import { serialize } from "bun:closure";
+        import { writeFileSync } from "node:fs";
+        const data = { m: new Map([["a", 1]]), s: new Set([2, 3]), arr: [4, 5], nested: { x: 6 } };
+        const boom = () => { throw new Error("tampered primordial was called"); };
+        Object.keys = boom;
+        Object.getOwnPropertyDescriptor = boom;
+        Object.getPrototypeOf = boom;
+        Object.create = boom;
+        Reflect.ownKeys = boom;
+        Array.isArray = boom;
+        JSON.stringify = boom;
+        globalThis.Map = class FakeMap {};
+        globalThis.Set = class FakeSet {};
+        writeFileSync(new URL("./out.mjs", import.meta.url), serialize(() => data));
+        process.stdout.write("SERIALIZED");
+      `,
+      "check.mjs": `
+        import out from "./out.mjs";
+        const v = out();
+        process.stdout.write(JSON.stringify({ m: v.m.get("a"), s: [...v.s], arr: v.arr, x: v.nested.x }));
+      `,
+    });
+
+    await using ser = Bun.spawn({
+      cmd: [bunExe(), "serialize.mjs"],
+      env: bunEnv,
+      cwd: String(dir),
+      stderr: "pipe",
+    });
+    const [serOut, serErr, serCode] = await Promise.all([ser.stdout.text(), ser.stderr.text(), ser.exited]);
+    expect({ serOut, serErr: serErr.includes("tampered") ? serErr : "", serCode }).toEqual({
+      serOut: "SERIALIZED",
+      serErr: "",
+      serCode: 0,
+    });
+
+    await using chk = Bun.spawn({
+      cmd: [bunExe(), "check.mjs"],
+      env: bunEnv,
+      cwd: String(dir),
+      stderr: "pipe",
+    });
+    const [chkOut, chkErr, chkCode] = await Promise.all([chk.stdout.text(), chk.stderr.text(), chk.exited]);
+    expect(chkOut).toBe(JSON.stringify({ m: 1, s: [2, 3], arr: [4, 5], x: 6 }));
+    expect(chkCode).toBe(0);
+    void chkErr;
+  });
+});
