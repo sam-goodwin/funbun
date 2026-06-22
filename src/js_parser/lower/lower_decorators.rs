@@ -85,6 +85,8 @@ fn prop_copy(p: &Property) -> Property {
         // `bun_alloc::ast_alloc` module docs), so at most one of the two
         // copies ever reaches drop glue; no double free.
         ts_metadata: unsafe { core::ptr::read(&raw const p.ts_metadata) },
+        initializer_start: p.initializer_start,
+        initializer_end: p.initializer_end,
     }
 }
 
@@ -105,6 +107,8 @@ fn prop_full_copy(p: &Property) -> Property {
         value: p.value,
         // SAFETY: see `prop_copy`.
         ts_metadata: unsafe { core::ptr::read(&raw const p.ts_metadata) },
+        initializer_start: p.initializer_start,
+        initializer_end: p.initializer_end,
     }
 }
 
@@ -286,6 +290,7 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
         let stmts_list = bun_alloc::AstVec::<Stmt>::from_arena_slice(stmts);
         let sb = bump.alloc(G::ClassStaticBlock {
             loc: l,
+            close_loc: bun_ast::Loc::EMPTY,
             stmts: stmts_list,
         });
         Property {

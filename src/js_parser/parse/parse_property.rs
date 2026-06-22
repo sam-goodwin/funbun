@@ -511,6 +511,8 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
                             p.pop_scope();
 
                             p.fn_or_arrow_data_parse = old_fn_or_arrow_data_parse;
+                            // The lexer is at the closing `}` (parse_stmts_up_to stops before it).
+                            let close_loc = p.lexer.loc();
                             p.lexer.expect(T::TCloseBrace)?;
 
                             // Vec::from_slice copies the bump-backed StmtList into a heap-backed list.
@@ -519,6 +521,7 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
                             let block = p.arena.alloc(G::ClassStaticBlock {
                                 stmts: stmt_list,
                                 loc,
+                                close_loc,
                             });
 
                             return Ok(Some(G::Property {
@@ -638,6 +641,8 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
                 && (p.lexer.token != T::TOpenParen || has_definite_assignment_assertion_operator)
             {
                 let mut initializer: Option<Expr> = None;
+                let mut initializer_start = bun_ast::Loc::EMPTY;
+                let mut initializer_end = bun_ast::Loc::EMPTY;
                 let mut ts_metadata = TsMetadata::default();
 
                 // Forbid the names "constructor" and "prototype" in some cases
@@ -686,6 +691,9 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
                     }
 
                     p.lexer.next()?;
+                    // Just past the `=`: the initializer text starts here (incl. any grouping
+                    // parens, which the initializer Expr's own loc would skip).
+                    initializer_start = p.lexer.loc();
 
                     // "this" and "super" property access is allowed in field initializers
                     let old_is_this_disallowed = p.fn_or_arrow_data_parse.is_this_disallowed;
@@ -694,6 +702,8 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
                     p.fn_or_arrow_data_parse.allow_super_property = true;
 
                     initializer = Some(p.parse_expr(Level::Comma)?);
+                    // The lexer now sits at the terminator (`;`/`}`/next member).
+                    initializer_end = p.lexer.loc();
 
                     p.fn_or_arrow_data_parse.is_this_disallowed = old_is_this_disallowed;
                     p.fn_or_arrow_data_parse.allow_super_property = old_allow_super_property;
@@ -740,6 +750,8 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
                     flags: prop_flags,
                     key: Some(key),
                     initializer,
+                    initializer_start,
+                    initializer_end,
                     ts_metadata,
                     ..Default::default()
                 }));

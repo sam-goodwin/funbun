@@ -1956,6 +1956,10 @@ impl<'a> AstJsConverter<'a> {
         node.put(self.global, "params", params);
         let body = self.stmts(func.body.stmts.slice())?;
         node.put(self.global, "body", body);
+        // The body's opening `{` position, so a consumer can inject a leading statement (e.g.
+        // the closure serializer's reify-guard branch) by AST offset rather than scanning past
+        // the parameter list.
+        node.put(self.global, "bodyStart", JSValue::js_number(func.body.loc.start as f64));
         let is_async = func.flags.contains(flags::Function::IsAsync);
         let is_gen = func.flags.contains(flags::Function::IsGenerator);
         node.put(self.global, "async", JSValue::js_boolean(is_async));
@@ -1972,6 +1976,8 @@ impl<'a> AstJsConverter<'a> {
             if let Some(block) = p.class_static_block_ref() {
                 let body = self.stmts(block.stmts.as_slice())?;
                 node.put(self.global, "body", body);
+                // The closing `}` position, so a consumer can empty the block by AST offset.
+                node.put(self.global, "closeBrace", JSValue::js_number(block.close_loc.start as f64));
             }
             let kind = self.str(b"staticBlock")?;
             node.put(self.global, "kind", kind);
@@ -2008,6 +2014,11 @@ impl<'a> AstJsConverter<'a> {
         node.put(self.global, "kind", kind);
         node.put(self.global, "static", JSValue::js_boolean(is_static));
         node.put(self.global, "computed", JSValue::js_boolean(computed));
+        // For a class FIELD with an initializer: the source span of the initializer text (just
+        // past `=` to its terminator). Lets a consumer neutralize the initializer's eager side
+        // effects by AST offset rather than scanning. EMPTY (-1) when there's no initializer.
+        node.put(self.global, "initStart", JSValue::js_number(p.initializer_start.start as f64));
+        node.put(self.global, "initEnd", JSValue::js_number(p.initializer_end.start as f64));
         Ok(node)
     }
 

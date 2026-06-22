@@ -136,6 +136,29 @@ describe("Transpiler.ast", () => {
     expect(members[3]).toMatchObject({ type: "PropertyDefinition", kind: "field", static: true, key: { value: "s" } });
   });
 
+  // Source-position fields used by AST-driven source rewriters (e.g. the closure serializer):
+  // a field initializer's text span, a static block's closing brace, the class body close, and
+  // a function body's opening brace. All are byte offsets into the source.
+  test("class members expose initializer span, static-block close, class close, and fn body brace", () => {
+    const src = "class C { x = (1, 2); m() { return 0 } static { foo() } }";
+    const a = ast(src).body[0];
+    const members = a.body.body;
+    // `initStart`..`initEnd` brackets the initializer text just past `=` (incl. grouping parens).
+    const field = members[0];
+    expect(src.slice(field.initStart, field.initEnd)).toBe("(1, 2)");
+    // A field with no initializer reports -1.
+    expect(members[1].initStart).toBe(-1);
+    // The method's function body `{`.
+    expect(src[members[1].value.bodyStart]).toBe("{");
+    // The static block's closing `}` (and its node start is the opening `{`).
+    const block = members[2];
+    expect(block.type).toBe("StaticBlock");
+    expect(src[block.start]).toBe("{");
+    expect(src[block.closeBrace]).toBe("}");
+    // The class body's closing `}`.
+    expect(src[a.body.closeBrace]).toBe("}");
+  });
+
   test("object expression properties", () => {
     const a = ast("({ x: 1, y, ...rest })").body[0].expression;
     expect(a.type).toBe("ObjectExpression");

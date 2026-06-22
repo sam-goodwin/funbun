@@ -821,20 +821,9 @@ function injectReifyConstructor(
   const ctor = node.body.body.find(
     (m: any) => m.type === "MethodDefinition" && m.static !== true && m.key?.value === "constructor",
   );
-  if (ctor !== undefined) {
-    // ctor.value.start is the params `(`; scan past the balanced param list to the
-    // body `{` (ast() does not expose the body-brace position directly).
-    let i = ctor.value.start - offset;
-    let depth = 0;
-    for (; i < source.length; i++) {
-      const c = source[i];
-      if (c === "(") depth++;
-      else if (c === ")" && --depth === 0) {
-        i++;
-        break;
-      }
-    }
-    while (i < source.length && source[i] !== "{") i++;
+  if (ctor !== undefined && typeof ctor.value?.bodyStart === "number") {
+    // ctor.value.bodyStart is the constructor body's `{` (surfaced by ast()).
+    const i = ctor.value.bodyStart - offset;
     // Insert the reify branch after the constructor body `{` (later position) first, then the
     // class-body injections after the class body `{` (earlier position) so offsets stay valid.
     let out = source.slice(0, i + 1) + branch + source.slice(i + 1);
@@ -851,98 +840,20 @@ function injectReifyConstructor(
   return source.slice(0, classBrace + 1) + synthesized + classBodyInjections + source.slice(classBrace + 1);
 }
 
-// If a string/template/line-comment/block-comment begins at `source[i]`, returns the index
-// just past it; otherwise returns `i` unchanged. Lets a structural scan skip over content
-// whose braces/semicolons/quotes must not be counted. (Regex literals are not handled — rare
-// inside a class field initializer / static block, and the only cost is a mis-scan there.)
-function skipAtomic(source: string, i: number): number {
-  const n = source.length;
-  const c = source[i];
-  if (c === '"' || c === "'") {
-    i++;
-    while (i < n && source[i] !== c) i += source[i] === "\\" ? 2 : 1;
-    return i + 1;
-  }
-  if (c === "`") {
-    i++;
-    while (i < n) {
-      if (source[i] === "\\") {
-        i += 2;
-        continue;
-      }
-      if (source[i] === "`") return i + 1;
-      if (source[i] === "$" && source[i + 1] === "{") {
-        i += 2;
-        let depth = 1;
-        while (i < n && depth > 0) {
-          const j = skipAtomic(source, i);
-          if (j > i) {
-            i = j;
-            continue;
-          }
-          if (source[i] === "{") depth++;
-          else if (source[i] === "}") depth--;
-          i++;
-        }
-        continue;
-      }
-      i++;
-    }
-    return i;
-  }
-  if (c === "/" && source[i + 1] === "/") {
-    i += 2;
-    while (i < n && source[i] !== "\n") i++;
-    return i;
-  }
-  if (c === "/" && source[i + 1] === "*") {
-    i += 2;
-    while (i < n && !(source[i] === "*" && source[i + 1] === "/")) i++;
-    return i + 2;
-  }
-  return i;
-}
-
-// Scans forward from `start` and returns the index of the first occurrence of any character in
-// `stops` at bracket depth 0 (parens/brackets/braces balanced), skipping atomic runs. Returns
-// source.length if none. Used to find a field initializer's terminating `;` and a static
-// block's matching `}` in REPRINTED class source (toString emits `;` after every field, so
-// there is no ASI ambiguity).
-function scanToDepth0(source: string, start: number, stops: string): number {
-  const n = source.length;
-  let i = start;
-  let depth = 0;
-  while (i < n) {
-    const j = skipAtomic(source, i);
-    if (j > i) {
-      i = j;
-      continue;
-    }
-    const c = source[i];
-    if (c === "(" || c === "[" || c === "{") depth++;
-    else if (c === ")" || c === "]" || c === "}") {
-      if (depth === 0 && stops.indexOf(c) !== -1) return i;
-      depth--;
-    } else if (depth === 0 && stops.indexOf(c) !== -1) {
-      return i;
-    }
-    i++;
-  }
-  return n;
-}
-
 // Neutralizes a reconstructed class's EAGER initializers, whose side effects would otherwise
 // re-run when the class is re-evaluated / reified:
-//   - STATIC blocks are removed, and STATIC field initializers replaced with `undefined`
-//     (unconditional — they run at class definition, which the reify flag can't guard; their
-//     resulting static state is restored separately as the class's own properties). Applies to
-//     both genuine and mangled classes.
+//   - STATIC blocks are emptied (`static { ... }` → `static {}`), and STATIC PUBLIC field
+//     initializers replaced with `undefined` (they run at class definition, which the reify
+//     flag can't guard; their resulting static state is restored separately as the class's own
+//     properties). A static #PRIVATE field can't be restored that way, so it's left intact.
+//     Applies to both genuine and mangled classes.
 //   - INSTANCE field initializers are wrapped `<key> = REIFY_SLOT ? undefined : (<init>)` so the
 //     reify factory's bare construct skips them (a normal `new C()` still runs them); their
 //     values are restored by the patch (#private) / own-property (public) emit. Genuine path
 //     only (mangled instances are `Object.create`d and never run initializers).
-// Works on the REPRINTED `fn.toString()` source (fields end with `;`). Edits are applied
-// right-to-left so positions stay valid. `offset` maps AST positions to source positions.
+// Driven entirely by AST positions (no source scanning): the field initializer's text span is
+// `[initStart, initEnd)` and a static block's braces are `[start, closeBrace]` (both surfaced
+// by ast()). `offset` maps AST positions to source positions; edits applied right-to-left.
 function neutralizeClassInitializers(
   source: string,
   classNode: any,
@@ -951,43 +862,25 @@ function neutralizeClassInitializers(
 ): string {
   const members = classNode?.body?.body;
   if (!$isJSArray(members)) return source;
-  const isWs = (c: string): boolean => c === " " || c === "\t" || c === "\n" || c === "\r";
   const edits: Array<{ start: number; end: number; replace: string }> = [];
   for (const m of members) {
-    if (m?.type === "StaticBlock" && typeof m.start === "number") {
-      // `StaticBlock.loc.start` points at the block's `{`, not the `static` keyword — back up
-      // over whitespace and the keyword so the whole `static { ... }` is removed (else a bare
-      // `static` is left behind). Falls back to the node start if the keyword isn't found.
-      let brace = m.start - offset;
-      while (brace < source.length && source[brace] !== "{") brace++;
-      let s = brace - 1;
-      while (s >= 0 && isWs(source[s])) s--;
-      const stripStart = s >= 5 && source.slice(s - 5, s + 1) === "static" ? s - 5 : m.start - offset;
-      const close = scanToDepth0(source, brace + 1, "}");
-      edits.push({ start: stripStart, end: Math.min(close + 1, source.length), replace: "" });
+    if (m?.type === "StaticBlock" && typeof m.start === "number" && typeof m.closeBrace === "number") {
+      // `start` is the block's `{`, `closeBrace` its `}` — empty the body in between.
+      const open = m.start - offset;
+      const close = m.closeBrace - offset;
+      if (open >= 0 && close > open && close <= source.length) edits.push({ start: open + 1, end: close, replace: "" });
       continue;
     }
-    if (m?.type === "PropertyDefinition" && m.value && typeof m.value.start === "number") {
-      // The value node starts INSIDE any grouping parens (`x = (a, b)` → value is at `a`), so
-      // anchor on the field's `=` instead: scan back over whitespace and `(` to it, then the
-      // initializer is `[firstNonWsAfterEquals, terminating ;)`. Scanning the span from there
-      // keeps the parens balanced (scanning from inside them would under/overflow the depth).
-      const vs = m.value.start - offset;
-      let eq = vs - 1;
-      while (eq >= 0 && (isWs(source[eq]) || source[eq] === "(")) eq--;
-      if (source[eq] !== "=") continue; // not an initialized field (shouldn't happen — value set)
-      let initStart = eq + 1;
-      while (initStart < source.length && isWs(source[initStart])) initStart++;
-      const semi = scanToDepth0(source, initStart, ";");
-      // Static PUBLIC field initializers run at class definition (the reify flag can't guard
-      // them) — replace with `undefined`; their value is restored as the class's own property.
-      // A static #PRIVATE field can't be restored that way, so leave it intact.
+    if (m?.type === "PropertyDefinition" && typeof m.initStart === "number" && m.initStart >= 0) {
+      // `[initStart, initEnd)` is the initializer text just past `=` (incl. any grouping parens).
+      const s = m.initStart - offset;
+      const e = m.initEnd - offset;
+      if (s < 0 || e < s || e > source.length) continue;
       if (m.static === true) {
-        if (m.key?.type !== "PrivateIdentifier") edits.push({ start: initStart, end: semi, replace: "undefined" });
+        if (m.key?.type !== "PrivateIdentifier") edits.push({ start: s, end: e, replace: "undefined" });
       } else if (guardInstanceFields) {
-        // Instance field: `<key> = REIFY ? undefined : (<init>)`. A normal `new` still runs it.
-        edits.push({ start: initStart, end: initStart, replace: `${REIFY_SLOT}?undefined:(` });
-        edits.push({ start: semi, end: semi, replace: ")" });
+        edits.push({ start: s, end: s, replace: `${REIFY_SLOT}?undefined:(` });
+        edits.push({ start: e, end: e, replace: ")" });
       }
     }
   }
