@@ -6741,14 +6741,14 @@ describe("adversarial regressions: round 3", () => {
 
   // BUG O: RegExp lastIndex (iteration cursor) is reset to 0; extra own props on RegExp/Date
   // are dropped (own-prop restore only runs on the subclass path).
-  test.failing("a stateful global regex preserves lastIndex", async () => {
+  test("a stateful global regex preserves lastIndex", async () => {
     const re = /a/g;
     re.lastIndex = 2;
     const out = (await roundtrip(() => re))() as RegExp;
     expect(out.lastIndex).toBe(2);
     expect(out.exec("aaaa")!.index).toBe(2);
   });
-  test.failing("extra own properties on a RegExp and a Date round-trip", async () => {
+  test("extra own properties on a RegExp and a Date round-trip", async () => {
     const re: any = /z/;
     re.custom = 42;
     const d: any = new Date(1000);
@@ -6821,7 +6821,7 @@ describe("adversarial regressions: round 3", () => {
 
   // BUG Q: an Error subclass INSTANCE loses subclass identity — its prototype is rebuilt as a
   // standalone object instead of linking to the reconstructed constructor's prototype.
-  test.failing("an Error subclass instance keeps `instanceof` its reconstructed constructor", async () => {
+  test("an Error subclass instance keeps `instanceof` its reconstructed constructor", async () => {
     class AppError extends Error {
       constructor(m: string) {
         super(m);

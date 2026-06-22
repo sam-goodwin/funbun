@@ -2320,11 +2320,20 @@ function emitBuiltin(value: object, name: string, ctx: Context): object | null {
   }
   if (value instanceof Date) {
     ctx.module.push(`const ${name} = new Date(${(value as Date).getTime()});`);
+    // Extra own properties (`d.label = ...`) are only otherwise restored on the subclass
+    // path; emit them here for a plain Date too. (A subclass's own props go through
+    // restoreSubclass instead, so only do this when the prototype is the natural one.)
+    if (Object.getPrototypeOf(value) === Date.prototype) emitOwnProperties(name, value, ctx);
     return Date.prototype;
   }
   if (value instanceof RegExp) {
     const re = value as RegExp;
     ctx.module.push(`const ${name} = new RegExp(${JSON.stringify(re.source)}, ${JSON.stringify(re.flags)});`);
+    // lastIndex is the iteration cursor of a global/sticky regex — stateful, must be restored.
+    if (re.lastIndex !== 0) ctx.module.push(`${name}.lastIndex = ${re.lastIndex};`);
+    // Extra own props (`re.custom = ...`) — same rationale as Date; skip the lastIndex own
+    // slot (already set above, and it's non-configurable so defineProperty would fail).
+    if (Object.getPrototypeOf(value) === RegExp.prototype) emitOwnProperties(name, value, ctx, REGEXP_SKIP_KEYS);
     return RegExp.prototype;
   }
   // Read the live entries AND restore them through the base prototype methods, never the
@@ -2488,11 +2497,20 @@ function emitErrorBody(value: Error, name: string, ctx: Context): void {
   emitOwnProperties(name, value, ctx, ERROR_SKIP_KEYS);
   const proto = Object.getPrototypeOf(value);
   if (proto !== (globalThis as any)[base].prototype) {
-    ctx.module.push(`Object.setPrototypeOf(${name}, ${emitValue(proto, ctx)});`);
+    // Link to the reconstructed subclass's OWN `.prototype` (not a standalone rebuilt copy)
+    // so `instanceof e.constructor` and shared prototype identity survive — same shape as
+    // restoreSubclass / objectBaseExpression's class-instance case.
+    const ctor = (proto as any)?.constructor;
+    const protoExpr =
+      typeof ctor === "function" && ctor.prototype === proto
+        ? `${emitValue(ctor, ctx)}.prototype`
+        : emitValue(proto, ctx);
+    ctx.module.push(`Object.setPrototypeOf(${name}, ${protoExpr});`);
   }
 }
 
 const ERROR_SKIP_KEYS = new Set(["stack"]);
+const REGEXP_SKIP_KEYS = new Set(["lastIndex"]);
 
 // Reconstructs a Proxy as `new Proxy(target, handler)`. Both the target and the
 // handler (whose traps are themselves serialized functions) recurse through the
