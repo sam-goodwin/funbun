@@ -20,8 +20,9 @@
 // class member executables aren't reachable from the class constructor — the
 // workaround is to capture the class's factory, or reference the variable in a
 // method; decorators are not part of `Function.prototype.toString()` and so are
-// not preserved; unique (non-registered) symbol values/keys and native functions
-// throw a clear error.
+// not preserved; native functions with no reachable global path throw a clear
+// error. (Unique non-registered symbols DO round-trip — hoisted with identity
+// preserved within the closure.)
 
 type Replacer = (key: string, value: unknown) => unknown;
 
@@ -252,6 +253,26 @@ function serialize(fn: Function, replacer?: Replacer): string {
   }
 }
 
+// A root function/class whose own state — static field values, externally-assigned properties, or
+// monkey-patched prototype members — would be silently dropped by the inline reconstructFunctionExpr
+// path (it neutralizes static initializers and emits no restore). Such a root must go through the
+// binding path (emitFunction → emitFunctionContent), which restores that state via emitOwnProperties.
+function rootNeedsBindingForOwnState(fn: Function): boolean {
+  const hasEnumerableOwn = (o: object, isFn: boolean): boolean => {
+    for (const key of ObjectGetOwnPropertyNames(o)) {
+      if (isFn && (key === "length" || key === "name" || key === "prototype")) continue;
+      if (ObjectGetOwnPropertyDescriptor(o, key)!.enumerable) return true;
+    }
+    for (const sym of ObjectGetOwnPropertySymbols(o)) {
+      if (ObjectGetOwnPropertyDescriptor(o, sym)!.enumerable) return true;
+    }
+    return false;
+  };
+  if (hasEnumerableOwn(fn, true)) return true;
+  const proto = (fn as { prototype?: object }).prototype;
+  return typeof proto === "object" && proto !== null && proto !== Function.prototype && hasEnumerableOwn(proto, false);
+}
+
 function serializeImpl(fn: Function, replacer?: Replacer): string {
   const { sharedIds, cellInfo } = analyzeSharedCells(fn);
   // Start the generated-ref counter past any `__bunClosure$N` already present as a
@@ -315,7 +336,8 @@ function serializeImpl(fn: Function, replacer?: Replacer): string {
   if (
     (fn as any)[Symbol.boundFunction] !== undefined ||
     ctx.hostedArrows.has(fn) ||
-    isNativeFunctionSource(fn.toString())
+    isNativeFunctionSource(fn.toString()) ||
+    rootNeedsBindingForOwnState(fn)
   ) {
     exportExpr = emitFunction(fn, ctx);
   } else {
@@ -2196,6 +2218,13 @@ function transform(holder: unknown, key: string, value: unknown, ctx: Context): 
   return ctx.replacer ? ctx.replacer.$call(holder, key, value) : value;
 }
 
+// The replacer key for a Map VALUE: the entry's own key when it's a string (the natural analog of
+// an object property name), else the positional index. Map keys are never passed `""` — that
+// collides with JSON's synthetic root key, so a replacer dropping `""` would wipe the collection.
+function mapReplacerKey(key: unknown, index: number): string {
+  return typeof key === "string" ? key : String(index);
+}
+
 // Returns a JS expression for `value`, appending any hoisted declarations to
 // `ctx.module` (for objects and nested functions).
 function emitValue(value: unknown, ctx: Context): string {
@@ -2475,16 +2504,20 @@ function restoreBuiltinContent(value: object, name: string, ctx: Context): Set<s
   // Symbol.iterator) and the restore (base set/add) go through the prototype directly so
   // restore reproduces the exact live contents. (The array branch assigns indices directly.)
   if (value instanceof MapCtor) {
+    let i = 0;
     for (const [k, v] of MapCtor.prototype.entries.$call(value as Map<unknown, unknown>)) {
-      const kx = emitValue(transform(value, "", k, ctx), ctx);
-      const vx = emitValue(transform(value, "", v, ctx), ctx);
+      const kx = emitValue(k, ctx);
+      const vx = emitValue(transform(value, mapReplacerKey(k, i), v, ctx), ctx);
       ctx.module.push(`Map.prototype.set.call(${name}, ${kx}, ${vx});`);
+      i++;
     }
     return undefined;
   }
   if (value instanceof SetCtor) {
+    let i = 0;
     for (const v of SetCtor.prototype.values.$call(value as Set<unknown>)) {
-      ctx.module.push(`Set.prototype.add.call(${name}, ${emitValue(transform(value, "", v, ctx), ctx)});`);
+      ctx.module.push(`Set.prototype.add.call(${name}, ${emitValue(transform(value, String(i), v, ctx), ctx)});`);
+      i++;
     }
     return undefined;
   }
@@ -2575,15 +2608,17 @@ function emitOwnProperties(
 
     const keyName = typeof key === "string" ? key : key.toString();
     const child = transform(value, keyName, descriptor.value, ctx);
-    // A REPLACER that turns a defined value into undefined omits the property (JSON-like).
+    // A REPLACER that turns a defined value into undefined omits the property (JSON-like) — for
+    // every key kind (string OR symbol, enumerable OR not), not just enumerable string keys.
     // A genuinely-undefined own value is kept (faithful: `{a: undefined}` keeps `a`), so this
     // only fires when the replacer changed it (descriptor.value was not already undefined).
-    if (child === undefined && descriptor.value !== undefined && typeof key === "string" && descriptor.enumerable) {
+    if (child === undefined && descriptor.value !== undefined) {
       // On the genuine-instance path the reify factory runs the real constructor, so a
-      // field-initialized property already exists on `name`; not emitting it would leave the
-      // constructor's value. `delete` drops it for real. On the plain-object path the property
-      // was never assigned, so the delete is a harmless no-op.
-      ctx.module.push(`delete ${name}[${keyExpr}];`);
+      // field-initialized property already exists on `name`; `delete` drops it for real. On the
+      // plain-object path the property was never assigned, so the delete is a harmless no-op.
+      // A non-configurable property can't be deleted (and `delete` would throw in the module's
+      // strict mode), so just skip emitting it — best effort for that rare case.
+      if (descriptor.configurable) ctx.module.push(`delete ${name}[${keyExpr}];`);
       continue;
     }
 
@@ -2766,10 +2801,12 @@ function emitBuiltin(value: object, name: string, ctx: Context): { proto: object
     return {
       proto: MapCtor.prototype,
       body: () => {
+        let i = 0;
         for (const entry of MapCtor.prototype.entries.$call(value as Map<unknown, unknown>)) {
-          const k = emitValue(transform(value, "", entry[0], ctx), ctx);
-          const v = emitValue(transform(value, "", entry[1], ctx), ctx);
+          const k = emitValue(entry[0], ctx);
+          const v = emitValue(transform(value, mapReplacerKey(entry[0], i), entry[1], ctx), ctx);
           ctx.module.push(`Map.prototype.set.call(${name}, ${k}, ${v});`);
+          i++;
         }
         // A plain Map can also carry extra own properties (`m.meta = ...`); a subclass's go
         // through restoreSubclass, so only emit them here when the prototype is the natural one.
@@ -2782,8 +2819,12 @@ function emitBuiltin(value: object, name: string, ctx: Context): { proto: object
     return {
       proto: SetCtor.prototype,
       body: () => {
+        let i = 0;
         for (const element of SetCtor.prototype.values.$call(value as Set<unknown>)) {
-          ctx.module.push(`Set.prototype.add.call(${name}, ${emitValue(transform(value, "", element, ctx), ctx)});`);
+          ctx.module.push(
+            `Set.prototype.add.call(${name}, ${emitValue(transform(value, String(i), element, ctx), ctx)});`,
+          );
+          i++;
         }
         if (ObjectGetPrototypeOf(value) === SetCtor.prototype) emitOwnProperties(name, value, ctx);
       },

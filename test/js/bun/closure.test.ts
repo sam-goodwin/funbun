@@ -7373,3 +7373,83 @@ describe("tamper resistance (hostile primordials)", () => {
     void chkErr;
   });
 });
+
+describe("adversarial regressions: round 6", () => {
+  // A class passed DIRECTLY to serialize() (the root) had its public static field initializers
+  // neutralized to `undefined` with no restore emitted — static state was silently lost. The
+  // closure-wrapped path already restored them; the root now routes through the same binding path.
+  test("a class as the serialization root keeps its public static fields", async () => {
+    class Registry {
+      static nextId = 1;
+      static prefix = "id_";
+      static make() {
+        return this.prefix + this.nextId++;
+      }
+    }
+    const Out = (await roundtrip(Registry as any)) as any;
+    expect(Out.nextId).toBe(1);
+    expect(Out.prefix).toBe("id_");
+    expect(Out.make()).toBe("id_1");
+    expect(Out.make()).toBe("id_2"); // mutable static state advances
+  });
+
+  // Externally-assigned own properties on a function root were dropped (the inline root path
+  // emitted no own-property restore).
+  test("a function root keeps its externally-assigned own properties", async () => {
+    function f() {
+      return 1;
+    }
+    (f as any).meta = "hello";
+    (f as any).count = 42;
+    const out = (await roundtrip(f)) as any;
+    expect(out()).toBe(1);
+    expect(out.meta).toBe("hello");
+    expect(out.count).toBe(42);
+  });
+
+  // The replacer was invoked on Map keys/values and Set elements with `""` as the key — which
+  // collides with JSON.stringify's synthetic root key, so a replacer dropping `""` wiped the
+  // collection. Keys are no longer replacer-transformed; values/elements get a meaningful key.
+  test("a replacer that drops the empty-string key does not wipe Maps and Sets", async () => {
+    const data = { m: new Map([["realkey", "realval"]]), s: new Set(["x", "y"]) };
+    const code = serialize(
+      () => data,
+      (k, v) => (k === "" ? undefined : v),
+    );
+    using dir = tempDir("closure-r6-mapdrop", { "mod.mjs": code });
+    const out = ((await import(`${String(dir)}/mod.mjs`)).default as any)();
+    expect(out.m.get("realkey")).toBe("realval");
+    expect([...out.s].sort()).toEqual(["x", "y"]);
+  });
+
+  // ...while the replacer STILL transforms Map values and Set elements by value (the round-4
+  // feature), now keyed by the entry's string key / positional index instead of `""`.
+  test("a replacer still transforms Map values and Set elements", async () => {
+    const data = { m: new Map([["x", 2]]), s: new Set([5, 6]) };
+    const code = serialize(
+      () => data,
+      (_k, v) => (typeof v === "number" ? v * 100 : v),
+    );
+    using dir = tempDir("closure-r6-maptransform", { "mod.mjs": code });
+    const out = ((await import(`${String(dir)}/mod.mjs`)).default as any)();
+    expect(out.m.get("x")).toBe(200);
+    expect([...out.s].sort((a: number, b: number) => a - b)).toEqual([500, 600]);
+  });
+
+  // A replacer returning undefined dropped enumerable string-keyed props but was ignored for
+  // non-enumerable and symbol-keyed props (the drop path was gated on string+enumerable).
+  test("a replacer drops non-enumerable and symbol-keyed properties too", async () => {
+    const sym = Symbol.for("r6dk");
+    const obj: any = { a: 1, [sym]: 2 };
+    Object.defineProperty(obj, "b", { value: 3, enumerable: false, writable: true, configurable: true });
+    const code = serialize(
+      () => obj,
+      (k, v) => (k === "b" || v === 2 ? undefined : v),
+    );
+    using dir = tempDir("closure-r6-dropkeys", { "mod.mjs": code });
+    const out = ((await import(`${String(dir)}/mod.mjs`)).default as any)();
+    expect(Object.keys(out)).toEqual(["a"]);
+    expect("b" in out).toBe(false);
+    expect(Object.getOwnPropertySymbols(out).length).toBe(0);
+  });
+});
