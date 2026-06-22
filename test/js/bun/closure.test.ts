@@ -6684,7 +6684,7 @@ describe("adversarial regressions: round 2", () => {
   // before the constructor body, where the REIFY guard sits), so a side-effecting initializer
   // runs an extra time on reconstruction (and a field-initializer-only binding would be
   // needed at import). The final field VALUE must come from the snapshot, with no re-run.
-  test.failing("a side-effecting public field initializer does not re-run on a genuine instance", async () => {
+  test("a side-effecting public field initializer does not re-run on a genuine instance", async () => {
     const log: string[] = [];
     class C {
       #p = 1;
@@ -6709,7 +6709,7 @@ describe("adversarial regressions: round 2", () => {
   // re-evaluation, duplicating its side effect. (The crash variant — variable referenced
   // ONLY by the static block — is the same root cause: static blocks aren't part of the
   // class's collected free variables / aren't suppressed on reconstruction.)
-  test.failing("a static block's side effect does not re-run on reconstruction", async () => {
+  test("a static block's side effect does not re-run on reconstruction", async () => {
     const log: string[] = [];
     const make = () => {
       class C {
@@ -6726,6 +6726,75 @@ describe("adversarial regressions: round 2", () => {
     void inst;
     const out = (await roundtrip(() => inst))() as any;
     expect(out.m()).toBe(1); // static block side effect not duplicated (would be 2)
+  });
+
+  // A side-effecting STATIC field initializer must not re-run, but its value must survive
+  // (restored as the class's own static property).
+  test("a static field initializer does not re-run but its value is preserved", async () => {
+    const log: string[] = [];
+    const make = () => {
+      class C {
+        static x = (log.push("init"), 42);
+        m() {
+          return log.length;
+        }
+      }
+      return new C();
+    };
+    const inst = make(); // log === ["init"], C.x === 42
+    void inst;
+    const out = (await roundtrip(() => inst))() as any;
+    expect(out.m()).toBe(1); // not re-run
+    expect(out.constructor.x).toBe(42); // value preserved
+  });
+
+  // A genuine instance field initializer that references a captured-only helper must not run
+  // on reify (it would need the helper bound at import); the snapshot value is used instead.
+  test("a genuine field initializer referencing a captured-only helper does not run on reify", async () => {
+    const make = () => {
+      const helper = () => 99;
+      class C {
+        #p = 1;
+        x = helper();
+        gp() {
+          return this.#p;
+        }
+      }
+      return new C();
+    };
+    const inst = make();
+    void inst;
+    const out = (await roundtrip(() => inst))() as any;
+    expect(out.x).toBe(99); // snapshot value
+    expect(out.gp()).toBe(1);
+  });
+
+  // A derived genuine class with a side-effecting field initializer: reify must skip it.
+  test("a derived genuine class does not re-run a side-effecting field initializer", async () => {
+    const log: string[] = [];
+    class Base {
+      #b = 1;
+      getB() {
+        return this.#b;
+      }
+    }
+    class Derived extends Base {
+      #d: number;
+      y = (log.push("init"), 7);
+      constructor() {
+        super();
+        this.#d = 3;
+      }
+      probe() {
+        return [this.#d, log.length];
+      }
+    }
+    const inst = new Derived(); // log === ["init"]
+    void inst;
+    const out = (await roundtrip(() => inst))() as any;
+    expect(out.probe()).toEqual([3, 1]); // #d preserved, initializer not re-run
+    expect(out.y).toBe(7);
+    expect(out.getB()).toBe(1);
   });
 });
 

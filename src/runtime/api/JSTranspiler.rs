@@ -1967,7 +1967,8 @@ impl<'a> AstJsConverter<'a> {
         use bun_ast::flags;
         use bun_ast::g::PropertyKind;
         if p.kind == PropertyKind::ClassStaticBlock {
-            let node = self.node("StaticBlock", 0)?;
+            let block_start = p.class_static_block_ref().map_or(0, |block| block.loc.start);
+            let node = self.node("StaticBlock", block_start)?;
             if let Some(block) = p.class_static_block_ref() {
                 let body = self.stmts(block.stmts.as_slice())?;
                 node.put(self.global, "body", body);
@@ -2034,6 +2035,9 @@ impl<'a> AstJsConverter<'a> {
         }
         let body = self.node("ClassBody", class.body_loc.start)?;
         body.put(self.global, "body", arr);
+        // The class body's closing `}` position — a source-rewriting consumer needs it to bound
+        // the last member's span (e.g. a field initializer with no trailing semicolon).
+        body.put(self.global, "closeBrace", JSValue::js_number(class.close_brace_loc.start as f64));
         node.put(self.global, "body", body);
         Ok(node)
     }
