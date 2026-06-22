@@ -6852,3 +6852,88 @@ describe("adversarial regressions: round 3", () => {
     expect(() => serialize(o.g)).toThrow();
   });
 });
+
+// Computed field keys (a previously-noted limitation) work in this build — lock it in.
+describe("computed field keys", () => {
+  test("a computed string field key (used only as the key) round-trips", async () => {
+    const k = "onlyKey";
+    class C {
+      [k] = 5;
+    }
+    const c = new C();
+    void c;
+    const out = (await roundtrip(() => c))() as any;
+    expect(out.onlyKey).toBe(5);
+  });
+  test("a computed field key on a genuine #private class round-trips", async () => {
+    const k = "gk";
+    class C {
+      #p = 1;
+      [k] = 8;
+      gp() {
+        return this.#p;
+      }
+    }
+    const c = new C();
+    void c;
+    const out = (await roundtrip(() => c))() as any;
+    expect(out.gk).toBe(8);
+    expect(out.gp()).toBe(1);
+  });
+});
+
+// Round-4 subagent findings, encoded test.failing before their fixes.
+describe("adversarial regressions: round 4", () => {
+  // BUG W: a plain array drops every non-index own property (the array emit branch never
+  // calls emitOwnProperties).
+  test("a plain array preserves non-index own properties", async () => {
+    const a: any = [1, 2, 3];
+    a.foo = "bar";
+    const out = (await roundtrip(() => a))() as any;
+    expect(Array.isArray(out)).toBe(true);
+    expect([...out]).toEqual([1, 2, 3]);
+    expect(out.foo).toBe("bar");
+  });
+
+  // BUG X: an own data property shadowing a prototype accessor is emitted via plain
+  // assignment, which walks the prototype chain and fires the inherited setter (or throws
+  // for a getter-only accessor) instead of creating an own data property.
+  test("an own data property shadowing a prototype accessor round-trips", async () => {
+    const make = () => {
+      class C {
+        _viaSetter: any;
+        get x() {
+          return "proto";
+        }
+        set x(v) {
+          this._viaSetter = v;
+        }
+      }
+      const i: any = new C();
+      Object.defineProperty(i, "x", { value: "own", enumerable: true, writable: true, configurable: true });
+      return i;
+    };
+    const i = make();
+    const out = (await roundtrip(() => i))() as any;
+    expect(out.x).toBe("own"); // own data prop shadows the accessor
+    expect(out._viaSetter).toBeUndefined(); // setter NOT invoked
+  });
+
+  // BUG Y: a frozen/sealed class prototype (or constructor) loses its extensibility state
+  // (the prototype is emitted via the function path, never through emitObject's freeze block).
+  test.failing("a frozen class prototype stays frozen", async () => {
+    const make = () => {
+      class C {
+        m() {
+          return 1;
+        }
+      }
+      Object.freeze(C.prototype);
+      return new C();
+    };
+    const i = make();
+    const out = (await roundtrip(() => i))() as any;
+    expect(Object.isFrozen(Object.getPrototypeOf(out))).toBe(true);
+    expect(out.m()).toBe(1);
+  });
+});

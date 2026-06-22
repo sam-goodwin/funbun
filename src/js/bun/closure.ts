@@ -2032,14 +2032,26 @@ function emitObjectBody(value: object, name: string, ctx: Context): void {
   if (Array.isArray(value)) {
     ctx.module.push(`const ${name} = [];`);
     const array = value as unknown[];
+    let presentIndices = 0;
     for (let i = 0; i < array.length; i++) {
       if (i in array) {
+        presentIndices++;
         const child = transform(value, String(i), array[i], ctx);
         ctx.module.push(`${name}[${i}] = ${emitValue(child, ctx)};`);
       }
     }
     // Preserve the length, including trailing holes.
     ctx.module.push(`${name}.length = ${array.length};`);
+    // An array can carry NON-index own properties (`a.foo = ...`, a symbol key, a
+    // non-canonical-index string, a non-enumerable prop). Emit those too — but only when some
+    // exist: own names beyond the present indices + `length`, or any symbol key. (The common
+    // dense array has none, and an unconditional emitOwnProperties walk is a measurable cost.)
+    if (
+      Object.getOwnPropertyNames(array).length > presentIndices + 1 ||
+      Object.getOwnPropertySymbols(array).length > 0
+    ) {
+      emitOwnProperties(name, value, ctx, arrayIndexSkip(array));
+    }
   } else if (isModuleNamespaceObject(value)) {
     // A module namespace (`import * as ns`) — emit only the members the closure
     // referenced (access-path pruned), as a plain object. Its exotic prototype
@@ -2205,6 +2217,14 @@ function emitOwnProperties(
   // those keys; emit only them. Symbol keys are never pruned (not statically
   // analyzable). "all" / absent means emit everything.
   const keep = ctx.keepSets.get(value);
+  // For an inherited-accessor check (below): only a CUSTOM prototype can hold a same-key
+  // accessor that a plain `obj[key] = v` would trip. Object.prototype's only accessor is
+  // `__proto__` (handled separately), and a null prototype has none — so skip the per-key
+  // prototype walk for those common cases (it's a measurable cost on large graphs).
+  const accessorProto = (() => {
+    const p = Object.getPrototypeOf(value);
+    return p !== null && p !== Object.prototype ? p : null;
+  })();
   for (const key of Reflect.ownKeys(value)) {
     if (skip !== undefined && typeof key === "string" && skip.has(key)) {
       continue;
@@ -2241,12 +2261,18 @@ function emitOwnProperties(
       continue;
     }
 
-    // `name["__proto__"] = v` invokes the Object.prototype `__proto__` setter (reparents the
-    // object / silently drops a primitive) instead of defining an own property — route it
-    // through defineProperty so an own `__proto__` data property round-trips faithfully.
+    // A plain `name[key] = v` assignment walks the prototype chain: if an ACCESSOR with the
+    // same key lives there, the assignment fires its setter (or throws for a getter-only
+    // accessor) instead of creating an own data property. `name["__proto__"] = v` similarly
+    // hits the Object.prototype `__proto__` setter. In both cases route through
+    // Object.defineProperty (which always defines an own property and never invokes a setter).
+    const inherited =
+      accessorProto !== null && typeof key === "string" ? lookupDescriptor(accessorProto, key) : undefined;
+    const inheritedAccessor = inherited !== undefined && (inherited.get !== undefined || inherited.set !== undefined);
     if (
       typeof key === "string" &&
       key !== "__proto__" &&
+      !inheritedAccessor &&
       descriptor.enumerable &&
       descriptor.writable &&
       descriptor.configurable
