@@ -7016,12 +7016,61 @@ describe("adversarial regressions: round 4", () => {
     expect(out.m()).toBe(1);
   });
 
-  // BUG2: the emission is recursive, so a graph whose longest emission chain is very long
-  // (a deep linked list, or a wide graph with a long acyclic path) overflows the JS stack.
-  // That surfaces as a clear, catchable serializer error rather than a bare RangeError.
-  test("a too-deeply-nested graph throws a clear serializer error, not a raw RangeError", () => {
+  // BUG2: a graph whose longest emission chain is very long (a deep linked list, or a wide
+  // graph with a long acyclic path) used to overflow the recursive emission. The analysis
+  // pre-passes and the emission are now iterative (heap worklists), so it serializes — and the
+  // flat output (declarations + assignments, no nested literals) also imports without overflow.
+  // 30000 is well past the old ~6000-deep call-stack limit.
+  test("a deep object graph serializes iteratively without overflowing the stack", async () => {
+    const N = 30000;
     let head: any = { v: 0 };
-    for (let i = 1; i < 60000; i++) head = { v: i, next: head };
-    expect(() => serialize(() => head)).toThrow(/too deeply nested/);
+    for (let i = 1; i < N; i++) head = { v: i, next: head };
+    const out = (await roundtrip(() => head))() as any;
+    let n = out;
+    let count = 0;
+    let deepest: number | undefined;
+    while (n) {
+      deepest = n.v;
+      count++;
+      n = n.next;
+    }
+    expect(count).toBe(N);
+    expect(out.v).toBe(N - 1); // head
+    expect(deepest).toBe(0); // tail
+  });
+
+  // A deep chain of built-in containers (Maps) goes through the iterative builtin body path.
+  test("a deep Map chain serializes iteratively", async () => {
+    const N = 20000;
+    let m = new Map<string, unknown>([["v", 0]]);
+    for (let i = 1; i < N; i++)
+      m = new Map<string, unknown>([
+        ["v", i],
+        ["next", m],
+      ]);
+    const out = (await roundtrip(() => m))() as Map<string, any>;
+    let node: any = out;
+    let count = 0;
+    while (node) {
+      count++;
+      node = node.get("next");
+    }
+    expect(count).toBe(N);
+    expect(out.get("v")).toBe(N - 1);
+  });
+
+  // A wide, heavily-shared graph (each node points at several others, including a long acyclic
+  // path) serializes iteratively, preserving shared identity and cycles.
+  test("a wide, heavily-shared graph serializes iteratively with identity preserved", async () => {
+    const N = 6400;
+    const nodes: Array<{ i: number; refs: any[] }> = [];
+    for (let i = 0; i < N; i++) nodes.push({ i, refs: [] });
+    for (let i = 0; i < N; i++) {
+      nodes[i].refs.push(nodes[(i + 1) % N], nodes[(i * 7 + 3) % N], nodes[0]);
+    }
+    const out = (await roundtrip(() => nodes[0]))() as any;
+    expect(out.i).toBe(0);
+    expect(out.refs.length).toBe(3);
+    expect(out.refs[2]).toBe(out); // the shared back-edge to node 0 keeps its identity
   });
 });

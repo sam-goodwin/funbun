@@ -131,6 +131,13 @@ interface Context {
   // hoisted binding exists) avoids a temporal-dead-zone reference. The bare instance is still
   // emitted up front, so identity and cycles resolve.
   deferredPatches: string[];
+  // Deferred object BODIES (property assignments, container contents, subclass/freeze
+  // restoration). emitObject emits each object's `const name = <base>` declaration synchronously
+  // at discovery (so a parent's `name.key = childref` always references an already-declared
+  // binding) and enqueues the body here; a drain loop runs them. This bounds emission DEPTH by
+  // the heap (the queue), not the JS call stack, so an arbitrarily deep/wide graph serializes
+  // without overflowing.
+  bodyQueue: Array<() => void>;
 }
 
 interface SourceBlock {
@@ -220,6 +227,7 @@ function serializeImpl(fn: Function, replacer?: Replacer): string {
     genuineClassId: new Map(),
     needsReifySlot: false,
     deferredPatches: [],
+    bodyQueue: [],
   };
 
   // Emit shared cells at module scope (deduped by id) before any function that
@@ -271,6 +279,11 @@ function serializeImpl(fn: Function, replacer?: Replacer): string {
         `: ${name}.run(${storeExpr}, () => __root.apply(this, __a)); })(${exportExpr})`;
     }
   }
+
+  // Drain deferred object BODIES iteratively (a growing FIFO worklist, not recursion) so an
+  // arbitrarily deep/wide graph emits without overflowing the stack. Each body op references
+  // bindings declared at discovery; running a body may discover (and enqueue) more objects.
+  for (let i = 0; i < ctx.bodyQueue.length; i++) ctx.bodyQueue[i]();
 
   // Genuine-instance private patches run last, after every hoisted binding (including any
   // hosted arrow a private slot points at) has been declared.
@@ -2082,32 +2095,44 @@ function emitObject(value: object, ctx: Context): string {
   // Record BEFORE recursing so a self-reference resolves to `name`.
   ctx.refs.set(value, name);
 
-  // A genuine-private class instance (including a genuine subclass of a builtin like Map) is
-  // reconstructed via its reify factory + patch methods, NOT the builtin/object paths below.
-  // (Falls through to the frozen/sealed handling at the end.)
-  if (!emitGenuinePrivateInstance(value, name, ctx)) {
-    const builtinProto = emitBuiltin(value, name, ctx);
-    if (builtinProto === null) {
-      emitObjectBody(value, name, ctx);
-      // An array subclass (`class X extends Array`) is constructed as a plain array
-      // above; restore its prototype and any extra (non-index) own/private fields.
-      if (Array.isArray(value) && Object.getPrototypeOf(value) !== Array.prototype) {
-        restoreSubclass(value, name, ctx, arrayIndexSkip(value));
-      }
-    } else if (Object.getPrototypeOf(value) !== builtinProto) {
-      // A built-in subclass (`class X extends Map/Set/...`): the base data is built;
-      // restore the subclass prototype + its own/private instance fields.
-      restoreSubclass(value, name, ctx);
+  // Each path emits the `const name = <base>` declaration SYNCHRONOUSLY and returns a thunk for
+  // the (deep, recursive) body. The body is enqueued — not run inline — so emission depth lives
+  // on the heap (ctx.bodyQueue) rather than the JS call stack. A non-extensible/sealed/frozen
+  // state is applied LAST in the body, after every property and cycle is wired (freeze rejects
+  // later mutation). A genuine-private class instance (incl. a genuine subclass of a builtin
+  // like Map) goes through its reify factory + patch methods, not the builtin/object paths.
+  const finishExtensibility = (): void => {
+    if (!Object.isExtensible(value)) emitNonExtensible(name, value, ctx);
+  };
+  const genuineBody = emitGenuinePrivateInstance(value, name, ctx);
+  if (genuineBody !== null) {
+    ctx.bodyQueue.push(() => {
+      genuineBody();
+      finishExtensibility();
+    });
+    return name;
+  }
+  const builtin = emitBuiltin(value, name, ctx);
+  if (builtin !== null) {
+    ctx.bodyQueue.push(() => {
+      builtin.body();
+      // A built-in subclass (`class X extends Map/Set/...`): the base data is built; restore the
+      // subclass prototype + its own/private instance fields.
+      if (Object.getPrototypeOf(value) !== builtin.proto) restoreSubclass(value, name, ctx);
+      finishExtensibility();
+    });
+    return name;
+  }
+  const objBody = emitObjectBody(value, name, ctx);
+  ctx.bodyQueue.push(() => {
+    objBody();
+    // An array subclass (`class X extends Array`) is constructed as a plain array above; restore
+    // its prototype and any extra (non-index) own/private fields.
+    if (Array.isArray(value) && Object.getPrototypeOf(value) !== Array.prototype) {
+      restoreSubclass(value, name, ctx, arrayIndexSkip(value));
     }
-  }
-
-  // Preserve a non-extensible/sealed/frozen state — applied LAST, after every
-  // property (and any cycle) is wired, since a frozen object rejects mutation.
-  // Covers built-ins (a frozen Map/Set/Date) as well as plain objects.
-  if (!Object.isExtensible(value)) {
-    emitNonExtensible(name, value, ctx);
-  }
-
+    finishExtensibility();
+  });
   return name;
 }
 
@@ -2135,53 +2160,63 @@ function arrayIndexSkip(value: unknown[]): Set<string> {
   return skip;
 }
 
-function emitObjectBody(value: object, name: string, ctx: Context): void {
+// Emits the object's `const name = <base>` declaration SYNCHRONOUSLY (so a parent referencing
+// `name` always sees a declared binding) and returns a thunk that emits the BODY (property
+// assignments / members) — deferred via emitObject so emission depth lives on the heap.
+function emitObjectBody(value: object, name: string, ctx: Context): () => void {
   if (Array.isArray(value)) {
     ctx.module.push(`const ${name} = [];`);
     const array = value as unknown[];
-    let presentIndices = 0;
-    for (let i = 0; i < array.length; i++) {
-      if (i in array) {
-        presentIndices++;
-        const child = transform(value, String(i), array[i], ctx);
-        ctx.module.push(`${name}[${i}] = ${emitValue(child, ctx)};`);
+    return () => {
+      let presentIndices = 0;
+      for (let i = 0; i < array.length; i++) {
+        if (i in array) {
+          presentIndices++;
+          const child = transform(value, String(i), array[i], ctx);
+          ctx.module.push(`${name}[${i}] = ${emitValue(child, ctx)};`);
+        }
       }
-    }
-    // Preserve the length, including trailing holes.
-    ctx.module.push(`${name}.length = ${array.length};`);
-    // An array can carry NON-index own properties (`a.foo = ...`, a symbol key, a
-    // non-canonical-index string, a non-enumerable prop). Emit those too — but only when some
-    // exist: own names beyond the present indices + `length`, or any symbol key. (The common
-    // dense array has none, and an unconditional emitOwnProperties walk is a measurable cost.)
-    if (
-      Object.getOwnPropertyNames(array).length > presentIndices + 1 ||
-      Object.getOwnPropertySymbols(array).length > 0
-    ) {
-      emitOwnProperties(name, value, ctx, arrayIndexSkip(array));
-    }
-  } else if (isModuleNamespaceObject(value)) {
+      // Preserve the length, including trailing holes.
+      ctx.module.push(`${name}.length = ${array.length};`);
+      // An array can carry NON-index own properties (`a.foo = ...`, a symbol key, a
+      // non-canonical-index string, a non-enumerable prop). Emit those too — but only when some
+      // exist: own names beyond the present indices + `length`, or any symbol key. (The common
+      // dense array has none, and an unconditional emitOwnProperties walk is a measurable cost.)
+      if (
+        Object.getOwnPropertyNames(array).length > presentIndices + 1 ||
+        Object.getOwnPropertySymbols(array).length > 0
+      ) {
+        emitOwnProperties(name, value, ctx, arrayIndexSkip(array));
+      }
+    };
+  }
+  if (isModuleNamespaceObject(value)) {
     // A module namespace (`import * as ns`) — emit only the members the closure
     // referenced (access-path pruned), as a plain object. Its exotic prototype
     // chain and `Symbol.toStringTag` must NOT be walked (that reaches native
     // built-ins). Each member is read live and serialized like any value, so
     // imported functions/objects are inlined and tree-shaken to what's used.
     ctx.module.push(`const ${name} = {};`);
-    const keep = ctx.keepSets.get(value);
-    for (const key of Reflect.ownKeys(value)) {
-      if (typeof key !== "string") continue;
-      if (keep !== undefined && keep !== "all" && !keep.has(key)) continue;
-      const child = transform(value, key, (value as any)[key], ctx);
-      if (child === undefined) continue;
-      ctx.module.push(`${name}[${JSON.stringify(key)}] = ${emitValue(child, ctx)};`);
-    }
-  } else if (value instanceof Error) {
-    emitErrorBody(value, name, ctx);
-  } else {
-    // Genuine-private instances are handled earlier in emitObject (before emitBuiltin).
-    ctx.module.push(`const ${name} = ${objectBaseExpression(value, ctx)};`);
+    return () => {
+      const keep = ctx.keepSets.get(value);
+      for (const key of Reflect.ownKeys(value)) {
+        if (typeof key !== "string") continue;
+        if (keep !== undefined && keep !== "all" && !keep.has(key)) continue;
+        const child = transform(value, key, (value as any)[key], ctx);
+        if (child === undefined) continue;
+        ctx.module.push(`${name}[${JSON.stringify(key)}] = ${emitValue(child, ctx)};`);
+      }
+    };
+  }
+  if (value instanceof Error) {
+    return emitErrorBody(value, name, ctx);
+  }
+  // Plain object / class instance (genuine-private instances are handled earlier in emitObject).
+  ctx.module.push(`const ${name} = ${objectBaseExpression(value, ctx)};`);
+  return () => {
     emitOwnProperties(name, value, ctx);
     emitPrivateFields(name, value, ctx);
-  }
+  };
 }
 
 // If `value` is an instance of a class the gate cleared for genuine privates, emit it in two
@@ -2190,26 +2225,27 @@ function emitObjectBody(value: object, name: string, ctx: Context): void {
 // slots by calling each chain class's patch method (after all instances exist). Public own
 // properties are restored last. Real `#private` slots preserve privacy, brand checks, and
 // `instanceof`. Returns false (caller uses the default Object.create path) when not applicable.
-function emitGenuinePrivateInstance(value: object, name: string, ctx: Context): boolean {
+function emitGenuinePrivateInstance(value: object, name: string, ctx: Context): (() => void) | null {
   const proto = Object.getPrototypeOf(value);
   const ctor = (proto as any)?.constructor;
-  if (typeof ctor !== "function" || ctor.prototype !== proto) return false;
-  if (!ctx.genuineClasses.has(ctor)) return false;
+  if (typeof ctor !== "function" || ctor.prototype !== proto) return null;
+  if (!ctx.genuineClasses.has(ctor)) return null;
   // Emit the class first so its (and its ancestors') reify factories are in ctx.classReify.
   emitValue(ctor, ctx);
   const reify = ctx.classReify.get(ctor);
-  if (reify === undefined) return false;
+  if (reify === undefined) return null;
 
-  // Phase 1: bare construct. Emitted before any private value so a private referencing this
+  // DECL: bare construct. Emitted before any private value so a private referencing this
   // instance (or a cycle through another instance) resolves to an already-declared binding.
   // For a builtin subclass the factory's `super()` yields an empty Map/Set/Array; its content
-  // is restored onto the live instance next (the instance IS a Map/Set/Array).
+  // is restored onto the live instance in the deferred body (the instance IS a Map/Set/Array).
   ctx.module.push(`const ${name} = ${reify.factory}();`);
-  const builtinSkip = restoreBuiltinContent(value, name, ctx);
 
-  // Phase 2: install privates. Each genuine class in the chain that declares private fields
-  // gets its own patch method (sharing the name across the chain, reached via its prototype),
-  // each reading only its own keys from the shared values object.
+  // Install privates. Each genuine class in the chain that declares private fields gets its own
+  // patch method (sharing the name across the chain, reached via its prototype), each reading
+  // only its own keys from the shared values object. The patch VALUES (emitValue, O(1) each)
+  // and the patch CALLS are deferred to the end of the prelude — a private value can reference a
+  // binding declared after this instance (e.g. a hosted arrow held in its own private slot).
   const patchClasses: Function[] = [];
   for (let p: object | null = proto; p && p !== Object.prototype; p = Object.getPrototypeOf(p)) {
     const c = (p as any).constructor;
@@ -2233,17 +2269,16 @@ function emitGenuinePrivateInstance(value: object, name: string, ctx: Context): 
       }
     }
     const valsName = REF_PREFIX + ctx.counter++;
-    // Deferred to the end of the prelude: a private value can reference a binding declared
-    // after this instance (e.g. a hosted arrow stored in this very instance's own private
-    // slot). The bare instance is already emitted, so identity/cycles resolve; running the
-    // patch last guarantees every referenced binding exists.
     ctx.deferredPatches.push(`const ${valsName} = { ${entries.join(", ")} };`);
     for (const c of patchClasses) {
       ctx.deferredPatches.push(`${emitValue(c, ctx)}.prototype.${PATCH_METHOD}.call(${name}, ${valsName});`);
     }
   }
-  emitOwnProperties(name, value, ctx, builtinSkip);
-  return true;
+  // BODY (deferred): restore builtin-subclass content (.set/.add/indices) then public own props.
+  return () => {
+    const builtinSkip = restoreBuiltinContent(value, name, ctx);
+    emitOwnProperties(name, value, ctx, builtinSkip);
+  };
 }
 
 // Restores a genuine builtin subclass's content onto the already-constructed (empty) live
@@ -2453,7 +2488,11 @@ function propertyKeyExpression(key: string | symbol, ctx: Context): string {
 // ctx.module under `name` and returns the built-in's NATURAL prototype (so the
 // caller can detect and restore a subclass instance); returns null for plain
 // objects/arrays, which the caller handles.
-function emitBuiltin(value: object, name: string, ctx: Context): object | null {
+// Emits a builtin's `const name = new X(...)` declaration SYNCHRONOUSLY and returns its natural
+// prototype plus a thunk that emits the deep content (Map/Set/Weak entries, own props) — or null
+// if `value` isn't a recognized builtin. The content is deferred via emitObject so a deep
+// container chain serializes without overflowing.
+function emitBuiltin(value: object, name: string, ctx: Context): { proto: object; body: () => void } | null {
   // A settled promise reconstructs from its result: Promise.resolve(value) /
   // Promise.reject(reason). Rejected promises are pre-handled (`.catch(...)`) so
   // module load doesn't raise an unhandled-rejection — the reason is still
@@ -2468,25 +2507,33 @@ function emitBuiltin(value: object, name: string, ctx: Context): object | null {
     } else {
       ctx.module.push(`const ${name} = Promise.resolve(${emitValue(settled, ctx)});`);
     }
-    return Promise.prototype;
+    return { proto: Promise.prototype, body: NOOP_BODY };
   }
   if (value instanceof Date) {
     ctx.module.push(`const ${name} = new Date(${(value as Date).getTime()});`);
-    // Extra own properties (`d.label = ...`) are only otherwise restored on the subclass
-    // path; emit them here for a plain Date too. (A subclass's own props go through
-    // restoreSubclass instead, so only do this when the prototype is the natural one.)
-    if (Object.getPrototypeOf(value) === Date.prototype) emitOwnProperties(name, value, ctx);
-    return Date.prototype;
+    return {
+      proto: Date.prototype,
+      // Extra own properties (`d.label = ...`) are only otherwise restored on the subclass
+      // path; emit them here for a plain Date too. (A subclass's own props go through
+      // restoreSubclass instead, so only do this when the prototype is the natural one.)
+      body: () => {
+        if (Object.getPrototypeOf(value) === Date.prototype) emitOwnProperties(name, value, ctx);
+      },
+    };
   }
   if (value instanceof RegExp) {
     const re = value as RegExp;
     ctx.module.push(`const ${name} = new RegExp(${JSON.stringify(re.source)}, ${JSON.stringify(re.flags)});`);
     // lastIndex is the iteration cursor of a global/sticky regex — stateful, must be restored.
     if (re.lastIndex !== 0) ctx.module.push(`${name}.lastIndex = ${re.lastIndex};`);
-    // Extra own props (`re.custom = ...`) — same rationale as Date; skip the lastIndex own
-    // slot (already set above, and it's non-configurable so defineProperty would fail).
-    if (Object.getPrototypeOf(value) === RegExp.prototype) emitOwnProperties(name, value, ctx, REGEXP_SKIP_KEYS);
-    return RegExp.prototype;
+    return {
+      proto: RegExp.prototype,
+      // Extra own props (`re.custom = ...`) — same rationale as Date; skip the lastIndex own
+      // slot (already set above, and it's non-configurable so defineProperty would fail).
+      body: () => {
+        if (Object.getPrototypeOf(value) === RegExp.prototype) emitOwnProperties(name, value, ctx, REGEXP_SKIP_KEYS);
+      },
+    };
   }
   // Read the live entries AND restore them through the base prototype methods, never the
   // instance's own (possibly user-overridden) Symbol.iterator / set / add — an override
@@ -2494,17 +2541,25 @@ function emitBuiltin(value: object, name: string, ctx: Context): object | null {
   // throwing override would escape serialize() raw). Mirrors restoreBuiltinContent.
   if (value instanceof Map) {
     ctx.module.push(`const ${name} = new Map();`);
-    for (const entry of Map.prototype.entries.$call(value as Map<unknown, unknown>)) {
-      ctx.module.push(`Map.prototype.set.call(${name}, ${emitValue(entry[0], ctx)}, ${emitValue(entry[1], ctx)});`);
-    }
-    return Map.prototype;
+    return {
+      proto: Map.prototype,
+      body: () => {
+        for (const entry of Map.prototype.entries.$call(value as Map<unknown, unknown>)) {
+          ctx.module.push(`Map.prototype.set.call(${name}, ${emitValue(entry[0], ctx)}, ${emitValue(entry[1], ctx)});`);
+        }
+      },
+    };
   }
   if (value instanceof Set) {
     ctx.module.push(`const ${name} = new Set();`);
-    for (const element of Set.prototype.values.$call(value as Set<unknown>)) {
-      ctx.module.push(`Set.prototype.add.call(${name}, ${emitValue(element, ctx)});`);
-    }
-    return Set.prototype;
+    return {
+      proto: Set.prototype,
+      body: () => {
+        for (const element of Set.prototype.values.$call(value as Set<unknown>)) {
+          ctx.module.push(`Set.prototype.add.call(${name}, ${emitValue(element, ctx)});`);
+        }
+      },
+    };
   }
   // ArrayBuffer-backed: emit the underlying buffer through the normal value path
   // (so multiple views over one buffer share it by identity) then build the view
@@ -2535,7 +2590,7 @@ function emitBuiltin(value: object, name: string, ctx: Context): object | null {
           : `const ${name} = new ${view.constructor.name}(${bufferExpr}, ${view.byteOffset}, ${view.length});`,
       );
     }
-    return Object.getPrototypeOf(value);
+    return { proto: Object.getPrototypeOf(value), body: NOOP_BODY };
   }
   if (
     value instanceof ArrayBuffer ||
@@ -2549,20 +2604,20 @@ function emitBuiltin(value: object, name: string, ctx: Context): object | null {
     const resizeOpts = ab.resizable === true || ab.growable === true ? `, { maxByteLength: ${ab.maxByteLength} }` : "";
     ctx.module.push(`const ${name} = new ${ctor}(${(value as ArrayBufferLike).byteLength}${resizeOpts});`);
     if (bytes.some(b => b !== 0)) ctx.module.push(`new Uint8Array(${name}).set([${bytes.join(", ")}]);`);
-    return Object.getPrototypeOf(value);
+    return { proto: Object.getPrototypeOf(value), body: NOOP_BODY };
   }
   // Boxed primitives (new Number/String/Boolean) — objects wrapping a primitive.
   if (value instanceof Number) {
     ctx.module.push(`const ${name} = new Number(${serializeNumber((value as Number).valueOf())});`);
-    return Number.prototype;
+    return { proto: Number.prototype, body: NOOP_BODY };
   }
   if (value instanceof String) {
     ctx.module.push(`const ${name} = new String(${JSON.stringify((value as String).valueOf())});`);
-    return String.prototype;
+    return { proto: String.prototype, body: NOOP_BODY };
   }
   if (value instanceof Boolean) {
     ctx.module.push(`const ${name} = new Boolean(${(value as Boolean).valueOf()});`);
-    return Boolean.prototype;
+    return { proto: Boolean.prototype, body: NOOP_BODY };
   }
   // A WeakRef snapshots its live referent. If already collected at serialize
   // time, emit a WeakRef to a fresh (immediately collectable) object — best
@@ -2570,25 +2625,33 @@ function emitBuiltin(value: object, name: string, ctx: Context): object | null {
   if (value instanceof WeakRef) {
     const target = (value as WeakRef<any>).deref();
     ctx.module.push(`const ${name} = new WeakRef(${target === undefined ? "{}" : emitValue(target, ctx)});`);
-    return WeakRef.prototype;
+    return { proto: WeakRef.prototype, body: NOOP_BODY };
   }
   // WeakMap / WeakSet entries aren't JS-enumerable, but their live entries can be
   // snapshotted natively. Reconstruct as a fresh weak collection with those
   // entries (keys keep their identity with other captures). Snapshot semantics:
   // the keys alive at serialize time.
   if (value instanceof WeakMap) {
-    const snap = $weakCollectionSnapshot(value); // [k, v, k, v, ...]
     ctx.module.push(`const ${name} = new WeakMap();`);
-    for (let i = 0; i + 1 < snap.length; i += 2) {
-      ctx.module.push(`${name}.set(${emitValue(snap[i], ctx)}, ${emitValue(snap[i + 1], ctx)});`);
-    }
-    return WeakMap.prototype;
+    return {
+      proto: WeakMap.prototype,
+      body: () => {
+        const snap = $weakCollectionSnapshot(value); // [k, v, k, v, ...]
+        for (let i = 0; i + 1 < snap.length; i += 2) {
+          ctx.module.push(`${name}.set(${emitValue(snap[i], ctx)}, ${emitValue(snap[i + 1], ctx)});`);
+        }
+      },
+    };
   }
   if (value instanceof WeakSet) {
-    const snap = $weakCollectionSnapshot(value); // [k, k, ...]
     ctx.module.push(`const ${name} = new WeakSet();`);
-    for (const element of snap) ctx.module.push(`${name}.add(${emitValue(element, ctx)});`);
-    return WeakSet.prototype;
+    return {
+      proto: WeakSet.prototype,
+      body: () => {
+        const snap = $weakCollectionSnapshot(value); // [k, k, ...]
+        for (const element of snap) ctx.module.push(`${name}.add(${emitValue(element, ctx)});`);
+      },
+    };
   }
   // FinalizationRegistry: its registrations aren't JS-enumerable, but a native
   // snapshot exposes the callback + live { target, heldValue, unregisterToken }.
@@ -2598,16 +2661,23 @@ function emitBuiltin(value: object, name: string, ctx: Context): object | null {
     const snap = $finalizationRegistrySnapshot(value); // { callback, flat: [t, h, tok, ...] }
     if (snap === null) return null;
     ctx.module.push(`const ${name} = new FinalizationRegistry(${emitValue(snap.callback, ctx)});`);
-    const flat = snap.flat;
-    for (let i = 0; i + 2 < flat.length; i += 3) {
-      const token = flat[i + 2];
-      const tokenArg = token === undefined ? "" : `, ${emitValue(token, ctx)}`;
-      ctx.module.push(`${name}.register(${emitValue(flat[i], ctx)}, ${emitValue(flat[i + 1], ctx)}${tokenArg});`);
-    }
-    return FinalizationRegistry.prototype;
+    return {
+      proto: FinalizationRegistry.prototype,
+      body: () => {
+        const flat = snap.flat;
+        for (let i = 0; i + 2 < flat.length; i += 3) {
+          const token = flat[i + 2];
+          const tokenArg = token === undefined ? "" : `, ${emitValue(token, ctx)}`;
+          ctx.module.push(`${name}.register(${emitValue(flat[i], ctx)}, ${emitValue(flat[i + 1], ctx)}${tokenArg});`);
+        }
+      },
+    };
   }
   return null;
 }
+
+// A shared no-op body for builtins with no deferred content (their declaration is complete).
+const NOOP_BODY = (): void => {};
 
 // Known builtin Error constructors, in priority order (most specific first).
 const ERROR_BASES = [
@@ -2639,26 +2709,30 @@ function builtinErrorBase(value: object): string {
 // AggregateError's `errors`, and any custom fields (`code`, `status`, ...) —
 // and, for a subclass, its prototype. `stack` is intentionally not pinned to the
 // original location.
-function emitErrorBody(value: Error, name: string, ctx: Context): void {
+// Emits the error's `const name = new Base(msg)` declaration synchronously and returns a thunk
+// that restores its own properties and (for a subclass) its prototype.
+function emitErrorBody(value: Error, name: string, ctx: Context): () => void {
   const base = builtinErrorBase(value);
   if (base === "AggregateError") {
     ctx.module.push(`const ${name} = new AggregateError([], ${JSON.stringify(value.message)});`);
   } else {
     ctx.module.push(`const ${name} = new ${base}(${JSON.stringify(value.message)});`);
   }
-  emitOwnProperties(name, value, ctx, ERROR_SKIP_KEYS);
-  const proto = Object.getPrototypeOf(value);
-  if (proto !== (globalThis as any)[base].prototype) {
-    // Link to the reconstructed subclass's OWN `.prototype` (not a standalone rebuilt copy)
-    // so `instanceof e.constructor` and shared prototype identity survive — same shape as
-    // restoreSubclass / objectBaseExpression's class-instance case.
-    const ctor = (proto as any)?.constructor;
-    const protoExpr =
-      typeof ctor === "function" && ctor.prototype === proto
-        ? `${emitValue(ctor, ctx)}.prototype`
-        : emitValue(proto, ctx);
-    ctx.module.push(`Object.setPrototypeOf(${name}, ${protoExpr});`);
-  }
+  return () => {
+    emitOwnProperties(name, value, ctx, ERROR_SKIP_KEYS);
+    const proto = Object.getPrototypeOf(value);
+    if (proto !== (globalThis as any)[base].prototype) {
+      // Link to the reconstructed subclass's OWN `.prototype` (not a standalone rebuilt copy)
+      // so `instanceof e.constructor` and shared prototype identity survive — same shape as
+      // restoreSubclass / objectBaseExpression's class-instance case.
+      const ctor = (proto as any)?.constructor;
+      const protoExpr =
+        typeof ctor === "function" && ctor.prototype === proto
+          ? `${emitValue(ctor, ctx)}.prototype`
+          : emitValue(proto, ctx);
+      ctx.module.push(`Object.setPrototypeOf(${name}, ${protoExpr});`);
+    }
+  };
 }
 
 const ERROR_SKIP_KEYS = new Set(["stack"]);
@@ -3241,6 +3315,7 @@ async function bundle(fn: Function, replacer?: Replacer): Promise<string> {
     genuineClassId: new Map(),
     needsReifySlot: false,
     deferredPatches: [],
+    bodyQueue: [],
   };
   // 2. Recover the closure module's import bindings: localName → original source.
   type Binding = { source: string; imported?: string; default?: boolean; star?: boolean };
@@ -3290,6 +3365,8 @@ async function bundle(fn: Function, replacer?: Replacer): Promise<string> {
     const value = transform(undefined, variable.name, variable.value, ctx);
     stateExports.push(`export const ${variable.name} = ${emitValue(value, ctx)};`);
   }
+  // Drain deferred object bodies iteratively (see the serialize() path) before the patches.
+  for (let i = 0; i < ctx.bodyQueue.length; i++) ctx.bodyQueue[i]();
   // Genuine-instance private patches run last (see the serialize() path), after every
   // hoisted binding a private slot may point at has been declared.
   for (const line of ctx.deferredPatches) ctx.module.push(line);
