@@ -124,6 +124,13 @@ interface Context {
   genuineClassId: Map<Function, number>;
   // Whether any genuine-private class was emitted (so `let REIFY_SLOT` is hoisted).
   needsReifySlot: boolean;
+  // Genuine-instance private-field patches (`<vals> = {...}; <Class>.prototype.patch.call(...)`)
+  // deferred to the very end of the prelude. A private field can hold a value whose binding is
+  // declared LATER than the instance — e.g. a hosted arrow stored in the instance's own private
+  // slot, whose `const` is emitted after the instance. Running the patch last (once every
+  // hoisted binding exists) avoids a temporal-dead-zone reference. The bare instance is still
+  // emitted up front, so identity and cycles resolve.
+  deferredPatches: string[];
 }
 
 interface SourceBlock {
@@ -189,6 +196,7 @@ function serialize(fn: Function, replacer?: Replacer): string {
     classReify: new Map(),
     genuineClassId: new Map(),
     needsReifySlot: false,
+    deferredPatches: [],
   };
 
   // Emit shared cells at module scope (deduped by id) before any function that
@@ -233,6 +241,10 @@ function serialize(fn: Function, replacer?: Replacer): string {
       exportExpr = `(...__alsArgs) => ${name}.run(${storeExpr}, () => (${exportExpr})(...__alsArgs))`;
     }
   }
+
+  // Genuine-instance private patches run last, after every hoisted binding (including any
+  // hosted arrow a private slot points at) has been declared.
+  for (const line of ctx.deferredPatches) ctx.module.push(line);
 
   const prelude = ctx.module.length ? ctx.module.join("\n") + "\n" : "";
   const moduleStartLines = computeStartLines(ctx.module);
@@ -628,6 +640,44 @@ function arrowReadsLexicalThisPrivate(mangledSource: string): boolean {
       return;
     }
     // A nested `function`/class rebinds `this`; only nested arrows share the lexical one.
+    if (
+      n.type === "FunctionExpression" ||
+      n.type === "FunctionDeclaration" ||
+      n.type === "ClassExpression" ||
+      n.type === "ClassDeclaration"
+    ) {
+      return;
+    }
+    for (const k in n) {
+      if (k !== "start") walk(n[k]);
+    }
+  };
+  walk(node.body);
+  return found;
+}
+
+// True if `source` is an arrow that uses its lexical `this` at its own level (a member
+// access, brand check, or `this` itself — public OR private). Such an arrow can't be
+// reconstructed standalone: its `this` (the receiving instance) is baked in lexically. The
+// genuine-private ones are hosted; anything else (e.g. `() => this.x` reading a public
+// field) is rejected rather than emitted with an unbound `this`. Nested functions rebind
+// `this`, so they're not descended into.
+function arrowReadsLexicalThis(source: string): boolean {
+  const node = parseFunctionNode(source);
+  if (node?.type !== "ArrowFunctionExpression") return false;
+  const isLexicalThis = (n: any): boolean =>
+    n?.type === "ThisExpression" || (n?.type === "Identifier" && n.name === "exports");
+  let found = false;
+  const walk = (n: any): void => {
+    if (found || n === null || typeof n !== "object") return;
+    if ($isJSArray(n)) {
+      for (const c of n) walk(c);
+      return;
+    }
+    if (isLexicalThis(n)) {
+      found = true;
+      return;
+    }
     if (
       n.type === "FunctionExpression" ||
       n.type === "FunctionDeclaration" ||
@@ -1393,11 +1443,16 @@ function reconstructFunctionExpr(fn: Function, ctx: Context): ReconstructedFunct
     // wasn't hosted (its `this` class isn't genuine-reconstructable, or it captures more
     // than `this`/brands), it cannot be reconstructed — reject it instead of emitting
     // silently-broken output.
-    if (source.includes(PRIVATE_PREFIX) && !ctx.hostedArrows.has(fn) && arrowReadsLexicalThisPrivate(source)) {
+    if (!ctx.hostedArrows.has(fn) && arrowReadsLexicalThis(source)) {
+      const isPrivate = source.includes(PRIVATE_PREFIX) && arrowReadsLexicalThisPrivate(source);
       throw new TypeError(
-        "Cannot serialize an arrow function that reads a #private field through its lexical `this`: " +
-          "the receiving instance cannot be recovered. Capture the value first, e.g. " +
-          "`const v = this.#x; return () => v;`.",
+        isPrivate
+          ? "Cannot serialize an arrow function that reads a #private field through its lexical `this`: " +
+            "the receiving instance cannot be recovered. Capture the value first, e.g. " +
+            "`const v = this.#x; return () => v;`."
+          : "Cannot serialize an arrow function that reads its lexical `this`: " +
+            "the receiving instance is baked in lexically and cannot be recovered. Capture the value " +
+            "first, e.g. `const x = this.x; return () => x;`.",
       );
     }
   }
@@ -1980,9 +2035,13 @@ function emitGenuinePrivateInstance(value: object, name: string, ctx: Context): 
       }
     }
     const valsName = REF_PREFIX + ctx.counter++;
-    ctx.module.push(`const ${valsName} = { ${entries.join(", ")} };`);
+    // Deferred to the end of the prelude: a private value can reference a binding declared
+    // after this instance (e.g. a hosted arrow stored in this very instance's own private
+    // slot). The bare instance is already emitted, so identity/cycles resolve; running the
+    // patch last guarantees every referenced binding exists.
+    ctx.deferredPatches.push(`const ${valsName} = { ${entries.join(", ")} };`);
     for (const c of patchClasses) {
-      ctx.module.push(`${emitValue(c, ctx)}.prototype.${PATCH_METHOD}.call(${name}, ${valsName});`);
+      ctx.deferredPatches.push(`${emitValue(c, ctx)}.prototype.${PATCH_METHOD}.call(${name}, ${valsName});`);
     }
   }
   emitOwnProperties(name, value, ctx, builtinSkip);
@@ -2854,6 +2913,7 @@ async function bundle(fn: Function, replacer?: Replacer): Promise<string> {
     classReify: new Map(),
     genuineClassId: new Map(),
     needsReifySlot: false,
+    deferredPatches: [],
   };
   // 2. Recover the closure module's import bindings: localName → original source.
   type Binding = { source: string; imported?: string; default?: boolean; star?: boolean };
@@ -2903,6 +2963,9 @@ async function bundle(fn: Function, replacer?: Replacer): Promise<string> {
     const value = transform(undefined, variable.name, variable.value, ctx);
     stateExports.push(`export const ${variable.name} = ${emitValue(value, ctx)};`);
   }
+  // Genuine-instance private patches run last (see the serialize() path), after every
+  // hoisted binding a private slot may point at has been declared.
+  for (const line of ctx.deferredPatches) ctx.module.push(line);
   const reifyBlock = ctx.needsReifySlot ? `let ${REIFY_SLOT} = false;\n` : "";
   const stateModule = reifyBlock + (ctx.module.length ? ctx.module.join("\n") + "\n" : "") + stateExports.join("\n");
 

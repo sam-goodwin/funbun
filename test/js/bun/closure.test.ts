@@ -4523,6 +4523,66 @@ describe("genuine #private reification", () => {
     const out = (await roundtrip(() => f))();
     expect(out()).toBe(8);
   });
+
+  // Regression: a hosted arrow stored in its OWN instance's private slot. The instance's
+  // patch object references the hosted arrow, but the arrow's `const` is obtained FROM that
+  // same instance (`inst.__host()`), so it's declared after the bare instance. The patch is
+  // deferred to the end of the prelude so it never references the arrow before its binding
+  // exists (a temporal-dead-zone crash before the fix).
+  test("a hosted arrow stored in its own instance's private field round-trips", async () => {
+    class D {
+      #x: number;
+      #fn: () => number;
+      constructor(v: number) {
+        this.#x = v;
+        this.#fn = () => this.#x; // arrow captured into this very instance's private slot
+      }
+      get() {
+        return this.#fn;
+      }
+    }
+    const f = new D(77).get();
+    void f;
+    const out = (await roundtrip(() => f))();
+    expect(out()).toBe(77); // the reified arrow reads the genuine #x off the reified instance
+  });
+
+  // An escaped arrow that reads a PUBLIC field through its lexical `this` is not hosted
+  // (hosting only triggers for #private reads). Its `this` is baked in lexically and cannot
+  // be recovered, so reconstructing it standalone would emit a `this.x` off an unbound
+  // `this`. Reject clearly at serialize time rather than emit silently-broken output.
+  test("an escaped arrow reading a public field through lexical this is rejected clearly", () => {
+    class C {
+      x: number;
+      constructor(v: number) {
+        this.x = v;
+      }
+      make() {
+        return () => this.x;
+      }
+    }
+    const f = new C(42).make();
+    void f;
+    expect(() => serialize(() => f)).toThrow(/reads its lexical `this`/);
+  });
+
+  // Capturing the public value first sidesteps the lexical-`this` problem and round-trips.
+  test("capturing the public value first round-trips", async () => {
+    class C {
+      x: number;
+      constructor(v: number) {
+        this.x = v;
+      }
+      make() {
+        const x = this.x; // capture the value, not `this`
+        return () => x;
+      }
+    }
+    const f = new C(42).make();
+    void f;
+    const out = (await roundtrip(() => f))();
+    expect(out()).toBe(42);
+  });
 });
 
 // Generality: genuine privates must hold across arity (any number/order of fields), depth
