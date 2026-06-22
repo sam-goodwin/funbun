@@ -172,7 +172,25 @@ function serialize(fn: Function, replacer?: Replacer): string {
   if (typeof fn !== "function") {
     throw new TypeError("serialize() expects a function");
   }
+  // The whole pipeline — the analysis pre-passes AND the emission — walks the captured graph
+  // recursively, so a deep chain (a long linked list, or a wide graph with a long acyclic
+  // emission path) overflows the JS stack. Surface a clear, catchable serializer error rather
+  // than leaking a bare RangeError. (No user code runs during the walk, so a stack-overflow
+  // RangeError here is unambiguously ours.)
+  try {
+    return serializeImpl(fn, replacer);
+  } catch (e) {
+    if (e instanceof RangeError && /call stack/i.test(e.message)) {
+      throw new TypeError(
+        "Cannot serialize: the captured object graph is too deeply nested (the reconstruction " +
+          "exceeded the call-stack limit). Flatten the graph or reduce its depth.",
+      );
+    }
+    throw e;
+  }
+}
 
+function serializeImpl(fn: Function, replacer?: Replacer): string {
   const { sharedIds, cellInfo } = analyzeSharedCells(fn);
   // Start the generated-ref counter past any `__bunClosure$N` already present as a
   // free-variable name, so re-serializing already-serialized output (whose
@@ -223,9 +241,8 @@ function serialize(fn: Function, replacer?: Replacer): string {
     ctx.module.push(`${cell.kind} ${cell.name} = ${emitValue(value, ctx)};`);
   }
 
-  // A bound or native root is emitted via the value path (bound → .bind(...),
-  // native → its global path) and exported by reference; otherwise reconstruct
-  // it inline.
+  // A bound or native root is emitted via the value path (bound → .bind(...), native → its
+  // global path) and exported by reference; otherwise reconstruct it inline.
   let exportExpr: string;
   let exportReconstructed: ReconstructedFunction | undefined;
   if ((fn as any)[Symbol.boundFunction] !== undefined || isNativeFunctionSource(fn.toString())) {
@@ -1677,13 +1694,22 @@ function reconstructFunctionExpr(fn: Function, ctx: Context): ReconstructedFunct
 // IS reliable: find a prototype method that is locatable in `source`, and subtract that
 // method's line offset within `source` from its true file line. Returns undefined if no
 // usable method is found (the class then simply isn't source-mapped).
-function classSourceAnchor(fn: Function, source: string): { url: string; line: number; column: number } | undefined {
+function classSourceAnchor(
+  fn: Function,
+  source: string,
+): { url: string; line: number; column: number; endLine?: number } | undefined {
   const parsed = parseWithOffset(source);
   if (parsed === null) return undefined;
   const members = parsed.node.body?.body;
   if (!$isJSArray(members)) return undefined;
   const proto = fn.prototype;
   if (proto == null) return undefined;
+  let anchor: { url: string; line: number; column: number } | undefined;
+  // The class's last original line, for the source-map clamp (see buildSourceMap): the max of
+  // its methods' file end lines. Like a function's endLine, this stops a compact (e.g.
+  // single-line) class — which toString() reprints onto more lines than it spans — from
+  // mapping body lines past the definition.
+  let endLine = 0;
   for (const m of members) {
     if (m.type !== "MethodDefinition" || m.static === true) continue;
     const key = m.key?.value;
@@ -1691,8 +1717,12 @@ function classSourceAnchor(fn: Function, source: string): { url: string; line: n
     if (typeof m.value?.start !== "number") continue;
     const d = Object.getOwnPropertyDescriptor(proto, key);
     const method = d?.value ?? d?.get ?? d?.set;
-    const loc = (method as any)?.[Symbol.sourceLocation] as { url?: string; line?: number } | undefined;
+    const loc = (method as any)?.[Symbol.sourceLocation] as
+      | { url?: string; line?: number; endLine?: number }
+      | undefined;
     if (!loc?.url || typeof loc.line !== "number") continue;
+    if (typeof loc.endLine === "number" && loc.endLine > endLine) endLine = loc.endLine;
+    if (anchor !== undefined) continue;
     const posInSource = m.value.start - parsed.offset; // the method's params `(`
     if (posInSource < 0 || posInSource > source.length) continue;
     let rel = 0;
@@ -1703,9 +1733,10 @@ function classSourceAnchor(fn: Function, source: string): { url: string; line: n
     // file span and `line` goes <= 0 — an unreliable anchor. Skip mapping rather than emit a
     // bogus (or crashing) map; the function still reconstructs, it just isn't stack-mapped.
     if (line < 1) continue;
-    return { url: loc.url, line, column: 1 };
+    anchor = { url: loc.url, line, column: 1 };
   }
-  return undefined;
+  if (anchor === undefined) return undefined;
+  return { ...anchor, endLine: endLine >= anchor.line ? endLine : undefined };
 }
 
 // True if the AST contains any `Unsupported` node — ast() surfaces some constructs (yield*,
@@ -2727,6 +2758,20 @@ function emitFunction(fn: Function, ctx: Context): string {
   // the offset within the expression.
   ctx.module.push(`const ${name} = ${reconstructed.expr};`);
   recordSourceBlock(ctx, ctx.module.length - 1, reconstructed);
+  // A function's `.name` is non-enumerable, so emitOwnProperties skips it — but the live name
+  // can differ from what the reconstructed source produces: overridden via defineProperty
+  // (`name` was reassigned), or inferred from an assignment for an anonymous arrow/function
+  // (`const f = () => {}` → `.name === "f"`, but the standalone reconstruction has no name).
+  // When it differs from the source's declared id, restore it explicitly (matching the spec's
+  // name descriptor: writable:false, enumerable:false, configurable:true).
+  if (typeof fn.name === "string" && fn.name !== "") {
+    const declaredName = parseFunctionNode(reconstructed.source)?.id?.name;
+    if (fn.name !== declaredName) {
+      ctx.module.push(
+        `Object.defineProperty(${name}, "name", { value: ${JSON.stringify(fn.name)}, writable: false, enumerable: false, configurable: true });`,
+      );
+    }
+  }
   // A genuine-private class needs a reify factory: set the module-level flag, construct a
   // BARE instance (the constructor's reify branch skips the original body), then clear the
   // flag. Privates are installed afterward by the patch method (see emitGenuinePrivateInstance)

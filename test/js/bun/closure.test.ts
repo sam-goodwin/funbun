@@ -644,19 +644,14 @@ describe("source maps: emitted inline map is decode-correct", () => {
     for (const sl of srcLines) expect(sl).toBeGreaterThanOrEqual(0);
   });
 
-  // DOCUMENTED LIMITATION (crash-safe, fidelity-only). `fn.toString()` REPRINTS the
-  // captured source from the AST, so a definition written on FEWER lines than its canonical
-  // form (e.g. a one-line `function f(){const a=1;return a;}`) is emitted across MORE
+  // `fn.toString()` REPRINTS the captured source from the AST, so a definition written on
+  // FEWER lines than its canonical form (e.g. a one-line function/class) is emitted across MORE
   // generated lines than the original spans. buildSourceMap maps generated body line `k` to
-  // original line `defLine + k` (closure.ts, the `block.line - 1 + k` distribution), which
-  // then walks PAST the definition onto unrelated later statements (or past EOF). The
-  // negative-line case is already clamped (no crash); the positive over-run mis-points stack
-  // lines for compact-source definitions only. A faithful fix needs the definition's original
-  // END line (e.g. `executable->lastLine()` exposed natively) to clamp the per-line walk —
-  // straightforward for functions, but classes derive their anchor from a method, so a
-  // complete fix is deferred. Workaround: none needed at runtime; stack traces still land in
-  // the right FILE, only the line can be off for single-line definitions.
-  test("a compact single-line definition maps every generated line to its definition line", () => {
+  // `defLine + k`, which would walk PAST the definition onto unrelated later lines — so it's
+  // CLAMPED to the definition's original end line (Symbol.sourceLocation.endLine for functions;
+  // the max method end line for classes). Every generated line of a single-line definition
+  // therefore maps back to its one source line.
+  test("a compact single-line function maps every generated line to its definition line", () => {
     // prettier-ignore
     function f(){const a=1;const b=2;return a+b;} // entire function on ONE source line
     const loc = (f as any)[Symbol.sourceLocation];
@@ -666,9 +661,24 @@ describe("source maps: emitted inline map is decode-correct", () => {
       .flat()
       .filter(s => s.srcIdx === srcIdx)
       .map(s => s.srcLine);
-    // Ideal: since the whole definition is on one source line, every generated line of it
-    // maps back to that single line. Today they walk forward (loc.line-1, loc.line, ...).
     for (const sl of srcLines) expect(sl).toBe(loc.line - 1);
+  });
+
+  test("a compact single-line class does not over-run its source map", () => {
+    // prettier-ignore
+    class K { go(){ return 1 } probe(){ return 2 } } // entire class on ONE source line
+    const defLine = (K.prototype.go as any)[Symbol.sourceLocation].line; // the class's line
+    const i = new K();
+    void i;
+    const { json, decoded } = decodeInlineMap(serialize(() => i));
+    const srcIdx = json.sources.findIndex((s: string) => s.includes("closure.test"));
+    const srcLines = decoded
+      .flat()
+      .filter(s => s.srcIdx === srcIdx)
+      .map(s => s.srcLine);
+    expect(srcLines.length).toBeGreaterThan(0);
+    // No generated line maps past the (single) definition line — the clamp holds.
+    for (const sl of srcLines) expect(sl).toBeLessThanOrEqual(defLine - 1);
   });
 
   // --- Indirection: the same edge cases explored for ALS, applied to maps. ---
@@ -6854,7 +6864,7 @@ describe("adversarial regressions: round 3", () => {
     expect(out.name).toBe("inner");
     expect(out()).toBe("inner"); // self-reference resolves to the named function, not a ref
   });
-  test.failing("a function with a defineProperty-overridden name preserves it", async () => {
+  test("a function with a defineProperty-overridden name preserves it", async () => {
     function f1() {
       return 1;
     }
@@ -7004,5 +7014,14 @@ describe("adversarial regressions: round 4", () => {
     const out = (await roundtrip(() => i))() as any;
     expect(Object.isFrozen(Object.getPrototypeOf(out))).toBe(true);
     expect(out.m()).toBe(1);
+  });
+
+  // BUG2: the emission is recursive, so a graph whose longest emission chain is very long
+  // (a deep linked list, or a wide graph with a long acyclic path) overflows the JS stack.
+  // That surfaces as a clear, catchable serializer error rather than a bare RangeError.
+  test("a too-deeply-nested graph throws a clear serializer error, not a raw RangeError", () => {
+    let head: any = { v: 0 };
+    for (let i = 1; i < 60000; i++) head = { v: i, next: head };
+    expect(() => serialize(() => head)).toThrow(/too deeply nested/);
   });
 });
