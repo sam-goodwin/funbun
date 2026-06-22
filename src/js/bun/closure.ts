@@ -143,6 +143,11 @@ interface Context {
   // (an iterative post-order, so a deep capture chain doesn't overflow), and uses this to know
   // which are already done.
   emittedFns: Set<Function>;
+  // Functions whose body is mid-emission (expanded in the post-order but not yet finished),
+  // shared across nested emitFunction calls. Emitting a function's own property can hold a
+  // function that captures the host back (`F.helper = () => F`), re-entering emitFunction; without
+  // a shared in-flight set the host would be re-expanded and double-declared.
+  inProgressFns: Set<Function>;
 }
 
 interface SourceBlock {
@@ -234,6 +239,7 @@ function serializeImpl(fn: Function, replacer?: Replacer): string {
     deferredPatches: [],
     bodyQueue: [],
     emittedFns: new Set(),
+    inProgressFns: new Set(),
   };
 
   // Emit shared cells at module scope (deduped by id) before any function that
@@ -256,10 +262,16 @@ function serializeImpl(fn: Function, replacer?: Replacer): string {
   }
 
   // A bound or native root is emitted via the value path (bound → .bind(...), native → its
-  // global path) and exported by reference; otherwise reconstruct it inline.
+  // global path) and exported by reference; a hostable escaped `#private` arrow is emitted via
+  // its host method on the reified receiver (emitFunction) — reconstructFunctionExpr has no
+  // hosting branch and would emit `this.#x` off an unbound `this`. Otherwise reconstruct inline.
   let exportExpr: string;
   let exportReconstructed: ReconstructedFunction | undefined;
-  if ((fn as any)[Symbol.boundFunction] !== undefined || isNativeFunctionSource(fn.toString())) {
+  if (
+    (fn as any)[Symbol.boundFunction] !== undefined ||
+    ctx.hostedArrows.has(fn) ||
+    isNativeFunctionSource(fn.toString())
+  ) {
     exportExpr = emitFunction(fn, ctx);
   } else {
     exportReconstructed = reconstructFunctionExpr(fn, ctx);
@@ -466,6 +478,28 @@ function computeStartLines(module: string[]): number[] {
   return starts;
 }
 
+// Visits a Map's keys+values / a Set's elements via the BASE iterator (never a user override),
+// for the analysis graph walks. Map/Set CONTENTS are reconstructed at emit time, so the analysis
+// pre-passes must see them too — otherwise a value reachable ONLY through a Map/Set (a genuine
+// #private instance, a hostable escaped arrow) is invisible to genuine-class / hosted-arrow /
+// keep-set planning (privacy silently downgraded to mangling; a hostable arrow wrongly rejected).
+function forEachMapSetEntry(o: object, visit: (v: unknown) => void): void {
+  // `instanceof` is necessary but not sufficient: a Map/Set SUBCLASS's `.prototype` object is
+  // `instanceof Map`/`Set` yet has no internal [[MapData]]/[[SetData]] slot (the analysis walks
+  // prototypes), so the base iterator throws on it. Guard with try/catch — a non-real receiver
+  // simply has no entries to walk.
+  try {
+    if (o instanceof Map) {
+      for (const entry of Map.prototype.entries.$call(o as Map<unknown, unknown>)) {
+        visit(entry[0]);
+        visit(entry[1]);
+      }
+    } else if (o instanceof Set) {
+      for (const el of Set.prototype.values.$call(o as Set<unknown>)) visit(el);
+    }
+  } catch {}
+}
+
 // Walks the function graph reachable from `root` and finds cells referenced by
 // more than one function — those must share a single binding.
 function analyzeSharedCells(root: Function): { sharedIds: Set<number>; cellInfo: Map<number, FreeVariable> } {
@@ -537,6 +571,7 @@ function analyzeSharedCells(root: Function): { sharedIds: Set<number>; cellInfo:
     }
     const privateFields = (o as any)[Symbol.privateFields] as Array<{ value: unknown }> | undefined;
     if (privateFields) for (const field of privateFields) enqueue(field.value);
+    forEachMapSetEntry(o, enqueue);
   }
   function processFn(fn: Function): void {
     if (seenFns.has(fn)) return;
@@ -1005,6 +1040,7 @@ function computeGenuineClasses(root: unknown, sharedIdsArg?: Set<number>): Genui
         // DATA fields (accessors/methods excluded) for any object, so this is safe.
         const pf = (v as any)[Symbol.privateFields] as Array<{ name: string; value: unknown }> | undefined;
         if (pf) for (const f of pf) push(f.value);
+        forEachMapSetEntry(v as object, push);
       }
       // Own DATA properties only — reading an accessor could fire a getter (side effect).
       for (const key of Reflect.ownKeys(v as object)) {
@@ -1527,6 +1563,7 @@ function computeKeepSets(root: Function): Map<object, Set<string> | "all"> {
       const ctor = (proto as any).constructor;
       enqueueFns(typeof ctor === "function" && ctor.prototype === proto ? ctor : proto);
     }
+    forEachMapSetEntry(obj, enqueueFns);
   }
 
   function processFn(fn: Function): void {
@@ -2621,8 +2658,13 @@ function emitBuiltin(value: object, name: string, ctx: Context): { proto: object
       proto: Map.prototype,
       body: () => {
         for (const entry of Map.prototype.entries.$call(value as Map<unknown, unknown>)) {
-          ctx.module.push(`Map.prototype.set.call(${name}, ${emitValue(entry[0], ctx)}, ${emitValue(entry[1], ctx)});`);
+          const k = emitValue(transform(value, "", entry[0], ctx), ctx);
+          const v = emitValue(transform(value, "", entry[1], ctx), ctx);
+          ctx.module.push(`Map.prototype.set.call(${name}, ${k}, ${v});`);
         }
+        // A plain Map can also carry extra own properties (`m.meta = ...`); a subclass's go
+        // through restoreSubclass, so only emit them here when the prototype is the natural one.
+        if (Object.getPrototypeOf(value) === Map.prototype) emitOwnProperties(name, value, ctx);
       },
     };
   }
@@ -2632,8 +2674,9 @@ function emitBuiltin(value: object, name: string, ctx: Context): { proto: object
       proto: Set.prototype,
       body: () => {
         for (const element of Set.prototype.values.$call(value as Set<unknown>)) {
-          ctx.module.push(`Set.prototype.add.call(${name}, ${emitValue(element, ctx)});`);
+          ctx.module.push(`Set.prototype.add.call(${name}, ${emitValue(transform(value, "", element, ctx), ctx)});`);
         }
+        if (Object.getPrototypeOf(value) === Set.prototype) emitOwnProperties(name, value, ctx);
       },
     };
   }
@@ -2666,7 +2709,21 @@ function emitBuiltin(value: object, name: string, ctx: Context): { proto: object
           : `const ${name} = new ${view.constructor.name}(${bufferExpr}, ${view.byteOffset}, ${view.length});`,
       );
     }
-    return { proto: Object.getPrototypeOf(value), body: NOOP_BODY };
+    return {
+      proto: Object.getPrototypeOf(value),
+      // Typed arrays / DataView aren't subclass-restored (the live prototype is returned), so
+      // emit any extra own properties here. Skip a typed array's integer-index elements (already
+      // materialized via the shared buffer); a DataView has none.
+      body: () => {
+        let skip: Set<string> | undefined;
+        if (!(value instanceof DataView)) {
+          skip = new Set<string>();
+          const len = (value as ArrayBufferView & { length: number }).length;
+          for (let i = 0; i < len; i++) skip.add(String(i));
+        }
+        emitOwnProperties(name, value, ctx, skip);
+      },
+    };
   }
   if (
     value instanceof ArrayBuffer ||
@@ -2680,20 +2737,32 @@ function emitBuiltin(value: object, name: string, ctx: Context): { proto: object
     const resizeOpts = ab.resizable === true || ab.growable === true ? `, { maxByteLength: ${ab.maxByteLength} }` : "";
     ctx.module.push(`const ${name} = new ${ctor}(${(value as ArrayBufferLike).byteLength}${resizeOpts});`);
     if (bytes.some(b => b !== 0)) ctx.module.push(`new Uint8Array(${name}).set([${bytes.join(", ")}]);`);
-    return { proto: Object.getPrototypeOf(value), body: NOOP_BODY };
+    // Not subclass-restored (live prototype returned) — emit extra own props here.
+    return { proto: Object.getPrototypeOf(value), body: () => emitOwnProperties(name, value, ctx) };
   }
-  // Boxed primitives (new Number/String/Boolean) — objects wrapping a primitive.
+  // Boxed primitives (new Number/String/Boolean) — objects wrapping a primitive. Extra own props
+  // are restored here for the natural-prototype case (a subclass goes through restoreSubclass).
   if (value instanceof Number) {
     ctx.module.push(`const ${name} = new Number(${serializeNumber((value as Number).valueOf())});`);
-    return { proto: Number.prototype, body: NOOP_BODY };
+    return { proto: Number.prototype, body: () => emitBuiltinOwnProps(name, value, ctx, Number.prototype) };
   }
   if (value instanceof String) {
     ctx.module.push(`const ${name} = new String(${JSON.stringify((value as String).valueOf())});`);
-    return { proto: String.prototype, body: NOOP_BODY };
+    return {
+      proto: String.prototype,
+      body: () => {
+        if (Object.getPrototypeOf(value) !== String.prototype) return;
+        // A boxed String's own keys are its index chars + `length` (all intrinsic) — skip them.
+        const skip = new Set<string>(["length"]);
+        const len = (value as String).length;
+        for (let i = 0; i < len; i++) skip.add(String(i));
+        emitOwnProperties(name, value, ctx, skip);
+      },
+    };
   }
   if (value instanceof Boolean) {
     ctx.module.push(`const ${name} = new Boolean(${(value as Boolean).valueOf()});`);
-    return { proto: Boolean.prototype, body: NOOP_BODY };
+    return { proto: Boolean.prototype, body: () => emitBuiltinOwnProps(name, value, ctx, Boolean.prototype) };
   }
   // A WeakRef snapshots its live referent. If already collected at serialize
   // time, emit a WeakRef to a fresh (immediately collectable) object — best
@@ -2701,7 +2770,7 @@ function emitBuiltin(value: object, name: string, ctx: Context): { proto: object
   if (value instanceof WeakRef) {
     const target = (value as WeakRef<any>).deref();
     ctx.module.push(`const ${name} = new WeakRef(${target === undefined ? "{}" : emitValue(target, ctx)});`);
-    return { proto: WeakRef.prototype, body: NOOP_BODY };
+    return { proto: WeakRef.prototype, body: () => emitBuiltinOwnProps(name, value, ctx, WeakRef.prototype) };
   }
   // WeakMap / WeakSet entries aren't JS-enumerable, but their live entries can be
   // snapshotted natively. Reconstruct as a fresh weak collection with those
@@ -2716,6 +2785,7 @@ function emitBuiltin(value: object, name: string, ctx: Context): { proto: object
         for (let i = 0; i + 1 < snap.length; i += 2) {
           ctx.module.push(`${name}.set(${emitValue(snap[i], ctx)}, ${emitValue(snap[i + 1], ctx)});`);
         }
+        emitBuiltinOwnProps(name, value, ctx, WeakMap.prototype);
       },
     };
   }
@@ -2726,6 +2796,7 @@ function emitBuiltin(value: object, name: string, ctx: Context): { proto: object
       body: () => {
         const snap = $weakCollectionSnapshot(value); // [k, k, ...]
         for (const element of snap) ctx.module.push(`${name}.add(${emitValue(element, ctx)});`);
+        emitBuiltinOwnProps(name, value, ctx, WeakSet.prototype);
       },
     };
   }
@@ -2746,6 +2817,7 @@ function emitBuiltin(value: object, name: string, ctx: Context): { proto: object
           const tokenArg = token === undefined ? "" : `, ${emitValue(token, ctx)}`;
           ctx.module.push(`${name}.register(${emitValue(flat[i], ctx)}, ${emitValue(flat[i + 1], ctx)}${tokenArg});`);
         }
+        emitBuiltinOwnProps(name, value, ctx, FinalizationRegistry.prototype);
       },
     };
   }
@@ -2754,6 +2826,13 @@ function emitBuiltin(value: object, name: string, ctx: Context): { proto: object
 
 // A shared no-op body for builtins with no deferred content (their declaration is complete).
 const NOOP_BODY = (): void => {};
+
+// Emits a builtin's extra own properties (`m.meta = ...`, symbol keys, non-enumerable props) —
+// but only when its prototype is the natural one. A subclass instance has those restored by
+// restoreSubclass instead, so emitting here too would double-emit.
+function emitBuiltinOwnProps(name: string, value: object, ctx: Context, naturalProto: object): void {
+  if (Object.getPrototypeOf(value) === naturalProto) emitOwnProperties(name, value, ctx);
+}
 
 // Known builtin Error constructors, in priority order (most specific first).
 const ERROR_BASES = [
@@ -2887,28 +2966,29 @@ function emitFunction(fn: Function, ctx: Context): string {
   if (cached !== undefined) return cached;
 
   const stack: Array<{ fn: Function; expanded: boolean }> = [{ fn, expanded: false }];
-  const inProgress = new Set<Function>();
   while (stack.length > 0) {
     const frame = stack[stack.length - 1];
     const f = frame.fn;
     if (ctx.emittedFns.has(f)) {
       stack.pop();
-      inProgress.delete(f);
       continue;
     }
     if (!frame.expanded) {
       frame.expanded = true;
-      inProgress.add(f);
+      ctx.inProgressFns.add(f);
       if (!ctx.refs.has(f)) ctx.refs.set(f, REF_PREFIX + ctx.counter++);
-      // Push captured-function dependencies so they're emitted (post-order) before `f`.
+      // Push captured-function dependencies so they're emitted (post-order) before `f`. Skip any
+      // already emitted or already in-flight — a back-edge through an own property
+      // (`F.helper = () => F`) re-enters here while F is mid-emission, and must resolve to F's ref
+      // (the early-return above) rather than re-expand and double-declare it.
       for (const dep of capturedFunctions(f, ctx)) {
-        if (!ctx.emittedFns.has(dep) && !inProgress.has(dep)) stack.push({ fn: dep, expanded: false });
+        if (!ctx.emittedFns.has(dep) && !ctx.inProgressFns.has(dep)) stack.push({ fn: dep, expanded: false });
       }
     } else {
       stack.pop();
-      inProgress.delete(f);
       emitFunctionContent(f, ctx.refs.get(f)!, ctx);
       ctx.emittedFns.add(f);
+      ctx.inProgressFns.delete(f);
     }
   }
   return ctx.refs.get(fn)!;
@@ -3458,6 +3538,7 @@ async function bundle(fn: Function, replacer?: Replacer): Promise<string> {
     deferredPatches: [],
     bodyQueue: [],
     emittedFns: new Set(),
+    inProgressFns: new Set(),
   };
   // 2. Recover the closure module's import bindings: localName → original source.
   type Binding = { source: string; imported?: string; default?: boolean; star?: boolean };

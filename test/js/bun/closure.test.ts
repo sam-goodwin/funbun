@@ -7090,3 +7090,110 @@ describe("adversarial regressions: round 4", () => {
     expect(out()).toBe(0); // calling through all N levels reaches the base
   });
 });
+
+// Round-4 subagent campaign findings (post iterative-emission refactor).
+describe("adversarial regressions: round 4", () => {
+  // An own property holding a function that captures the host back (`F.helper = () => F`) used
+  // to double-declare the host (the post-order in-progress guard was per-call, not shared) →
+  // `SyntaxError: already declared` at import.
+  test("a function whose own property captures it back round-trips (no double-declare)", async () => {
+    function F() {
+      return 1;
+    }
+    (F as any).helper = () => F;
+    const out = (await roundtrip(() => F))() as any;
+    expect(out()).toBe(1);
+    expect(out.helper()).toBe(out); // the back-capture resolves to the one reconstructed F
+  });
+
+  test("a class with a static factory capturing itself round-trips", async () => {
+    class C {
+      static make = () => new C();
+      tag() {
+        return "c";
+      }
+    }
+    const out = (await roundtrip(() => C))() as any;
+    expect(out.make().tag()).toBe("c");
+  });
+
+  // Extra own properties on a plain built-in captured by reference were dropped (only Date/RegExp
+  // /Error restored them) — Map/Set/typed-array/ArrayBuffer/boxed/Weak* now restore them too.
+  test("extra own properties on a captured Map / typed array / boxed primitive round-trip", async () => {
+    const m: any = new Map([["a", 1]]);
+    m.meta = "x";
+    const ta: any = new Uint8Array([1, 2, 3]);
+    ta.label = "t";
+    const n: any = new Number(42);
+    n.tag = "num";
+    const out = (await roundtrip(() => ({ m, ta, n })))() as any;
+    expect(out.m.get("a")).toBe(1);
+    expect(out.m.meta).toBe("x");
+    expect(out.ta[0]).toBe(1);
+    expect(out.ta.label).toBe("t");
+    expect(out.n.valueOf()).toBe(42);
+    expect(out.n.tag).toBe("num");
+  });
+
+  // The replacer was applied to array/object entries but bypassed for plain Map/Set entries
+  // (only the genuine-subclass path honored it).
+  test("the replacer is applied to plain Map values and Set elements", async () => {
+    const m = new Map([["x", 2]]);
+    const s = new Set([5, 6]);
+    const code = serialize(() => ({ m, s }), (_k, v) => (typeof v === "number" ? v * 100 : v));
+    using dir = tempDir("closure-r4-replacer", { "mod.mjs": code });
+    const out = ((await import(`${String(dir)}/mod.mjs`)).default as any)();
+    expect(out.m.get("x")).toBe(200);
+    expect([...out.s].sort((a: number, b: number) => a - b)).toEqual([500, 600]);
+  });
+
+  // A hostable escaped `#private` arrow as the SERIALIZATION ROOT was emitted with an unbound
+  // `this` (the root routes through reconstructFunctionExpr, which has no hosting branch).
+  test("a hostable #private arrow as the serialization root is hosted", async () => {
+    class Counter {
+      #n = 5;
+      reader() {
+        return () => this.#n;
+      }
+    }
+    const c = new Counter();
+    const arrow = c.reader();
+    void arrow;
+    const out = (await roundtrip(arrow))();
+    expect(out).toBe(5);
+  });
+
+  // Values reachable ONLY through a Map/Set key/value were invisible to the analysis pre-passes,
+  // so a genuine #private instance behind a Map was silently downgraded to public mangling
+  // (privacy lost), and a hostable arrow behind a Map was wrongly rejected.
+  test("a genuine #private instance reachable only through a Map keeps real privacy", async () => {
+    class Secret {
+      #pw = "hunter2";
+      check(x: string) {
+        return x === this.#pw;
+      }
+    }
+    const s = new Secret();
+    const m = new Map([["s", s]]);
+    void m;
+    const out = (await roundtrip(() => ({ m })))() as any;
+    const rs = out.m.get("s");
+    expect(Object.keys(rs)).toEqual([]); // #pw is NOT a public own key (genuine private)
+    expect(rs.check("hunter2")).toBe(true);
+    expect(rs.check("nope")).toBe(false);
+  });
+
+  test("a hostable #private arrow reachable only through a Map round-trips", async () => {
+    class D {
+      #v = 99;
+      make() {
+        return () => this.#v;
+      }
+    }
+    const d = new D();
+    const m = new Map([["a", d.make()]]);
+    void [d, m];
+    const out = (await roundtrip(() => ({ d, m })))() as any;
+    expect(out.m.get("a")()).toBe(99);
+  });
+});
