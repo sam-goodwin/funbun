@@ -138,6 +138,11 @@ interface Context {
   // the heap (the queue), not the JS call stack, so an arbitrarily deep/wide graph serializes
   // without overflowing.
   bodyQueue: Array<() => void>;
+  // Functions whose declaration has actually been emitted (not just assigned a ref name).
+  // emitFunction emits a function's captured-function dependencies before the function itself
+  // (an iterative post-order, so a deep capture chain doesn't overflow), and uses this to know
+  // which are already done.
+  emittedFns: Set<Function>;
 }
 
 interface SourceBlock {
@@ -228,6 +233,7 @@ function serializeImpl(fn: Function, replacer?: Replacer): string {
     needsReifySlot: false,
     deferredPatches: [],
     bodyQueue: [],
+    emittedFns: new Set(),
   };
 
   // Emit shared cells at module scope (deduped by id) before any function that
@@ -1556,23 +1562,69 @@ function computeKeepSets(root: Function): Map<object, Set<string> | "all"> {
   return keepSets;
 }
 
-// Returns the set of functions that can reach themselves through the capture
-// graph (self-loops and longer cycles).
+// Returns the set of functions that can reach themselves through the capture graph (self-loops
+// and longer cycles) — exactly the nodes in a strongly-connected component of size ≥2, plus any
+// node with a self-edge. Iterative Tarjan SCC: O(V+E) (the old per-node DFS was O(V·E), minutes
+// on a large graph) and non-recursive (a deep capture chain can't overflow it).
 function findCyclicFunctions(edges: Map<Function, Set<Function>>): Set<Function> {
   const cyclic = new Set<Function>();
-  for (const start of edges.keys()) {
-    const stack = [...(edges.get(start) ?? [])];
-    const seen = new Set<Function>();
-    while (stack.length > 0) {
-      const node = stack.pop()!;
-      if (node === start) {
-        cyclic.add(start);
-        break;
+  const index = new Map<Function, number>();
+  const lowlink = new Map<Function, number>();
+  const onStack = new Set<Function>();
+  const sccStack: Function[] = [];
+  let counter = 0;
+
+  for (const root of edges.keys()) {
+    if (index.has(root)) continue;
+    // Each work frame is a node plus a cursor over its (graph-resident) neighbors. A leaf
+    // neighbor with no outgoing edges can't be on a cycle, so only nodes that are edge keys are
+    // descended into.
+    const work: Array<{ node: Function; neighbors: Function[]; i: number }> = [];
+    const begin = (n: Function): void => {
+      index.set(n, counter);
+      lowlink.set(n, counter);
+      counter++;
+      sccStack.push(n);
+      onStack.add(n);
+      work.push({ node: n, neighbors: [...(edges.get(n) ?? [])], i: 0 });
+    };
+    begin(root);
+
+    while (work.length > 0) {
+      const frame = work[work.length - 1];
+      if (frame.i < frame.neighbors.length) {
+        const w = frame.neighbors[frame.i++];
+        if (!edges.has(w)) continue; // leaf (no outgoing edges) — never on a cycle
+        if (!index.has(w)) {
+          begin(w);
+        } else if (onStack.has(w)) {
+          lowlink.set(frame.node, Math.min(lowlink.get(frame.node)!, index.get(w)!));
+        }
+        continue;
       }
-      if (seen.has(node)) continue;
-      seen.add(node);
-      const next = edges.get(node);
-      if (next) for (const f of next) stack.push(f);
+      // All neighbors explored: close out this node.
+      work.pop();
+      const node = frame.node;
+      if (lowlink.get(node) === index.get(node)) {
+        // Root of an SCC — pop it off the SCC stack.
+        const scc: Function[] = [];
+        let w: Function;
+        do {
+          w = sccStack.pop()!;
+          onStack.delete(w);
+          scc.push(w);
+        } while (w !== node);
+        if (scc.length >= 2) {
+          for (const f of scc) cyclic.add(f);
+        } else if (edges.get(node)?.has(node)) {
+          cyclic.add(node); // a lone node is cyclic only via a self-edge
+        }
+      }
+      // Propagate this node's lowlink up to its DFS parent.
+      if (work.length > 0) {
+        const parent = work[work.length - 1].node;
+        lowlink.set(parent, Math.min(lowlink.get(parent)!, lowlink.get(node)!));
+      }
     }
   }
   return cyclic;
@@ -2794,22 +2846,78 @@ interface BoundDetails {
   boundArgs: unknown[];
 }
 
-// NOTE: unlike emitObject, function emission is still RECURSIVE — reconstructFunctionExpr emits
-// a function's captured free-variable values inline (emitValue), so a chain of functions nested
-// tens-of-thousands deep through their captures (`f0` closes over `f1` closes over `f2` …)
-// recurses that deep and can overflow the stack. This is astronomically rare in real closures
-// (a deep DATA graph under a function own-property IS handled — emitValue defers objects), and
-// serialize()'s guard maps the overflow to a clear "too deeply nested" error. See the
-// `test.failing` "a deep chain of functions captured through each other" in the suite.
-// TODO: if this ever matters, convert this path to the same decl/body-worklist pattern emitObject
-// uses (emit the function declaration at discovery, defer its captures/own-props to ctx.bodyQueue).
+// The captured FUNCTIONS a function's reconstruction will emit inline (its free-var-function
+// values + a class's superclass) — i.e. the edges along which function emission would otherwise
+// recurse. Empty for the non-reconstruct paths (hosted/bound/native/genuine-method), which don't
+// chain deeply. emitFunction emits these before the function, iteratively, so a deep capture
+// chain doesn't overflow the stack.
+function capturedFunctions(fn: Function, ctx: Context): Function[] {
+  if (ctx.hostedArrows.has(fn)) return [];
+  if ((fn as any)[Symbol.boundFunction] !== undefined) return [];
+  if (ctx.genuineMethods.has(fn)) return [];
+  let source: string;
+  try {
+    source = fn.toString();
+  } catch {
+    return [];
+  }
+  if (isNativeFunctionSource(source)) return [];
+  const out: Function[] = [];
+  for (const v of allFreeVariables(fn, source)) {
+    if (typeof v.value === "function") out.push(v.value as Function);
+  }
+  const superclass = Object.getPrototypeOf(fn);
+  if (typeof superclass === "function" && superclass !== Function.prototype) out.push(superclass);
+  return out;
+}
+
+// Emits a function as `const <name> = ...`. Its captured FUNCTION dependencies (the edges along
+// which reconstruction recurses) are emitted FIRST, via an explicit post-order stack rather than
+// recursion — so a chain of functions nested arbitrarily deep through their captures serializes
+// without overflowing. A reference CYCLE among functions is hoisted to module scope beforehand,
+// so this dependency graph is acyclic (the in-progress guard is a belt-and-braces backstop). A
+// deep DATA graph under a function is already handled by emitObject's worklist.
 function emitFunction(fn: Function, ctx: Context): string {
-  const existing = ctx.refs.get(fn);
-  if (existing !== undefined) return existing;
+  // If a ref is already assigned, return it — even mid-emission. A self-reference / cycle (a
+  // self-referencing static field, or a hosted arrow held in its own instance's private slot)
+  // re-enters here while `fn`'s content is still being emitted; it must resolve to the ref, not
+  // start a second emission. (emittedFns — used only for the post-order dedup below — would not
+  // yet be set in that window.)
+  const cached = ctx.refs.get(fn);
+  if (cached !== undefined) return cached;
 
-  const name = REF_PREFIX + ctx.counter++;
-  ctx.refs.set(fn, name);
+  const stack: Array<{ fn: Function; expanded: boolean }> = [{ fn, expanded: false }];
+  const inProgress = new Set<Function>();
+  while (stack.length > 0) {
+    const frame = stack[stack.length - 1];
+    const f = frame.fn;
+    if (ctx.emittedFns.has(f)) {
+      stack.pop();
+      inProgress.delete(f);
+      continue;
+    }
+    if (!frame.expanded) {
+      frame.expanded = true;
+      inProgress.add(f);
+      if (!ctx.refs.has(f)) ctx.refs.set(f, REF_PREFIX + ctx.counter++);
+      // Push captured-function dependencies so they're emitted (post-order) before `f`.
+      for (const dep of capturedFunctions(f, ctx)) {
+        if (!ctx.emittedFns.has(dep) && !inProgress.has(dep)) stack.push({ fn: dep, expanded: false });
+      }
+    } else {
+      stack.pop();
+      inProgress.delete(f);
+      emitFunctionContent(f, ctx.refs.get(f)!, ctx);
+      ctx.emittedFns.add(f);
+    }
+  }
+  return ctx.refs.get(fn)!;
+}
 
+// Emits the body of one function (`name` already assigned). Its captured-function dependencies
+// are already emitted (emitFunction's post-order), so inline emitValue calls for them resolve to
+// refs without recursing.
+function emitFunctionContent(fn: Function, name: string, ctx: Context): void {
   // An escaped arrow that reads a `#private` through its lexical `this` is reconstructed by
   // invoking its host method on the reified receiver instance: the host (injected into the
   // genuine class body) returns a fresh arrow whose `this` is that instance, so `this.#x`
@@ -2819,7 +2927,7 @@ function emitFunction(fn: Function, ctx: Context): string {
     const instanceExpr = emitValue(hosted.instance, ctx);
     const argExprs = hosted.args.map(a => emitValue(transform(undefined, a.name, a.value, ctx), ctx));
     ctx.module.push(`const ${name} = ${instanceExpr}.${hosted.hostKey}(${argExprs.join(", ")});`);
-    return name;
+    return;
   }
 
   // Bound functions stringify as native code; reconstruct them from their
@@ -2834,7 +2942,7 @@ function emitFunction(fn: Function, ctx: Context): string {
     // A bound function can carry its own properties (`bf.extra = ...`); emit the enumerable
     // ones, like the from-source path does.
     emitOwnProperties(name, fn, ctx, undefined, true);
-    return name;
+    return;
   }
 
   // A method peeled off a genuine class — extracted as a value, or a bound function's
@@ -2849,7 +2957,7 @@ function emitFunction(fn: Function, ctx: Context): string {
     } else {
       ctx.module.push(`const ${name} = Object.getOwnPropertyDescriptor(${classRef}.prototype, ${keyExpr}).${gm.kind};`);
     }
-    return name;
+    return;
   }
 
   // A native built-in (Math.max, Array.prototype.slice, console.log, Error, ...)
@@ -2860,7 +2968,7 @@ function emitFunction(fn: Function, ctx: Context): string {
     const path = nativeFunctionPath(fn);
     if (path !== undefined) {
       ctx.module.push(`const ${name} = ${path};`);
-      return name;
+      return;
     }
   }
 
@@ -2927,7 +3035,7 @@ function emitFunction(fn: Function, ctx: Context): string {
   if (!Object.isExtensible(fn)) {
     emitNonExtensible(name, fn, ctx);
   }
-  return name;
+  return;
 }
 
 const PROTOTYPE_SKIP_KEYS = new Set(["constructor"]);
@@ -3349,6 +3457,7 @@ async function bundle(fn: Function, replacer?: Replacer): Promise<string> {
     needsReifySlot: false,
     deferredPatches: [],
     bodyQueue: [],
+    emittedFns: new Set(),
   };
   // 2. Recover the closure module's import bindings: localName → original source.
   type Binding = { source: string; imported?: string; default?: boolean; star?: boolean };
