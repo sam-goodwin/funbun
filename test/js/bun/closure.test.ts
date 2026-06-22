@@ -7288,4 +7288,30 @@ describe("adversarial regressions: round 5", () => {
     const out = (await roundtrip(f)) as any;
     expect(out()).toBe("eol=" + JSON.stringify(EOL));
   });
+
+  // Generator/iterator rejection is now keyed on the actual JSC cell type (native), not on
+  // Symbol.toStringTag — which userland can forge in either direction.
+  test("a plain object forging a Generator toStringTag is NOT falsely rejected", async () => {
+    const fake: any = { [Symbol.toStringTag]: "Generator", x: 1 };
+    const out = (await roundtrip(() => fake))() as any;
+    expect(out.x).toBe(1);
+    expect(out[Symbol.toStringTag]).toBe("Generator");
+  });
+
+  test("a real generator with its toStringTag stripped is still rejected", () => {
+    function* gen() {
+      yield 1;
+    }
+    const g: any = gen();
+    // Shadow the prototype's tag with an own `undefined` so `toString` no longer reports it.
+    Object.defineProperty(g, Symbol.toStringTag, { value: undefined, configurable: true });
+    expect(Object.prototype.toString.call(g)).toBe("[object Object]");
+    expect(() => serialize(() => g)).toThrow(/Cannot serialize a Generator object/);
+  });
+
+  test("a Map iterator is rejected with its precise native type label", () => {
+    const it = new Map([[1, 2]]).entries();
+    void it;
+    expect(() => serialize(() => it)).toThrow(/Cannot serialize a Map Iterator object/);
+  });
 });

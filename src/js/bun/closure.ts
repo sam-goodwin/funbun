@@ -2210,13 +2210,11 @@ function emitObject(value: object, ctx: Context): string {
   // state (the yield point and local frame) in engine slots that aren't reachable via reflection
   // and can't be expressed as source. Reject clearly instead of walking their native prototype
   // chain (which would throw an opaque "native function" error or silently emit a dead object).
-  // (Detected via Symbol.toStringTag — a real generator/iterator. There is no $is* intrinsic for
-  // these available here, so a plain object can in principle forge the tag and be falsely
-  // rejected; that is an exotic, low-severity false-negative on serializability, not corruption.)
-  const tag = objectToString.$call(value);
-  if (tag === "[object Generator]" || tag === "[object AsyncGenerator]" || tag.endsWith(" Iterator]")) {
+  // Detected by the actual JSC cell type (spoof-proof) — a forged Symbol.toStringTag can't fool it.
+  const unserializableTag = $bunClosureUnserializableTag(value);
+  if (unserializableTag !== undefined) {
     throw new TypeError(
-      `Cannot serialize a ${tag.slice("[object ".length, -1)} object ` +
+      `Cannot serialize a ${unserializableTag} object ` +
         `(its suspended execution state is not expressible as source). ` +
         `Serialize the generator function instead and re-create the iterator after reconstruction.`,
     );

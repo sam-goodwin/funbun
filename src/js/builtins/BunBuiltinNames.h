@@ -158,6 +158,7 @@ using namespace JSC;
     macro(pokePromiseAsHandled) \
     macro(port) \
     macro(finalizationRegistrySnapshot) \
+    macro(bunClosureUnserializableTag) \
     macro(resolveClosureBinding) \
     macro(weakCollectionSnapshot) \
     macro(post) \

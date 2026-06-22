@@ -199,6 +199,14 @@
 #include "EventLoopTask.h"
 #include "NodeModuleModule.h"
 #include <JavaScriptCore/JSCBytecodeCacheVersion.h>
+#include <JavaScriptCore/JSGenerator.h>
+#include <JavaScriptCore/JSAsyncGenerator.h>
+#include <JavaScriptCore/JSMapIterator.h>
+#include <JavaScriptCore/JSSetIterator.h>
+#include <JavaScriptCore/JSArrayIterator.h>
+#include <JavaScriptCore/JSStringIterator.h>
+#include <JavaScriptCore/JSRegExpStringIterator.h>
+#include <JavaScriptCore/JSIteratorHelper.h>
 #include "JSPerformanceServerTiming.h"
 #include "JSPerformanceResourceTiming.h"
 #include "JSPerformanceTiming.h"
@@ -3170,6 +3178,40 @@ JSC_DEFINE_HOST_FUNCTION(functionFinalizationRegistrySnapshot, (JSC::JSGlobalObj
     return JSC::JSValue::encode(result);
 }
 
+// Spoof-proof type check for the closure serializer: returns a human-readable label
+// ("Generator", "Map Iterator", ...) for objects holding suspended execution state that
+// cannot be expressed as source, or undefined for everything else. Uses the actual JSC
+// cell type (jsDynamicCast) rather than Symbol.toStringTag, which userland can forge.
+JSC_DEFINE_HOST_FUNCTION(functionBunClosureUnserializableTag, (JSC::JSGlobalObject * globalObject, JSC::CallFrame* callFrame))
+{
+    JSC::VM& vm = JSC::getVM(globalObject);
+    JSC::JSValue arg = callFrame->argument(0);
+    if (!arg.isCell())
+        return JSC::JSValue::encode(JSC::jsUndefined());
+
+    const char* label = nullptr;
+    if (dynamicDowncast<JSC::JSGenerator>(arg))
+        label = "Generator";
+    else if (dynamicDowncast<JSC::JSAsyncGenerator>(arg))
+        label = "AsyncGenerator";
+    else if (dynamicDowncast<JSC::JSMapIterator>(arg))
+        label = "Map Iterator";
+    else if (dynamicDowncast<JSC::JSSetIterator>(arg))
+        label = "Set Iterator";
+    else if (dynamicDowncast<JSC::JSArrayIterator>(arg))
+        label = "Array Iterator";
+    else if (dynamicDowncast<JSC::JSStringIterator>(arg))
+        label = "String Iterator";
+    else if (dynamicDowncast<JSC::JSRegExpStringIterator>(arg))
+        label = "RegExp String Iterator";
+    else if (dynamicDowncast<JSC::JSIteratorHelper>(arg))
+        label = "Iterator Helper";
+
+    if (!label)
+        return JSC::JSValue::encode(JSC::jsUndefined());
+    return JSC::JSValue::encode(JSC::jsString(vm, String::fromLatin1(label)));
+}
+
 JSC_DEFINE_CUSTOM_GETTER(functionFreeVariablesGetter, (JSC::JSGlobalObject * globalObject, JSC::EncodedJSValue thisValue, JSC::PropertyName))
 {
     JSC::VM& vm = JSC::getVM(globalObject);
@@ -3587,6 +3629,7 @@ void GlobalObject::addBuiltinGlobals(JSC::VM& vm)
         GlobalPropertyInfo(builtinNames.resolveClosureBindingPrivateName(), JSFunction::create(vm, this, 2, String(), functionResolveClosureBinding, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
         GlobalPropertyInfo(builtinNames.weakCollectionSnapshotPrivateName(), JSFunction::create(vm, this, 1, String(), functionWeakCollectionSnapshot, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
         GlobalPropertyInfo(builtinNames.finalizationRegistrySnapshotPrivateName(), JSFunction::create(vm, this, 1, String(), functionFinalizationRegistrySnapshot, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
+        GlobalPropertyInfo(builtinNames.bunClosureUnserializableTagPrivateName(), JSFunction::create(vm, this, 1, String(), functionBunClosureUnserializableTag, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
         GlobalPropertyInfo(builtinNames.getInternalWritableStreamPrivateName(), JSFunction::create(vm, this, 1, String(), getInternalWritableStream, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
         GlobalPropertyInfo(builtinNames.createWritableStreamFromInternalPrivateName(), JSFunction::create(vm, this, 1, String(), createWritableStreamFromInternal, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
         GlobalPropertyInfo(builtinNames.fulfillModuleSyncPrivateName(), JSFunction::create(vm, this, 1, String(), functionFulfillModuleSync, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),

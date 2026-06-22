@@ -158,6 +158,13 @@ declare function $weakCollectionSnapshot(value: object): unknown[];
  */
 declare function $finalizationRegistrySnapshot(value: object): { callback: Function; flat: unknown[] } | null;
 /**
+ * Spoof-proof type check for the closure serializer. Returns a human-readable label
+ * ("Generator", "Map Iterator", ...) for objects holding suspended execution state that
+ * cannot be expressed as source, or `undefined` for everything else. Uses the actual JSC
+ * cell type rather than `Symbol.toStringTag` (which userland can forge).
+ */
+declare function $bunClosureUnserializableTag(value: object): string | undefined;
+/**
  * Marks a promise as handled so it doesn't fire the unhandled-rejection
  * tracker. Equivalent to JSC's `JSPromise::markAsHandled()`.
  */
