@@ -207,7 +207,7 @@ function serializeImpl(fn: Function, replacer?: Replacer): string {
     const m = /^__bunClosure\$(\d+)$/.exec(variable.name);
     if (m !== null) counterStart = Math.max(counterStart, Number(m[1]) + 1);
   }
-  const genuinePlan = computeGenuineClasses(fn);
+  const genuinePlan = computeGenuineClasses(fn, sharedIds);
   const ctx: Context = {
     module: [],
     refs: new Map(),
@@ -637,11 +637,33 @@ function extractCallableNode(prog: any): any | null {
   return null;
 }
 
+// Source-keyed parse cache. A parse is a pure function of the source string, and EVERY caller
+// treats the returned node as READ-ONLY (walks it / reads positions; none mutate), so it's safe
+// to share one parse across the many passes that re-parse the same function — serialize() walks
+// each captured function ~5× (analysis pre-passes + reconstruction), and a deep chain of
+// identical-source closures parsed each one anew. Bounded (FIFO eviction) so a long-lived process
+// serializing many DISTINCT closures doesn't grow it without limit; a single serialize() of a
+// large same-source graph keeps its one entry hot.
+const parseCache = new Map<string, { node: any; offset: number } | null>();
+const PARSE_CACHE_CAP = 4096;
+
 // Parse a function's source (in any form `Function.prototype.toString` yields)
 // and return its AST node plus the column `offset` of `source` within the code
 // that actually parsed — each wrapper shifts node positions by its prefix length,
 // so a node at AST position P sits at `source` position `P - offset`.
 function parseWithOffset(source: string): { node: any; offset: number } | null {
+  const cached = parseCache.get(source);
+  if (cached !== undefined || parseCache.has(source)) return cached ?? null;
+  const result = parseWithOffsetUncached(source);
+  if (parseCache.size >= PARSE_CACHE_CAP) {
+    const oldest = parseCache.keys().next().value;
+    if (oldest !== undefined) parseCache.delete(oldest);
+  }
+  parseCache.set(source, result);
+  return result;
+}
+
+function parseWithOffsetUncached(source: string): { node: any; offset: number } | null {
   const t = getTranspiler();
   const attempts: ReadonlyArray<readonly [string, number]> = [
     ["(" + source + ")", 1],
@@ -938,11 +960,13 @@ interface GenuinePlan {
   hostedArrows: Map<Function, { instance: object; classFn: Function; hostKey: string }>;
   classHosts: Map<Function, Array<{ hostKey: string; source: string }>>;
 }
-function computeGenuineClasses(root: unknown): GenuinePlan {
+function computeGenuineClasses(root: unknown, sharedIdsArg?: Set<number>): GenuinePlan {
   // Cells shared across 2+ functions are hoisted to module scope by name; a hosted arrow
   // must reference such a cell by name (NOT thread it as a snapshot parameter) to keep
-  // mutations shared.
-  const sharedIds = typeof root === "function" ? analyzeSharedCells(root).sharedIds : new Set<number>();
+  // mutations shared. The caller (serialize) already ran analyzeSharedCells — reuse its result
+  // rather than walk the whole graph a second time.
+  const sharedIds =
+    sharedIdsArg ?? (typeof root === "function" ? analyzeSharedCells(root).sharedIds : new Set<number>());
   const funcs = new Set<Function>();
   const objs = new Set<object>();
   const seen = new Set<unknown>();
@@ -3304,7 +3328,7 @@ async function bundle(fn: Function, replacer?: Replacer): Promise<string> {
   // 1. Captured state → a virtual module exporting each free variable. Reuses
   //    the existing value emitter (objects, prototypes, pruning, cycles, …).
   const { sharedIds } = analyzeSharedCells(fn);
-  const genuinePlan = computeGenuineClasses(fn);
+  const genuinePlan = computeGenuineClasses(fn, sharedIds);
   const ctx: Context = {
     module: [],
     refs: new Map(),
