@@ -6921,7 +6921,7 @@ describe("adversarial regressions: round 4", () => {
 
   // BUG Y: a frozen/sealed class prototype (or constructor) loses its extensibility state
   // (the prototype is emitted via the function path, never through emitObject's freeze block).
-  test.failing("a frozen class prototype stays frozen", async () => {
+  test("a frozen class prototype stays frozen", async () => {
     const make = () => {
       class C {
         m() {

@@ -1996,9 +1996,7 @@ function emitObject(value: object, ctx: Context): string {
   // property (and any cycle) is wired, since a frozen object rejects mutation.
   // Covers built-ins (a frozen Map/Set/Date) as well as plain objects.
   if (!Object.isExtensible(value)) {
-    if (Object.isFrozen(value)) ctx.module.push(`Object.freeze(${name});`);
-    else if (Object.isSealed(value)) ctx.module.push(`Object.seal(${name});`);
-    else ctx.module.push(`Object.preventExtensions(${name});`);
+    emitNonExtensible(name, value, ctx);
   }
 
   return name;
@@ -2690,10 +2688,27 @@ function emitFunction(fn: Function, ctx: Context): string {
   if (typeof ownProto === "object" && ownProto !== null) {
     emitOwnProperties(`${name}.prototype`, ownProto, ctx, PROTOTYPE_SKIP_KEYS, true);
   }
+  // A frozen/sealed/non-extensible class prototype or constructor is emitted via this function
+  // path, never through emitObject, so its extensibility state would otherwise be lost. Apply
+  // it LAST, after the prototype's own properties are wired (freeze rejects later mutation).
+  if (typeof ownProto === "object" && ownProto !== null && !Object.isExtensible(ownProto)) {
+    emitNonExtensible(`${name}.prototype`, ownProto, ctx);
+  }
+  if (!Object.isExtensible(fn)) {
+    emitNonExtensible(name, fn, ctx);
+  }
   return name;
 }
 
 const PROTOTYPE_SKIP_KEYS = new Set(["constructor"]);
+
+// Emits the call that reproduces a value's non-extensible state (frozen > sealed >
+// preventExtensions). Caller has already checked `!Object.isExtensible(value)`.
+function emitNonExtensible(targetExpr: string, value: object, ctx: Context): void {
+  if (Object.isFrozen(value)) ctx.module.push(`Object.freeze(${targetExpr});`);
+  else if (Object.isSealed(value)) ctx.module.push(`Object.seal(${targetExpr});`);
+  else ctx.module.push(`Object.preventExtensions(${targetExpr});`);
+}
 
 function recordSourceBlock(ctx: Context, moduleIndex: number, reconstructed: ReconstructedFunction): void {
   const location = reconstructed.location;
