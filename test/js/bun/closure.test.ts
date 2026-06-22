@@ -6734,7 +6734,7 @@ describe("adversarial regressions: round 2", () => {
 describe("adversarial regressions: round 3", () => {
   // BUG R: analyzeSharedCells walks an EXTERNAL import's value graph instead of skipping it,
   // so a JS-implemented node builtin (node:util format) dives into native internals and throws.
-  test.failing("a closure referencing a JS-implemented node builtin re-emits the import", () => {
+  test("a closure referencing a JS-implemented node builtin re-emits the import", () => {
     const fn = () => nodeUtilFormat("%s", "x");
     expect(() => serialize(fn)).not.toThrow();
   });
@@ -6760,7 +6760,7 @@ describe("adversarial regressions: round 3", () => {
 
   // BUG P1: extra own properties on a bound function are dropped (the bound branch returns
   // before emitOwnProperties).
-  test.failing("extra own properties on a bound function round-trip", async () => {
+  test("extra own properties on a bound function round-trip", async () => {
     function g() {
       return 42;
     }
@@ -6837,7 +6837,7 @@ describe("adversarial regressions: round 3", () => {
 
   // BUG S: a method using `super`, extracted from its object, emits a module with bare `super`
   // (a syntax error) — must be rejected clearly at serialize time, not emit unimportable output.
-  test.failing("extracting a method that uses super is rejected clearly", () => {
+  test("extracting a method that uses super is rejected clearly", () => {
     const proto = {
       g() {
         return "hi";

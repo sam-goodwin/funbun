@@ -507,6 +507,11 @@ function analyzeSharedCells(root: Function): { sharedIds: Set<number>; cellInfo:
         cellInfo.set(variable.id, variable);
       }
       set.add(fn);
+      // An external import (node:*, a package) is re-emitted as an `import` statement; its
+      // VALUE is never inlined, so don't walk its implementation graph. Walking it dives into
+      // a JS-implemented builtin's native internals (e.g. node:util `format`) and throws.
+      // Mirrors the skip in reconstructFunctionExpr and the shared-cell emit loop.
+      if (variable.import?.external) continue;
       if (typeof variable.value === "function") {
         edges.add(variable.value as Function);
         cellValueFn.set(variable.id, variable.value as Function);
@@ -683,6 +688,41 @@ function arrowReadsLexicalThis(source: string): boolean {
       return;
     }
     if (isLexicalThis(n)) {
+      found = true;
+      return;
+    }
+    if (
+      n.type === "FunctionExpression" ||
+      n.type === "FunctionDeclaration" ||
+      n.type === "ClassExpression" ||
+      n.type === "ClassDeclaration"
+    ) {
+      return;
+    }
+    for (const k in n) {
+      if (k !== "start") walk(n[k]);
+    }
+  };
+  walk(node.body);
+  return found;
+}
+
+// True if the reconstructed callable's OWN body uses `super` (`super.x`, `super[x]`,
+// `super(...)`). `super` needs a [[HomeObject]] that a standalone reconstruction can't
+// provide — emitting `(function(){ ... super ... })` is a syntax error. Nested functions,
+// object-methods, and classes carry their own home object and are emitted verbatim within
+// their container, so the walk skips into them (it only flags `super` at the top level).
+function functionUsesSuper(source: string): boolean {
+  const node = parseFunctionNode(source);
+  if (node === null) return false;
+  let found = false;
+  const walk = (n: any): void => {
+    if (found || n === null || typeof n !== "object") return;
+    if ($isJSArray(n)) {
+      for (const c of n) walk(c);
+      return;
+    }
+    if (n.type === "Super") {
       found = true;
       return;
     }
@@ -1461,6 +1501,18 @@ function reconstructFunctionExpr(fn: Function, ctx: Context): ReconstructedFunct
           : "Cannot serialize an arrow function that reads its lexical `this`: " +
             "the receiving instance is baked in lexically and cannot be recovered. Capture the value " +
             "first, e.g. `const x = this.x; return () => x;`.",
+      );
+    }
+    // A method extracted from its object/class and reconstructed standalone loses its
+    // [[HomeObject]], so `super` becomes a syntax error in the emitted module. Reject clearly
+    // rather than emit unimportable output. (super inside the whole object/class IS fine —
+    // there it's reconstructed in its home context; this only fires for the peeled-off method.)
+    // Cheap textual guard first: `super` is rare, so skip the parse+walk for the common case.
+    if (source.includes("super") && functionUsesSuper(source)) {
+      throw new TypeError(
+        "Cannot serialize a method that uses `super`: it depends on the home object it was " +
+          "defined in, which is lost when the method is extracted on its own. Serialize the whole " +
+          "object or class instead.",
       );
     }
   }
@@ -2502,6 +2554,9 @@ function emitFunction(fn: Function, ctx: Context): string {
     const argExprs = bound.boundArgs.map(arg => emitValue(arg, ctx));
     const tail = argExprs.length ? `, ${argExprs.join(", ")}` : "";
     ctx.module.push(`const ${name} = ${targetExpr}.bind(${thisExpr}${tail});`);
+    // A bound function can carry its own properties (`bf.extra = ...`); emit the enumerable
+    // ones, like the from-source path does.
+    emitOwnProperties(name, fn, ctx, undefined, true);
     return name;
   }
 
