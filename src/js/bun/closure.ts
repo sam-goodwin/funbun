@@ -230,15 +230,23 @@ function serialize(fn: Function, replacer?: Replacer): string {
     exportExpr = exportReconstructed.expr;
   }
 
-  // Re-establish the captured AsyncLocalStorage context(s): wrap the root so each
-  // call runs inside `als.run(store, ...)`, restoring `als.getStore()`. The
-  // wrapper is single-line, so the function body's source-map lines are unchanged.
-  // Only applies to plain/async functions: wrapping a class breaks `new`, and a
-  // generator's body runs lazily after `run` returns (the context wouldn't be
-  // active during iteration) — those reconstruct without context restoration.
+  // Re-establish the captured AsyncLocalStorage context(s): wrap the root so each call runs
+  // inside `als.run(store, ...)`, restoring `als.getStore()`. The wrapper is a regular
+  // `function` (NOT an arrow): an arrow drops `this` and is non-constructable, so a plain
+  // `function` root invoked with `.call`/`.apply` or `new` would break. `new.target`
+  // branches between construct (`new __root(...)`, giving the instance the root's prototype)
+  // and call (`__root.apply(this, ...)`, forwarding `this`). A Proxy wrapper would be more
+  // transparent but its `toString` reports native code, so the reconstructed root couldn't be
+  // re-serialized. The root is bound once via an IIFE so it isn't duplicated across branches
+  // or nesting levels. Only plain/async functions are wrapped: a generator's body runs lazily
+  // after `run` returns (context wouldn't be active during iteration). Nested wrappers
+  // compose — the outer call/construct re-enters the inner wrapper, so every context is active.
   if (rootSupportsAlsWrap(fn)) {
     for (const { name, storeExpr } of ctx.alsContexts) {
-      exportExpr = `(...__alsArgs) => ${name}.run(${storeExpr}, () => (${exportExpr})(...__alsArgs))`;
+      exportExpr =
+        `(__root => function (...__a) { return new.target ` +
+        `? ${name}.run(${storeExpr}, () => new __root(...__a)) ` +
+        `: ${name}.run(${storeExpr}, () => __root.apply(this, __a)); })(${exportExpr})`;
     }
   }
 
@@ -2052,12 +2060,13 @@ function emitGenuinePrivateInstance(value: object, name: string, ctx: Context): 
 // instance: Map entries via `.set`, Set values via `.add`, array elements by index. Returns
 // the own-property keys it handled (array indices + length) so the caller skips them.
 function restoreBuiltinContent(value: object, name: string, ctx: Context): Set<string> | undefined {
-  // A user subclass may OVERRIDE `set`/`add` (e.g. to transform values or log) — restoring
-  // through the override would re-apply that transform/side effect on top of the already-final
-  // entries. Call the base method directly so restore reproduces the exact live contents. (The
-  // array branch already assigns indices directly, sidestepping any overridden mutators.)
+  // A user subclass may OVERRIDE its iterator or `set`/`add` (e.g. to transform values or
+  // log) — reading or restoring through the override would observe forged entries or re-apply
+  // that transform/side effect on top of the already-final entries. Both the read (base
+  // Symbol.iterator) and the restore (base set/add) go through the prototype directly so
+  // restore reproduces the exact live contents. (The array branch assigns indices directly.)
   if (value instanceof Map) {
-    for (const [k, v] of value as Map<unknown, unknown>) {
+    for (const [k, v] of Map.prototype.entries.$call(value as Map<unknown, unknown>)) {
       const kx = emitValue(transform(value, "", k, ctx), ctx);
       const vx = emitValue(transform(value, "", v, ctx), ctx);
       ctx.module.push(`Map.prototype.set.call(${name}, ${kx}, ${vx});`);
@@ -2065,7 +2074,7 @@ function restoreBuiltinContent(value: object, name: string, ctx: Context): Set<s
     return undefined;
   }
   if (value instanceof Set) {
-    for (const v of value as Set<unknown>) {
+    for (const v of Set.prototype.values.$call(value as Set<unknown>)) {
       ctx.module.push(`Set.prototype.add.call(${name}, ${emitValue(transform(value, "", v, ctx), ctx)});`);
     }
     return undefined;
@@ -2266,17 +2275,21 @@ function emitBuiltin(value: object, name: string, ctx: Context): object | null {
     ctx.module.push(`const ${name} = new RegExp(${JSON.stringify(re.source)}, ${JSON.stringify(re.flags)});`);
     return RegExp.prototype;
   }
+  // Read the live entries AND restore them through the base prototype methods, never the
+  // instance's own (possibly user-overridden) Symbol.iterator / set / add — an override
+  // would let the walk observe forged entries or re-run a transform on restore (and a
+  // throwing override would escape serialize() raw). Mirrors restoreBuiltinContent.
   if (value instanceof Map) {
     ctx.module.push(`const ${name} = new Map();`);
-    for (const entry of value as Map<unknown, unknown>) {
-      ctx.module.push(`${name}.set(${emitValue(entry[0], ctx)}, ${emitValue(entry[1], ctx)});`);
+    for (const entry of Map.prototype.entries.$call(value as Map<unknown, unknown>)) {
+      ctx.module.push(`Map.prototype.set.call(${name}, ${emitValue(entry[0], ctx)}, ${emitValue(entry[1], ctx)});`);
     }
     return Map.prototype;
   }
   if (value instanceof Set) {
     ctx.module.push(`const ${name} = new Set();`);
-    for (const element of value as Set<unknown>) {
-      ctx.module.push(`${name}.add(${emitValue(element, ctx)});`);
+    for (const element of Set.prototype.values.$call(value as Set<unknown>)) {
+      ctx.module.push(`Set.prototype.add.call(${name}, ${emitValue(element, ctx)});`);
     }
     return Set.prototype;
   }
@@ -2288,11 +2301,25 @@ function emitBuiltin(value: object, name: string, ctx: Context): object | null {
   if (ArrayBuffer.isView(value)) {
     const view = value as ArrayBufferView & { length?: number; constructor: { name: string } };
     const bufferExpr = emitValue(view.buffer, ctx);
+    const buf = view.buffer as ArrayBufferLike & { resizable?: boolean; growable?: boolean };
+    // A length-tracking view (constructed without an explicit length over a resizable
+    // buffer) auto-tracks the buffer's size; reconstructing it WITH an explicit length
+    // would pin it so it no longer tracks. There's no public flag distinguishing the two,
+    // so treat a view that currently spans to the end of a resizable buffer as
+    // length-tracking and omit the length argument.
+    const tracking =
+      (buf.resizable === true || buf.growable === true) && view.byteOffset + view.byteLength === buf.byteLength;
     if (value instanceof DataView) {
-      ctx.module.push(`const ${name} = new DataView(${bufferExpr}, ${view.byteOffset}, ${view.byteLength});`);
+      ctx.module.push(
+        tracking
+          ? `const ${name} = new DataView(${bufferExpr}, ${view.byteOffset});`
+          : `const ${name} = new DataView(${bufferExpr}, ${view.byteOffset}, ${view.byteLength});`,
+      );
     } else {
       ctx.module.push(
-        `const ${name} = new ${view.constructor.name}(${bufferExpr}, ${view.byteOffset}, ${view.length});`,
+        tracking
+          ? `const ${name} = new ${view.constructor.name}(${bufferExpr}, ${view.byteOffset});`
+          : `const ${name} = new ${view.constructor.name}(${bufferExpr}, ${view.byteOffset}, ${view.length});`,
       );
     }
     return Object.getPrototypeOf(value);
@@ -2303,7 +2330,11 @@ function emitBuiltin(value: object, name: string, ctx: Context): object | null {
   ) {
     const ctor = value instanceof ArrayBuffer ? "ArrayBuffer" : "SharedArrayBuffer";
     const bytes = [...new Uint8Array(value as ArrayBufferLike)];
-    ctx.module.push(`const ${name} = new ${ctor}(${(value as ArrayBufferLike).byteLength});`);
+    // A resizable/growable buffer needs its maxByteLength forwarded, or the reconstructed
+    // buffer is fixed-size and .resize()/.grow() (and any length-tracking view) break.
+    const ab = value as ArrayBufferLike & { resizable?: boolean; growable?: boolean; maxByteLength?: number };
+    const resizeOpts = ab.resizable === true || ab.growable === true ? `, { maxByteLength: ${ab.maxByteLength} }` : "";
+    ctx.module.push(`const ${name} = new ${ctor}(${(value as ArrayBufferLike).byteLength}${resizeOpts});`);
     if (bytes.some(b => b !== 0)) ctx.module.push(`new Uint8Array(${name}).set([${bytes.join(", ")}]);`);
     return Object.getPrototypeOf(value);
   }

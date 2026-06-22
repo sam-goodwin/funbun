@@ -6549,4 +6549,181 @@ describe("adversarial regressions", () => {
     expect([...out.s]).toEqual(["x", "y"]);
     expect(out.flog).toEqual(["x", "y"]); // add() override NOT re-invoked during restore
   });
+
+  // A plain Map/Set with a user-installed `Symbol.iterator` override must still serialize its
+  // REAL entries (read via the base iterator), not whatever the override yields. This is the
+  // read/walk-side analogue of the overridden-set/add restore bug.
+  test("a Map with an overridden Symbol.iterator serializes its real entries", async () => {
+    const m: any = new Map([
+      ["a", 1],
+      ["b", 2],
+    ]);
+    m[Symbol.iterator] = function* () {
+      yield ["HIJACKED", 999];
+    };
+    const out = (await roundtrip(() => m))() as any;
+    expect([...Map.prototype[Symbol.iterator].call(out)]).toEqual([
+      ["a", 1],
+      ["b", 2],
+    ]);
+  });
+
+  test("a Set with an overridden Symbol.iterator serializes its real elements", async () => {
+    const s: any = new Set([1, 2, 3]);
+    s[Symbol.iterator] = function* () {
+      yield "EVIL";
+    };
+    const out = (await roundtrip(() => s))() as any;
+    expect([...Set.prototype[Symbol.iterator].call(out)]).toEqual([1, 2, 3]);
+  });
+
+  // An ALS-wrapped root that is a plain `function` must stay constructable (the wrapper is a
+  // Proxy with apply+construct traps, not an arrow). `new` works and `this` is forwarded,
+  // both inside the restored async context.
+  test("an ALS-captured constructor function stays constructable and keeps its context", async () => {
+    const als = new AsyncLocalStorage<{ tag: string }>();
+    let code!: string;
+    als.run({ tag: "t" }, () => {
+      function Widget(this: any) {
+        this.store = als.getStore();
+      }
+      code = serialize(Widget);
+    });
+    using dir = tempDir("closure-als-ctor", { "mod.mjs": code });
+    const W = (await import(`${String(dir)}/mod.mjs`)).default as any;
+    const inst = new W(); // would throw "not a constructor" with an arrow wrapper
+    expect(inst.store).toEqual({ tag: "t" });
+  });
+
+  test("an ALS-captured function forwards `this` through .call inside the restored context", async () => {
+    const als = new AsyncLocalStorage<{ tag: string }>();
+    let code!: string;
+    als.run({ tag: "t" }, () => {
+      function reader(this: any) {
+        return { store: als.getStore(), self: this };
+      }
+      code = serialize(reader);
+    });
+    using dir = tempDir("closure-als-this", { "mod.mjs": code });
+    const r = (await import(`${String(dir)}/mod.mjs`)).default as any;
+    const out = r.call({ id: "x" });
+    expect(out.self).toEqual({ id: "x" }); // `this` forwarded (arrow wrapper dropped it)
+    expect(out.store).toEqual({ tag: "t" });
+  });
+
+  // A resizable ArrayBuffer must keep its maxByteLength (so .resize works) and a
+  // length-tracking view must keep tracking after the buffer resizes.
+  test("a resizable ArrayBuffer and its length-tracking view round-trip", async () => {
+    const rab = new ArrayBuffer(8, { maxByteLength: 32 });
+    const lt = new Uint8Array(rab);
+    lt.set([1, 2, 3, 4, 5, 6, 7, 8]);
+    const v = { rab, lt };
+    const out = (await roundtrip(() => v))() as any;
+    expect(out.rab.resizable).toBe(true);
+    expect(out.rab.maxByteLength).toBe(32);
+    expect([...out.lt]).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    out.rab.resize(16); // would throw on a non-resizable reconstruction
+    expect(out.lt.length).toBe(16); // still length-tracking
+  });
+});
+
+// Round-2 subagent findings. Encoded as regression tests BEFORE the fixes land; each
+// currently FAILS, and must pass once the corresponding fix is in.
+describe("adversarial regressions: round 2", () => {
+  // BUG L: prototype properties assigned imperatively (the classic pre-ES6 constructor
+  // pattern) are dropped — the reconstructed prototype carries only `constructor`, because
+  // emission relies on the function's source text and never serializes `fn.prototype`'s own
+  // properties.
+  test.failing("imperatively-assigned prototype properties on a constructor function round-trip", async () => {
+    function Animal(this: any, name: string) {
+      this.name = name;
+    }
+    (Animal.prototype as any).speak = function (this: any) {
+      return this.name + " speaks";
+    };
+    (Animal.prototype as any).legs = 4;
+    const dog = new (Animal as any)("Rex");
+    const out = (await roundtrip(() => dog))() as any;
+    expect(out.name).toBe("Rex");
+    expect(out.legs).toBe(4);
+    expect(out.speak()).toBe("Rex speaks");
+  });
+
+  // BUG L (class variant): a class prototype monkey-patched after declaration.
+  test.failing("imperatively-added class prototype members round-trip", async () => {
+    class K {}
+    (K.prototype as any).extra = function () {
+      return 7;
+    };
+    const k = new K();
+    void k;
+    const out = (await roundtrip(() => k))() as any;
+    expect(out.extra()).toBe(7);
+  });
+
+  // BUG M: a directly-captured `Class.prototype` must keep its identity — the same object as
+  // the reconstructed class's `.prototype` and the instance's [[Prototype]] — not a fresh
+  // duplicate `{}`.
+  test.failing("a directly-captured class prototype keeps shared identity", async () => {
+    class Foo {
+      hello() {
+        return "hi";
+      }
+    }
+    const inst = new Foo();
+    const protoRef = Foo.prototype;
+    void [inst, protoRef];
+    const out = (await roundtrip(() => ({ inst, protoRef, cls: Foo })))() as any;
+    expect(out.inst.hello()).toBe("hi");
+    expect(Object.getPrototypeOf(out.inst)).toBe(out.protoRef); // one shared object
+    expect(out.protoRef).toBe(out.cls.prototype);
+  });
+
+  // BUG N: the genuine #private reify path re-runs PUBLIC field initializers (they execute
+  // before the constructor body, where the REIFY guard sits), so a side-effecting initializer
+  // runs an extra time on reconstruction (and a field-initializer-only binding would be
+  // needed at import). The final field VALUE must come from the snapshot, with no re-run.
+  test.failing("a side-effecting public field initializer does not re-run on a genuine instance", async () => {
+    const log: string[] = [];
+    class C {
+      #p = 1;
+      x = (log.push("init"), 5);
+      read() {
+        return log.length;
+      }
+      gp() {
+        return this.#p;
+      }
+    }
+    const inst = new C(); // log === ["init"]
+    void inst;
+    const out = (await roundtrip(() => inst))() as any;
+    expect(out.read()).toBe(1); // initializer must NOT re-run (would be 2)
+    expect(out.gp()).toBe(1);
+    expect(out.x).toBe(5);
+  });
+
+  // BUG J: a static block referencing a captured outer variable. With the variable hoisted
+  // (a method also reads it) there's no crash, but the static block RE-RUNS on class
+  // re-evaluation, duplicating its side effect. (The crash variant — variable referenced
+  // ONLY by the static block — is the same root cause: static blocks aren't part of the
+  // class's collected free variables / aren't suppressed on reconstruction.)
+  test.failing("a static block's side effect does not re-run on reconstruction", async () => {
+    const log: string[] = [];
+    const make = () => {
+      class C {
+        static {
+          log.push("s");
+        }
+        m() {
+          return log.length;
+        }
+      }
+      return new C();
+    };
+    const inst = make(); // log === ["s"]
+    void inst;
+    const out = (await roundtrip(() => inst))() as any;
+    expect(out.m()).toBe(1); // static block side effect not duplicated (would be 2)
+  });
 });
