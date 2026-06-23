@@ -10784,3 +10784,140 @@ describe("generality: nesting & recursion", () => {
     expect(err.message).toContain("too deeply nested");
   });
 });
+
+// Generality of well-known-global references: a captured value identical to a global namespace,
+// built-in prototype, iterator/generator prototype, or host singleton is emitted as a REFERENCE to
+// its path (identity preserved), at every position, aliased, in cycles, and across re-serialization
+// — never deep-copied or thrown. A USER object is never wrongly referenced as a global.
+describe("generality: native global references", () => {
+  test.each([
+    ["Math", Math],
+    ["JSON", JSON],
+    ["Reflect", Reflect],
+    ["Atomics", Atomics],
+    ["console", console],
+    ["globalThis", globalThis],
+    ["crypto", globalThis.crypto],
+    ["performance", globalThis.performance],
+  ])("namespace/singleton %s keeps identity", async (_n, g) => {
+    const out = (await roundtrip(() => ({ x: g })))() as any;
+    expect(out.x).toBe(g);
+  });
+
+  const PROTOS: Array<[string, object]> = [
+    ["Object", Object.prototype],
+    ["Array", Array.prototype],
+    ["Promise", Promise.prototype],
+    ["Error", Error.prototype],
+    ["TypeError", TypeError.prototype],
+    ["AggregateError", AggregateError.prototype],
+    ["Number", Number.prototype],
+    ["Map", Map.prototype],
+    ["Set", Set.prototype],
+    ["WeakMap", WeakMap.prototype],
+    ["Date", Date.prototype],
+    ["RegExp", RegExp.prototype],
+    ["DataView", DataView.prototype],
+    ["Uint8Array", Uint8Array.prototype],
+    ["Float64Array", Float64Array.prototype],
+    ["BigInt64Array", BigInt64Array.prototype],
+  ];
+  test.each(PROTOS)("%s.prototype keeps identity", async (_n, p) => {
+    const out = (await roundtrip(() => ({ x: p })))() as any;
+    expect(out.x).toBe(p);
+  });
+
+  // The iterator/generator/typed-array abstract prototypes (no dotted path — resolved by
+  // expression). Previously these threw "Cannot serialize a native function".
+  const EXPR_PROTOS: Array<[string, object]> = [
+    ["%IteratorPrototype%", Iterator.prototype],
+    ["%TypedArray%.prototype", Object.getPrototypeOf(Uint8Array.prototype)],
+    ["%ArrayIteratorPrototype%", Object.getPrototypeOf([][Symbol.iterator]())],
+    ["%MapIteratorPrototype%", Object.getPrototypeOf(new Map().entries())],
+    ["%SetIteratorPrototype%", Object.getPrototypeOf(new Set().values())],
+    ["%StringIteratorPrototype%", Object.getPrototypeOf(""[Symbol.iterator]())],
+    ["%GeneratorFunction.prototype%", Object.getPrototypeOf(function* () {})],
+    ["%AsyncFunction.prototype%", Object.getPrototypeOf(async function () {})],
+    ["%AsyncGeneratorFunction.prototype%", Object.getPrototypeOf(async function* () {})],
+  ];
+  test.each(EXPR_PROTOS)("%s keeps identity (expression-resolved)", async (_n, p) => {
+    const out = (await roundtrip(() => ({ x: p })))() as any;
+    expect(out.x).toBe(p);
+  });
+
+  // POSITION generality — Math referenced from every position.
+  test("a global is referenced from every position", async () => {
+    class C {
+      static s = Math;
+      #p = Math;
+      get() {
+        return this.#p;
+      }
+    }
+    const o: any = {
+      direct: Math,
+      arr: [Math],
+      mapV: new Map([["k", Math]]),
+      mapK: new Map([[Math, 1]]),
+      set: new Set([Math]),
+      getter: { get g() { return Math; } },
+      cls: C,
+      inst: new C(),
+      proto: Object.create(Math),
+      deep: { a: { b: [{ c: Math }] } },
+    };
+    o.cause = new Error("x", { cause: Math });
+    const out = (await roundtrip(() => o))() as any;
+    expect(out.direct).toBe(Math);
+    expect(out.arr[0]).toBe(Math);
+    expect(out.mapV.get("k")).toBe(Math);
+    expect(out.mapK.get(Math)).toBe(1);
+    expect(out.set.has(Math)).toBe(true);
+    expect(out.getter.g).toBe(Math);
+    expect(out.cls.s).toBe(Math);
+    expect(out.inst.get()).toBe(Math);
+    expect(Object.getPrototypeOf(out.proto)).toBe(Math);
+    expect(out.deep.a.b[0].c).toBe(Math);
+    expect(out.cause.cause).toBe(Math);
+  });
+
+  test("the same global via K paths is one reference, and survives a cycle", async () => {
+    const a: any = { m: Math, arr: [Math, Math], n: new Map([[Math, Math]]) };
+    a.self = a;
+    const out = (await roundtrip(() => a))() as any;
+    expect(out.m).toBe(Math);
+    expect(out.arr[0]).toBe(Math);
+    expect(out.arr[0]).toBe(out.arr[1]);
+    expect(out.n.get(Math)).toBe(Math);
+    expect(out.self).toBe(out);
+  });
+
+  test.each([
+    ["Math.max", Math.max],
+    ["console.log", console.log],
+    ["Array.prototype.slice", Array.prototype.slice],
+  ])("native method %s as a value keeps identity", async (_n, f) => {
+    const out = (await roundtrip(() => ({ f })))() as any;
+    expect(out.f).toBe(f);
+  });
+
+  test("globals stay references across re-serialization", async () => {
+    const code1 = serialize(() => ({ m: Math, c: console }));
+    using d1 = tempDir(`closure-natre1-${counter++}`, { "mod.mjs": code1 });
+    const fn1 = (await import(`${String(d1)}/mod.mjs`)).default as any;
+    const code2 = serialize(fn1);
+    using d2 = tempDir(`closure-natre2-${counter++}`, { "mod.mjs": code2 });
+    const out = ((await import(`${String(d2)}/mod.mjs`)).default as any)();
+    expect(out.m).toBe(Math);
+    expect(out.c).toBe(console);
+  });
+
+  test("a user object whose prototype IS a global: proto referenced, object by value", async () => {
+    const u = Object.create(Math);
+    u.userField = 7;
+    const out = (await roundtrip(() => ({ u })))() as any;
+    expect(Object.getPrototypeOf(out.u)).toBe(Math);
+    expect(out.u.userField).toBe(7);
+    expect(out.u).not.toBe(u);
+  });
+});

@@ -3623,7 +3623,9 @@ const NATIVE_OBJECT_PATHS = [
   // The shared %TypedArray%.prototype — the abstract base of every typed-array prototype. Not
   // reachable by a plain dotted path; resolved specially in buildNativeObjectMap. Its re-resolving
   // expression in the reconstructed module is `Object.getPrototypeOf(Uint8Array.prototype)`.
-  "Object.getPrototypeOf(Uint8Array.prototype)",
+  // (resolved via NATIVE_OBJECT_EXPRESSIONS below, with the iterator/generator prototypes.)
+  // `Iterator` is a real global here, so its prototype (%IteratorPrototype%) has a dotted path.
+  "Iterator.prototype",
   // Intl sub-constructor prototypes (each guarded — older platforms lack some).
   "Intl.DateTimeFormat.prototype",
   "Intl.NumberFormat.prototype",
@@ -3639,6 +3641,19 @@ const NATIVE_OBJECT_PATHS = [
 // lazy build would record the user's object at path "console" and later (wrongly) reference a USER
 // object by a global path. Resolving the captured globals here is safe: every alias this depends on
 // (MapCtor, Uint8ArrayCtor, ObjectGetPrototypeOf) is declared earlier at module top.
+// Intrinsic objects with NO dotted global path — the iterator/generator/typed-array abstract
+// prototypes. Each entry resolves the real object at module load (left) and is emitted as a
+// self-resolving expression (right) that re-derives the SAME intrinsic in the reconstructed realm.
+const NATIVE_OBJECT_EXPRESSIONS: Array<[() => unknown, string]> = [
+  [() => ObjectGetPrototypeOf(Uint8ArrayCtor.prototype), "Object.getPrototypeOf(Uint8Array.prototype)"],
+  [() => ObjectGetPrototypeOf(ArrayCtor.prototype[Symbol.iterator]()), "Object.getPrototypeOf([][Symbol.iterator]())"],
+  [() => ObjectGetPrototypeOf(new MapCtor()[Symbol.iterator]()), "Object.getPrototypeOf(new Map()[Symbol.iterator]())"],
+  [() => ObjectGetPrototypeOf(new SetCtor()[Symbol.iterator]()), "Object.getPrototypeOf(new Set()[Symbol.iterator]())"],
+  [() => ObjectGetPrototypeOf("a"[Symbol.iterator]()), 'Object.getPrototypeOf(""[Symbol.iterator]())'],
+  [() => ObjectGetPrototypeOf(function* () {}), "Object.getPrototypeOf(function*(){})"],
+  [() => ObjectGetPrototypeOf(async function () {}), "Object.getPrototypeOf(async function(){})"],
+  [() => ObjectGetPrototypeOf(async function* () {}), "Object.getPrototypeOf(async function*(){})"],
+];
 function nativeObjectPath(value: object): string | undefined {
   return nativeObjectMap.get(value);
 }
@@ -3646,24 +3661,28 @@ function buildNativeObjectMap(): Map<object, string> {
   const map = new MapCtor<object, string>();
   const g = globalThis as any;
   map.set(g, "globalThis");
+  const record = (v: unknown, expr: string): void => {
+    // Only a genuine object identical to the resolved global is recorded. A USER object identical
+    // to nothing here is never matched, so it is always serialized BY VALUE (invariant preserved).
+    if (typeof v === "object" && v !== null && !map.has(v as object)) map.set(v as object, expr);
+  };
   for (const path of NATIVE_OBJECT_PATHS) {
-    let v: unknown;
+    let v: unknown = g;
     try {
-      // The %TypedArray%.prototype entry is an expression, not a dotted member path; resolve it
-      // from the captured Object/Uint8Array aliases (re-resolves in the reconstructed module via
-      // the literal path string, which is a valid expression).
-      if (path === "Object.getPrototypeOf(Uint8Array.prototype)") {
-        v = ObjectGetPrototypeOf(Uint8ArrayCtor.prototype);
-      } else {
-        v = g;
-        for (const part of path.split(".")) v = (v as any)[part];
-      }
+      for (const part of path.split(".")) v = (v as any)[part];
     } catch {
       continue;
     }
-    // Only a genuine object identical to the resolved global is recorded. A USER object identical
-    // to nothing here is never matched, so it is always serialized BY VALUE (invariant preserved).
-    if (typeof v === "object" && v !== null && !map.has(v as object)) map.set(v as object, path);
+    record(v, path);
+  }
+  for (const [resolve, expr] of NATIVE_OBJECT_EXPRESSIONS) {
+    let v: unknown;
+    try {
+      v = resolve();
+    } catch {
+      continue;
+    }
+    record(v, expr);
   }
   return map;
 }
