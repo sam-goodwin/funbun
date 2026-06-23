@@ -13120,3 +13120,101 @@ describe("class method pruning (non-#private)", () => {
     expect(fn()).toBe("GREET_MARK"); // imports cleanly (no orphaned `{}`), runs
   });
 });
+
+// ── Host/Web builtins (internal-slot backed) ─────────────────────────────────
+// These can't be reconstructed by the generic Object.create(proto) path (no internal slot →
+// every method throws). The serializer rebuilds the cheap ones from serializable state and
+// rejects the rest clearly instead of emitting a silently-broken shell.
+describe("host/Web builtins", () => {
+  test("a URL round-trips and its getters work", async () => {
+    const u = new URL("https://user:pw@example.com:8443/a/b?q=1&r=2#frag");
+    void u;
+    const out = (await roundtrip(() => u))() as URL;
+    expect(out.href).toBe("https://user:pw@example.com:8443/a/b?q=1&r=2#frag");
+    expect(out.pathname).toBe("/a/b");
+    expect(out.searchParams.get("q")).toBe("1");
+    expect(out instanceof URL).toBe(true);
+  });
+
+  test("a URLSearchParams round-trips (order + duplicates preserved)", async () => {
+    const sp = new URLSearchParams("x=1&y=2&x=3");
+    void sp;
+    const out = (await roundtrip(() => sp))() as URLSearchParams;
+    expect(out.toString()).toBe("x=1&y=2&x=3");
+    expect(out.getAll("x")).toEqual(["1", "3"]);
+  });
+
+  test("a Headers round-trips (combined value via .get)", async () => {
+    const h = new Headers([["content-type", "text/plain"]]);
+    h.append("x-multi", "a");
+    h.append("x-multi", "b");
+    void h;
+    const out = (await roundtrip(() => h))() as Headers;
+    expect(out.get("content-type")).toBe("text/plain");
+    expect(out.get("x-multi")).toBe("a, b");
+    expect(out instanceof Headers).toBe(true);
+  });
+
+  test("a TextEncoder round-trips and encodes", async () => {
+    const te = new TextEncoder();
+    void te;
+    const out = (await roundtrip(() => te))() as TextEncoder;
+    expect(out.encoding).toBe("utf-8");
+    expect([...out.encode("AB")]).toEqual([65, 66]);
+  });
+
+  test("a TextDecoder round-trips with its options", async () => {
+    const td = new TextDecoder("utf-16le", { fatal: true, ignoreBOM: true });
+    void td;
+    const out = (await roundtrip(() => td))() as TextDecoder;
+    expect(out.encoding).toBe("utf-16le");
+    expect(out.fatal).toBe(true);
+    expect(out.ignoreBOM).toBe(true);
+    expect(out.decode(new Uint8Array([0x41, 0x00]))).toBe("A");
+  });
+
+  test("a captured host builtin nested in a graph round-trips", async () => {
+    const graph = { api: new URL("https://x.test/v1"), list: [new URLSearchParams("a=1")] };
+    void graph;
+    const out = (await roundtrip(() => graph))() as typeof graph;
+    expect(out.api.href).toBe("https://x.test/v1");
+    expect(out.list[0].get("a")).toBe("1");
+  });
+
+  test("Request / Response / Blob / AbortController are clear errors", () => {
+    const req = new Request("https://x.test");
+    const res = new Response("body");
+    const blob = new Blob(["data"]);
+    const ac = new AbortController();
+    expect(() => serialize(() => req)).toThrow(/Cannot serialize a Request/);
+    expect(() => serialize(() => res)).toThrow(/Cannot serialize a Response/);
+    expect(() => serialize(() => blob)).toThrow(/Cannot serialize a Blob/);
+    expect(() => serialize(() => ac)).toThrow(/Cannot serialize an? AbortController/);
+  });
+
+  test("a reconstructed URL and Headers run in Node", async () => {
+    using dir = tempDir("closure-host-node", {
+      "gen.mjs": `
+        import { serialize } from "bun:closure";
+        import { writeFileSync } from "node:fs";
+        const data = { u: new URL("https://example.com/p?q=1"), h: new Headers([["x", "y"]]) };
+        writeFileSync(new URL("./out.mjs", import.meta.url), serialize(() => data));
+        process.stdout.write("SERIALIZED");
+      `,
+      "check.mjs": `
+        import build from "./out.mjs";
+        const d = build();
+        process.stdout.write(JSON.stringify({ href: d.u.href, q: d.u.searchParams.get("q"), x: d.h.get("x") }));
+      `,
+    });
+    await using ser = Bun.spawn({ cmd: [bunExe(), "gen.mjs"], env: bunEnv, cwd: String(dir), stderr: "pipe" });
+    const [sOut, sErr, sCode] = await Promise.all([ser.stdout.text(), ser.stderr.text(), ser.exited]);
+    expect({ sOut, sErr: sErr.includes("rror") ? sErr : "", sCode }).toEqual({ sOut: "SERIALIZED", sErr: "", sCode: 0 });
+
+    await using chk = Bun.spawn({ cmd: ["node", "check.mjs"], env: bunEnv, cwd: String(dir), stderr: "pipe" });
+    const [cOut, cErr, cCode] = await Promise.all([chk.stdout.text(), chk.stderr.text(), chk.exited]);
+    expect(cOut).toBe(JSON.stringify({ href: "https://example.com/p?q=1", q: "1", x: "y" }));
+    expect(cCode).toBe(0);
+    void cErr;
+  });
+});

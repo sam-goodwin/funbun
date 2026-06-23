@@ -3454,6 +3454,62 @@ function hasSlot(value: object, probe: Function): boolean {
   }
 }
 
+// Host/Web builtins backed by a C++ internal slot. Like the ECMAScript builtins above they CANNOT
+// be reconstructed by the generic `Object.create(proto)` path — that copies no slot, yielding a
+// shell whose every method/getter throws "can only be used on instances of …". They are instead
+// rebuilt from serializable state, or rejected with a clear error when their state isn't
+// synchronously expressible as source. Globals + their extractor methods/getters are snapshotted at
+// load (tamper-proof, mirroring `DateProtoGetTime`); a builtin absent in this realm stays undefined
+// and is simply not handled (the value falls through to the generic path).
+const URLCtor = typeof URL !== "undefined" ? URL : undefined;
+const URLHrefGetter = URLCtor ? ObjectGetOwnPropertyDescriptor(URLCtor.prototype, "href")?.get : undefined;
+const URLSearchParamsCtor = typeof URLSearchParams !== "undefined" ? URLSearchParams : undefined;
+const URLSearchParamsToString = URLSearchParamsCtor ? URLSearchParamsCtor.prototype.toString : undefined;
+const HeadersCtor = typeof Headers !== "undefined" ? Headers : undefined;
+const HeadersEntries = HeadersCtor ? HeadersCtor.prototype.entries : undefined;
+const TextEncoderCtor = typeof TextEncoder !== "undefined" ? TextEncoder : undefined;
+const TextEncoderEncodingGetter = TextEncoderCtor
+  ? ObjectGetOwnPropertyDescriptor(TextEncoderCtor.prototype, "encoding")?.get
+  : undefined;
+const TextDecoderCtor = typeof TextDecoder !== "undefined" ? TextDecoder : undefined;
+const tdDesc = (k: string) =>
+  TextDecoderCtor ? ObjectGetOwnPropertyDescriptor(TextDecoderCtor.prototype, k)?.get : undefined;
+const TextDecoderEncodingGetter = tdDesc("encoding");
+const TextDecoderFatalGetter = tdDesc("fatal");
+const TextDecoderIgnoreBOMGetter = tdDesc("ignoreBOM");
+// Host builtins whose state is NOT synchronously expressible as source (a body stream, async
+// binary data, live signal state) — detected by a slot-checking getter so only a GENUINE instance
+// is rejected (a `Object.create(Ctor.prototype)` look-alike with no slot falls through to the
+// generic object path). `[ctor, label, slotProbeGetter, reason]`.
+const hostGetter = (ctor: any, key: string): Function | undefined =>
+  ctor ? ObjectGetOwnPropertyDescriptor(ctor.prototype, key)?.get : undefined;
+const HOST_UNSERIALIZABLE: Array<[unknown, string, Function | undefined, string]> = [
+  [
+    typeof Request !== "undefined" ? Request : undefined,
+    "Request",
+    hostGetter(typeof Request !== "undefined" ? Request : undefined, "url"),
+    "its body stream and request state are not expressible as source",
+  ],
+  [
+    typeof Response !== "undefined" ? Response : undefined,
+    "Response",
+    hostGetter(typeof Response !== "undefined" ? Response : undefined, "status"),
+    "its body stream and response state are not expressible as source",
+  ],
+  [
+    typeof Blob !== "undefined" ? Blob : undefined,
+    "Blob",
+    hostGetter(typeof Blob !== "undefined" ? Blob : undefined, "size"),
+    "its binary data is only readable asynchronously",
+  ],
+  [
+    typeof AbortController !== "undefined" ? AbortController : undefined,
+    "AbortController",
+    hostGetter(typeof AbortController !== "undefined" ? AbortController : undefined, "signal"),
+    "its live signal state is not expressible as source",
+  ],
+];
+
 // The `.prototype` objects of every built-in `emitBuiltin` tests via `instanceof` (plus the
 // typed-array / DataView prototypes its `ArrayBufferIsView` branch covers). An object can only
 // match one of those `instanceof` checks if one of these prototypes is in its chain. Captured at
@@ -3480,6 +3536,14 @@ const BUILTIN_PROTOTYPES: Set<object> = (() => {
   if (SharedArrayBufferCtor !== undefined) add(SharedArrayBufferCtor.prototype);
   if (typeof FinalizationRegistry !== "undefined") add(FinalizationRegistry.prototype);
   if (typeof DataView !== "undefined") add(DataView.prototype);
+  // Host/Web builtins (reconstructed or clearly rejected by emitBuiltin) — registered so the gate
+  // routes their instances into emitBuiltin instead of the broken generic Object.create path.
+  if (URLCtor !== undefined) add(URLCtor.prototype);
+  if (URLSearchParamsCtor !== undefined) add(URLSearchParamsCtor.prototype);
+  if (HeadersCtor !== undefined) add(HeadersCtor.prototype);
+  if (TextEncoderCtor !== undefined) add(TextEncoderCtor.prototype);
+  if (TextDecoderCtor !== undefined) add(TextDecoderCtor.prototype);
+  for (const [ctor] of HOST_UNSERIALIZABLE) if (ctor !== undefined) add((ctor as { prototype: object }).prototype);
   // `%TypedArray%.prototype` — the shared base of every typed-array kind (Uint8Array, Float64Array,
   // …). A typed array's chain is `instance → Uint8Array.prototype → %TypedArray%.prototype → …`, so
   // this one entry covers them all (ArrayBufferIsView's targets).
@@ -3770,6 +3834,82 @@ function emitBuiltin(value: object, name: string, ctx: Context): { proto: object
         emitBuiltinOwnProps(name, value, ctx, FinalizationRegistry.prototype);
       },
     };
+  }
+  // ── Host/Web builtins with an internal slot ──
+  if (
+    URLCtor !== undefined &&
+    value instanceof URLCtor &&
+    URLHrefGetter !== undefined &&
+    hasSlot(value, URLHrefGetter)
+  ) {
+    ctx.module.push(`const ${name} = new URL(${JSONStringify(URLHrefGetter.$call(value) as string)});`);
+    return { proto: URLCtor.prototype, body: () => emitBuiltinOwnProps(name, value, ctx, URLCtor.prototype) };
+  }
+  if (
+    URLSearchParamsCtor !== undefined &&
+    value instanceof URLSearchParamsCtor &&
+    URLSearchParamsToString !== undefined &&
+    hasSlot(value, URLSearchParamsToString)
+  ) {
+    ctx.module.push(
+      `const ${name} = new URLSearchParams(${JSONStringify(URLSearchParamsToString.$call(value) as string)});`,
+    );
+    return {
+      proto: URLSearchParamsCtor.prototype,
+      body: () => emitBuiltinOwnProps(name, value, ctx, URLSearchParamsCtor.prototype),
+    };
+  }
+  if (
+    HeadersCtor !== undefined &&
+    value instanceof HeadersCtor &&
+    HeadersEntries !== undefined &&
+    hasSlot(value, HeadersEntries)
+  ) {
+    // `.entries()` yields combined values (multi-valued headers joined by ", "); reconstructing
+    // from those pairs preserves the observable `.get(name)` for every header. Read by index (no
+    // destructuring off a user-mutable Array iterator).
+    const pairs: string[] = [];
+    for (const pair of HeadersEntries.$call(value) as Iterable<[string, string]>) {
+      pairs.push(`[${JSONStringify(pair[0])}, ${JSONStringify(pair[1])}]`);
+    }
+    ctx.module.push(`const ${name} = new Headers([${pairs.join(", ")}]);`);
+    return { proto: HeadersCtor.prototype, body: () => emitBuiltinOwnProps(name, value, ctx, HeadersCtor.prototype) };
+  }
+  if (
+    TextEncoderCtor !== undefined &&
+    value instanceof TextEncoderCtor &&
+    TextEncoderEncodingGetter !== undefined &&
+    hasSlot(value, TextEncoderEncodingGetter)
+  ) {
+    ctx.module.push(`const ${name} = new TextEncoder();`); // stateless (encoding is always utf-8)
+    return {
+      proto: TextEncoderCtor.prototype,
+      body: () => emitBuiltinOwnProps(name, value, ctx, TextEncoderCtor.prototype),
+    };
+  }
+  if (
+    TextDecoderCtor !== undefined &&
+    value instanceof TextDecoderCtor &&
+    TextDecoderEncodingGetter !== undefined &&
+    hasSlot(value, TextDecoderEncodingGetter)
+  ) {
+    const enc = TextDecoderEncodingGetter.$call(value) as string;
+    const fatal = TextDecoderFatalGetter !== undefined ? !!TextDecoderFatalGetter.$call(value) : false;
+    const ignoreBOM = TextDecoderIgnoreBOMGetter !== undefined ? !!TextDecoderIgnoreBOMGetter.$call(value) : false;
+    ctx.module.push(
+      `const ${name} = new TextDecoder(${JSONStringify(enc)}, { fatal: ${fatal}, ignoreBOM: ${ignoreBOM} });`,
+    );
+    return {
+      proto: TextDecoderCtor.prototype,
+      body: () => emitBuiltinOwnProps(name, value, ctx, TextDecoderCtor.prototype),
+    };
+  }
+  // Host builtins whose state isn't synchronously expressible as source — reject clearly (a genuine
+  // instance only, slot-checked) rather than emit a broken `Object.create(proto)` shell.
+  for (const [ctor, label, probe, reason] of HOST_UNSERIALIZABLE) {
+    if (ctor !== undefined && value instanceof (ctor as Function) && probe !== undefined && hasSlot(value, probe)) {
+      throw new TypeError(`Cannot serialize a ${label} object (${reason}).`);
+    }
   }
   return null;
 }
