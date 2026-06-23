@@ -7723,3 +7723,1520 @@ describe("genuine #private: idempotent re-serialization", () => {
     expect(report.rounds[2].length).toBe(report.rounds[1].length); // stable size after round 1
   });
 });
+
+// Generality audit (re-serialization idempotence + genuine-private reconstruction).
+//
+// A single shared spawn-child fixture serializes a value N rounds IN ONE PROCESS — round k
+// serializes round k-1's RECONSTRUCTED value, writes the module, and re-imports it. Per round it
+// records: how many times an instance-field initializer re-ran (a counter side effect in the
+// initializer — MUST stay 0 on every reconstruction), the exercised result (private values, brand
+// checks, aliasing/identity), the public own keys of every probed instance (true privacy → empty),
+// the serialized code length (must STABILIZE from round 2 onward, never grow unboundedly), and the
+// `__bunReifyPatch(` DEFINITION count (one per genuine private-bearing class — stable across rounds).
+//
+// The suspected residual was MULTI-CLASS: patch keys are namespaced by a per-class id assigned in
+// emission-order (`genuineClassId`); the patch METHOD bakes its prefix at round-1 injection and is
+// NOT re-injected, while the patch VALUES object is re-emitted every round with a freshly computed
+// id. If emission order diverged between rounds the baked prefix and the value-object key would
+// mismatch → a lost #private. These tests prove the deterministic graph walk reproduces emission
+// order exactly (so the ids — and thus the prefixes — coincide) across 5 distinct classes, cycles,
+// and order-sensitive containers (Set/Map iteration, genuine instances as Map keys).
+describe("generality: genuine #private re-serialization", () => {
+  // Builds a fixture that re-serializes the value bound to `inst` for `rounds` rounds and prints one
+  // JSON report. `makeBody` is inlined source declaring `let inst = <value>;`. `exercise` is inlined
+  // source of `(inst) => <JSON-serializable payload>`.
+  function reserializeFixture(makeBody: string, exercise: string, rounds: number): string {
+    return [
+      `import { serialize } from "bun:closure";`,
+      `import { writeFileSync } from "node:fs";`,
+      `import { pathToFileURL } from "node:url";`,
+      `globalThis.__initRuns = 0;`, // any field initializer increments this
+      makeBody, // declares: let inst = <value>;
+      `const exercise = ${exercise};`,
+      `const runsAfterLiveConstruct = globalThis.__initRuns;`,
+      `const rounds = [];`,
+      `for (let round = 1; round <= ${rounds}; round++) {`,
+      `  const code = serialize(() => inst);`,
+      `  const runsBefore = globalThis.__initRuns;`,
+      `  const file = new URL("./round-" + round + ".mjs", import.meta.url);`,
+      `  writeFileSync(file, code);`,
+      `  const mod = await import(pathToFileURL(file.pathname).href);`,
+      `  inst = mod.default();`,
+      `  rounds.push({`,
+      `    round,`,
+      `    initRuns: globalThis.__initRuns - runsBefore,`,
+      `    result: exercise(inst),`,
+      `    length: code.length,`,
+      `    patchDefs: (code.match(/__bunReifyPatch\\s*\\(\\s*v\\s*\\)\\s*\\{/g) || []).length,`,
+      `    mangled: code.includes("$bunClosurePrivate$"),`, // genuine path: must stay false
+      `  });`,
+      `}`,
+      `console.log(JSON.stringify({ runsAfterLiveConstruct, rounds }));`,
+    ].join("\n");
+  }
+
+  type Report = {
+    runsAfterLiveConstruct: number;
+    rounds: Array<{
+      round: number;
+      initRuns: number;
+      result: unknown;
+      length: number;
+      patchDefs: number;
+      mangled: boolean;
+    }>;
+  };
+
+  async function runReserialize(makeBody: string, exercise: string, rounds: number): Promise<Report> {
+    using dir = tempDir(`closure-gen-reser-${counter++}`, {
+      "gen.mjs": reserializeFixture(makeBody, exercise, rounds),
+    });
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), `${String(dir)}/gen.mjs`],
+      env: bunEnv,
+      cwd: String(dir),
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    // Assert the whole {stdout-present, stderr, exitCode} shape so a crash surfaces the real error.
+    expect({ ok: stdout.length > 0, stderr: stderr.includes("error:") ? stderr : "", exitCode }).toEqual({
+      ok: true,
+      stderr: "",
+      exitCode: 0,
+    });
+    return JSON.parse(stdout.trim()) as Report;
+  }
+
+  // Asserts the universal idempotence invariants on a report:
+  //  - the LIVE construction ran every instance's initializer exactly once (`expectLiveRuns`,
+  //    one per genuine instance constructed in the source — N for an N-distinct-class graph),
+  //  - every round took the genuine path (never mangled),
+  //  - no initializer re-ran on any reconstruction (the core "reify never re-inits" invariant),
+  //  - the patch-definition count is `expectPatchDefs` every round,
+  //  - the serialized length is identical from round 2 onward (stabilizes, never grows),
+  //  - the exercised result is identical across every round (privacy + values preserved).
+  function assertIdempotent(report: Report, rounds: number, expectPatchDefs: number, expectLiveRuns = 1) {
+    expect(report.runsAfterLiveConstruct).toBe(expectLiveRuns); // initializers ran once per real instance
+    expect(report.rounds).toHaveLength(rounds);
+    const first = report.rounds[0];
+    for (const r of report.rounds) {
+      expect(r.mangled).toBe(false); // genuine #private path, never the mangled public fallback
+      expect(r.initRuns).toBe(0); // reconstruction NEVER re-runs an instance-field initializer
+      expect(r.patchDefs).toBe(expectPatchDefs); // one patch method per private-bearing class
+      expect(r.result).toEqual(first.result); // values, privacy, aliasing identical every round
+    }
+    // Length stabilizes from round 2: round 1 is the live class's source; from the first
+    // reconstruction onward the scaffold is fixed and re-injection is suppressed (idempotent).
+    const stable = report.rounds[1].length;
+    for (let i = 1; i < report.rounds.length; i++) {
+      expect(report.rounds[i].length).toBe(stable);
+    }
+  }
+
+  const ROUNDS = 10;
+
+  test("single #private class — 10 rounds, init runs 0×, length-stable, genuine", async () => {
+    const report = await runReserialize(
+      `class C { #x = (globalThis.__initRuns++, 42); get() { return this.#x; } }
+       let inst = new C();`,
+      `(i) => ({ x: i.get(), keys: Object.keys(i) })`,
+      ROUNDS,
+    );
+    assertIdempotent(report, ROUNDS, 1);
+    expect(report.rounds[0].result).toEqual({ x: 42, keys: [] });
+  });
+
+  test("multiple distinct private fields", async () => {
+    const report = await runReserialize(
+      `class C { #a = (globalThis.__initRuns++, 1); #b = 2; #c = 3; sum() { return this.#a + this.#b + this.#c; } }
+       let inst = new C();`,
+      `(i) => i.sum()`,
+      ROUNDS,
+    );
+    assertIdempotent(report, ROUNDS, 1);
+    expect(report.rounds[0].result).toBe(6);
+  });
+
+  test("inheritance chain (4 levels) with distinct private names — patch per level", async () => {
+    const report = await runReserialize(
+      `class A { #a = (globalThis.__initRuns++, 1); ga() { return this.#a; } }
+       class B extends A { #b = 2; gb() { return this.#b; } }
+       class C extends B { #c = 3; gc() { return this.#c; } }
+       class D extends C { #d = 4; gd() { return this.#d; } }
+       let inst = new D();`,
+      `(i) => [i.ga(), i.gb(), i.gc(), i.gd()]`,
+      ROUNDS,
+    );
+    assertIdempotent(report, ROUNDS, 4); // one patch method per private-bearing chain class
+    expect(report.rounds[0].result).toEqual([1, 2, 3, 4]);
+  });
+
+  test("SAME private name across an inheritance chain maps to each class's own slot", async () => {
+    const report = await runReserialize(
+      `class A { #x = (globalThis.__initRuns++, 10); ax() { return this.#x; } }
+       class B extends A { #x = 20; bx() { return this.#x; } }
+       class C extends B { #x = 30; cx() { return this.#x; } }
+       let inst = new C();`,
+      `(i) => [i.ax(), i.bx(), i.cx()]`,
+      ROUNDS,
+    );
+    // The per-class id prefix is what keeps the three identically-named #x slots distinct.
+    assertIdempotent(report, ROUNDS, 3);
+    expect(report.rounds[0].result).toEqual([10, 20, 30]);
+  });
+
+  test.each([
+    [
+      "Map",
+      `class M extends Map { #t = (globalThis.__initRuns++, "m"); gt() { return this.#t; } }
+       let inst = (() => { const m = new M(); m.set("k", "v"); return m; })();`,
+      `(i) => [i.gt(), i.get("k"), i.size]`,
+      ["m", "v", 1],
+    ],
+    [
+      "Set",
+      `class S extends Set { #t = (globalThis.__initRuns++, "s"); gt() { return this.#t; } }
+       let inst = (() => { const s = new S(); s.add(1); s.add(2); return s; })();`,
+      `(i) => [i.gt(), [...i], i.size]`,
+      ["s", [1, 2], 2],
+    ],
+    [
+      "Array",
+      `class A extends Array { #t = (globalThis.__initRuns++, "a"); gt() { return this.#t; } }
+       let inst = (() => { const a = new A(); a.push(9, 8, 7); return a; })();`,
+      `(i) => [i.gt(), [...i], i.length]`,
+      ["a", [9, 8, 7], 3],
+    ],
+  ])("a class extending %s reifies content + private genuinely across rounds", async (_name, body, ex, expected) => {
+    const report = await runReserialize(body, ex, ROUNDS);
+    assertIdempotent(report, ROUNDS, 1);
+    expect(report.rounds[0].result).toEqual(expected);
+  });
+
+  test("a #private VALUE that is itself a genuine-private instance (5 levels deep)", async () => {
+    const report = await runReserialize(
+      `class L0 { #v = (globalThis.__initRuns++, 0); g() { return this.#v; } }
+       class L1 { #c; constructor(c) { this.#c = c; } c() { return this.#c; } }
+       class L2 { #c; constructor(c) { this.#c = c; } c() { return this.#c; } }
+       class L3 { #c; constructor(c) { this.#c = c; } c() { return this.#c; } }
+       class L4 { #c; constructor(c) { this.#c = c; } c() { return this.#c; } }
+       let inst = new L4(new L3(new L2(new L1(new L0()))));`,
+      `(i) => i.c().c().c().c().g()`,
+      ROUNDS,
+    );
+    assertIdempotent(report, ROUNDS, 5);
+    expect(report.rounds[0].result).toBe(0);
+  });
+
+  test("a hosted escaped arrow reading #x via lexical this", async () => {
+    const report = await runReserialize(
+      `class C { #x = (globalThis.__initRuns++, 7); make() { return () => this.#x; } }
+       let inst = new C().make();`,
+      `(arrow) => arrow()`,
+      ROUNDS,
+    );
+    assertIdempotent(report, ROUNDS, 1);
+    expect(report.rounds[0].result).toBe(7);
+  });
+
+  test("a self-cycle: a #field points back to its own instance", async () => {
+    const report = await runReserialize(
+      `class C { #self; #v = (globalThis.__initRuns++, 5); constructor() { this.#self = this; } me() { return this.#self; } gv() { return this.#v; } }
+       let inst = new C();`,
+      `(i) => ({ selfIsSelf: i.me() === i, v: i.gv() })`,
+      ROUNDS,
+    );
+    assertIdempotent(report, ROUNDS, 1);
+    expect(report.rounds[0].result).toEqual({ selfIsSelf: true, v: 5 });
+  });
+
+  test("private + public fields mixed — privacy preserved, public restored", async () => {
+    const report = await runReserialize(
+      `class C { #p = (globalThis.__initRuns++, 1); pub = 2; both() { return this.#p + this.pub; } }
+       let inst = new C();`,
+      `(i) => ({ both: i.both(), pub: i.pub, keys: Object.keys(i) })`,
+      ROUNDS,
+    );
+    assertIdempotent(report, ROUNDS, 1);
+    expect(report.rounds[0].result).toEqual({ both: 3, pub: 2, keys: ["pub"] });
+  });
+
+  // ── MULTI-CLASS GRAPHS (the priority residual) ────────────────────────────────────────────
+  // A single serialized graph with N distinct genuine-private classes, reachable in orders that
+  // could perturb the per-class id assignment. If the round-1 baked patch-method prefix ever
+  // diverged from the round-N value-object key, a #private would read undefined — caught here
+  // because the exercised values would change between rounds (assertIdempotent compares them).
+
+  test("multi-class: 2 distinct private classes via array + reversed array + Map + Set", async () => {
+    const report = await runReserialize(
+      `class A { #a = (globalThis.__initRuns++, "A"); ga() { return this.#a; } }
+       class B { #b = (globalThis.__initRuns++, "B"); gb() { return this.#b; } }
+       let inst = (() => { const a = new A(), b = new B();
+         return { arr: [a, b], rev: [b, a], m: new Map([["b", b], ["a", a]]), s: new Set([b, a]) }; })();`,
+      `(i) => [i.arr[0].ga(), i.arr[1].gb(), i.rev[0].gb(), i.m.get("a").ga(), [...i.s][0].gb()]`,
+      ROUNDS,
+    );
+    // Two distinct private classes, one instance each → 2 live inits; reconstruction adds 0.
+    assertIdempotent(report, ROUNDS, 2, 2);
+    expect(report.rounds[0].result).toEqual(["A", "B", "B", "A", "B"]);
+  });
+
+  test("multi-class: 5 distinct private classes reached via a Set (iteration-order sensitive)", async () => {
+    const report = await runReserialize(
+      `class A { #a = (globalThis.__initRuns++, "A"); g() { return this.#a; } }
+       class B { #b = (globalThis.__initRuns++, "B"); g() { return this.#b; } }
+       class C { #c = (globalThis.__initRuns++, "C"); g() { return this.#c; } }
+       class D { #d = (globalThis.__initRuns++, "D"); g() { return this.#d; } }
+       class E { #e = (globalThis.__initRuns++, "E"); g() { return this.#e; } }
+       let inst = new Set([new C(), new E(), new A(), new D(), new B()]);`,
+      `(i) => [...i].map(x => x.g()).join("")`,
+      ROUNDS,
+    );
+    assertIdempotent(report, ROUNDS, 5, 5); // 5 distinct classes, one instance each
+    expect(report.rounds[0].result).toBe("CEADB"); // Set iteration order preserved through reify
+  });
+
+  test("multi-class: genuine instances as Map KEYS and values (key-iteration sensitive)", async () => {
+    const report = await runReserialize(
+      `class K { #id; constructor(i) { this.#id = (globalThis.__initRuns++, i); } id() { return this.#id; } }
+       class V { #v; constructor(v) { this.#v = (globalThis.__initRuns++, v); } v() { return this.#v; } }
+       let inst = (() => { const k1 = new K(1), k2 = new K(2);
+         const m = new Map(); m.set(k1, new V("a")); m.set(k2, new V("b"));
+         return { m, k1, k2 }; })();`,
+      `(i) => [i.m.get(i.k1).v(), i.m.get(i.k2).v(), i.k1.id(), i.k2.id()]`,
+      ROUNDS,
+    );
+    assertIdempotent(report, ROUNDS, 2, 4); // 2 keys + 2 values constructed live
+    expect(report.rounds[0].result).toEqual(["a", "b", 1, 2]);
+  });
+
+  test("multi-class: a mutual cycle between two distinct private classes", async () => {
+    const report = await runReserialize(
+      `class A { #peer; #t = (globalThis.__initRuns++, "A"); setPeer(p) { this.#peer = p; } peer() { return this.#peer; } t() { return this.#t; } }
+       class B { #peer; #t = (globalThis.__initRuns++, "B"); setPeer(p) { this.#peer = p; } peer() { return this.#peer; } t() { return this.#t; } }
+       let inst = (() => { const a = new A(), b = new B(); a.setPeer(b); b.setPeer(a); return { a, b }; })();`,
+      `(i) => ({ at: i.a.t(), bt: i.b.t(), aPeerIsB: i.a.peer() === i.b, bPeerIsA: i.b.peer() === i.a, viaPeer: i.a.peer().t() })`,
+      ROUNDS,
+    );
+    assertIdempotent(report, ROUNDS, 2, 2); // two instances in the cycle
+    expect(report.rounds[0].result).toEqual({ at: "A", bt: "B", aPeerIsB: true, bPeerIsA: true, viaPeer: "B" });
+  });
+
+  // ── CONTAINERS / POSITION / ALIASING ──────────────────────────────────────────────────────
+
+  test("aliased: the same instance via K paths collapses to one identity, privacy intact", async () => {
+    const report = await runReserialize(
+      `class A { #v = (globalThis.__initRuns++, "shared"); g() { return this.#v; } }
+       let inst = (() => { const a = new A();
+         return { p1: a, p2: a, arr: [a, a, a], m: new Map([["x", a]]), nested: { deep: { x: a } } }; })();`,
+      `(i) => { const all = [i.p1, i.p2, ...i.arr, i.m.get("x"), i.nested.deep.x];
+        return { v: i.p1.g(), allSame: all.every(x => x === i.p1), keys: Object.keys(i.p1) }; }`,
+      ROUNDS,
+    );
+    // Aliasing → ONE construction → initRuns 0 on reconstruction, one shared identity.
+    assertIdempotent(report, ROUNDS, 1);
+    expect(report.rounds[0].result).toEqual({ v: "shared", allSame: true, keys: [] });
+  });
+
+  test("deeply nested genuine instance with a #field cycling back to the root container", async () => {
+    const report = await runReserialize(
+      `class C { #v = (globalThis.__initRuns++, "z"); #back; g() { return this.#v; } setBack(o) { this.#back = o; } back() { return this.#back; } }
+       let inst = (() => { const c = new C(); const root = { a: { b: { c: [{ d: c }] } } }; c.setBack(root); return root; })();`,
+      `(i) => ({ v: i.a.b.c[0].d.g(), cyclesBack: i.a.b.c[0].d.back() === i })`,
+      ROUNDS,
+    );
+    assertIdempotent(report, ROUNDS, 1);
+    expect(report.rounds[0].result).toEqual({ v: "z", cyclesBack: true });
+  });
+
+  test("a builtin (Map) subclass instance holding ITSELF as a map value", async () => {
+    const report = await runReserialize(
+      `class M extends Map { #t = (globalThis.__initRuns++, "m"); gt() { return this.#t; } }
+       let inst = (() => { const m = new M(); m.set("self", m); m.set("x", 1); return m; })();`,
+      `(i) => ({ tag: i.gt(), selfIsSelf: i.get("self") === i, x: i.get("x") })`,
+      ROUNDS,
+    );
+    assertIdempotent(report, ROUNDS, 1);
+    expect(report.rounds[0].result).toEqual({ tag: "m", selfIsSelf: true, x: 1 });
+  });
+
+  // ── COMPOSITION ───────────────────────────────────────────────────────────────────────────
+
+  test("composition: a frozen genuine instance stays frozen with its #private intact", async () => {
+    const report = await runReserialize(
+      `class C { #x = (globalThis.__initRuns++, 42); g() { return this.#x; } }
+       let inst = Object.freeze(new C());`,
+      `(i) => ({ v: i.g(), frozen: Object.isFrozen(i) })`,
+      ROUNDS,
+    );
+    assertIdempotent(report, ROUNDS, 1);
+    expect(report.rounds[0].result).toEqual({ v: 42, frozen: true });
+  });
+
+  test.each([
+    [
+      "a Date",
+      `class C { #d; constructor(d) { this.#d = (globalThis.__initRuns++, d); } g() { return this.#d.getTime(); } }
+       let inst = new C(new Date(0));`,
+      `(i) => i.g()`,
+      0,
+    ],
+    [
+      "a Map",
+      `class C { #m; constructor(m) { this.#m = (globalThis.__initRuns++, m); } g() { return this.#m.get("k"); } }
+       let inst = new C(new Map([["k", "v"]]));`,
+      `(i) => i.g()`,
+      "v",
+    ],
+    [
+      "a global reference",
+      `class C { #f; constructor(f) { this.#f = (globalThis.__initRuns++, f); } g() { return this.#f(1, 9, 3); } }
+       let inst = new C(Math.max);`,
+      `(i) => i.g()`,
+      9,
+    ],
+  ])("composition: a #field holding %s round-trips and re-serializes", async (_name, body, ex, expected) => {
+    const report = await runReserialize(body, ex, ROUNDS);
+    assertIdempotent(report, ROUNDS, 1);
+    expect(report.rounds[0].result).toEqual(expected);
+  });
+
+  test("composition: a class static (public) restored alongside a #private, across rounds", async () => {
+    const report = await runReserialize(
+      `class C { static tag = "T"; #x = (globalThis.__initRuns++, 1); g() { return this.#x; } st() { return C.tag; } }
+       let inst = new C();`,
+      `(i) => ({ x: i.g(), tag: i.st() })`,
+      ROUNDS,
+    );
+    assertIdempotent(report, ROUNDS, 1);
+    expect(report.rounds[0].result).toEqual({ x: 1, tag: "T" });
+  });
+});
+
+describe("generality: aliasing & identity", () => {
+  // Each "value kind" is built so that ONE instance is reachable through several
+  // distinct paths in the returned graph. After round-trip, every path must
+  // reconstruct to ONE identity (`===`). `roundtrip` returns the default export
+  // (a function); calling it yields the graph.
+  //
+  // Builders return `() => graph`. The graph always exposes the shared value at
+  // `.a` (the canonical handle) plus the alternate paths. `check` receives the
+  // round-tripped graph and asserts identity across paths.
+  const kinds: Array<[name: string, build: () => () => any, check: (g: any) => void]> = [
+    [
+      "plain object",
+      () => {
+        const a = { id: "hub" };
+        return () => ({ a, arr: [a, [a]], m: new Map([[a, a]]), s: new Set([a]), nest: { x: { y: a } } });
+      },
+      g => {
+        const a = g.a;
+        expect(g.arr[0]).toBe(a);
+        expect(g.arr[1][0]).toBe(a);
+        expect([...g.s][0]).toBe(a);
+        expect(g.nest.x.y).toBe(a);
+        const [[k, val]] = [...g.m];
+        expect(k).toBe(a);
+        expect(val).toBe(a);
+        expect(g.m.get(a)).toBe(a);
+      },
+    ],
+    [
+      "array",
+      () => {
+        const a = [1, 2, 3];
+        return () => ({ a, arr: [a, a], m: new Map([["k", a]]), s: new Set([a]) });
+      },
+      g => {
+        expect(g.arr[0]).toBe(g.a);
+        expect(g.arr[1]).toBe(g.a);
+        expect([...g.m.values()][0]).toBe(g.a);
+        expect([...g.s][0]).toBe(g.a);
+      },
+    ],
+    [
+      "function",
+      () => {
+        function a() {
+          return 1;
+        }
+        return () => ({ a, arr: [a], s: new Set([a]), nest: { f: a } });
+      },
+      g => {
+        expect(g.arr[0]).toBe(g.a);
+        expect([...g.s][0]).toBe(g.a);
+        expect(g.nest.f).toBe(g.a);
+      },
+    ],
+    [
+      "class constructor",
+      () => {
+        class A {
+          m() {
+            return 1;
+          }
+        }
+        return () => ({ a: A, arr: [A], m: new Map([["k", A]]) });
+      },
+      g => {
+        expect(g.arr[0]).toBe(g.a);
+        expect([...g.m.values()][0]).toBe(g.a);
+      },
+    ],
+    [
+      "class instance",
+      () => {
+        class K {
+          x = 1;
+        }
+        const a = new K();
+        return () => ({ a, arr: [a], m: new Map([[a, a]]), s: new Set([a]) });
+      },
+      g => {
+        expect(g.arr[0]).toBe(g.a);
+        expect([...g.s][0]).toBe(g.a);
+        const [[k, val]] = [...g.m];
+        expect(k).toBe(g.a);
+        expect(val).toBe(g.a);
+      },
+    ],
+    [
+      "Date",
+      () => {
+        const a = new Date(0);
+        return () => ({ a, arr: [a], m: new Map([[a, a]]), s: new Set([a]) });
+      },
+      g => {
+        expect(g.arr[0]).toBe(g.a);
+        const [[k, val]] = [...g.m];
+        expect(k).toBe(g.a);
+        expect(val).toBe(g.a);
+        expect([...g.s][0]).toBe(g.a);
+      },
+    ],
+    [
+      "RegExp",
+      () => {
+        const a = /x/g;
+        return () => ({ a, arr: [a], s: new Set([a]) });
+      },
+      g => {
+        expect(g.arr[0]).toBe(g.a);
+        expect([...g.s][0]).toBe(g.a);
+      },
+    ],
+    [
+      "Map instance",
+      () => {
+        const a = new Map([["k", 1]]);
+        return () => ({ a, arr: [a], wrap: { m: a } });
+      },
+      g => {
+        expect(g.arr[0]).toBe(g.a);
+        expect(g.wrap.m).toBe(g.a);
+      },
+    ],
+    [
+      "Set instance",
+      () => {
+        const a = new Set([1]);
+        return () => ({ a, arr: [a], wrap: { s: a } });
+      },
+      g => {
+        expect(g.arr[0]).toBe(g.a);
+        expect(g.wrap.s).toBe(g.a);
+      },
+    ],
+    [
+      "WeakMap",
+      () => {
+        const a = new WeakMap();
+        return () => ({ a, arr: [a], m: new Map([["w", a]]) });
+      },
+      g => {
+        expect(g.arr[0]).toBe(g.a);
+        expect(g.m.get("w")).toBe(g.a);
+      },
+    ],
+    [
+      "WeakRef",
+      () => {
+        const target = { w: 1 };
+        const a = new WeakRef(target);
+        return () => ({ a, arr: [a], target });
+      },
+      g => {
+        expect(g.arr[0]).toBe(g.a);
+        expect(g.a.deref()).toBe(g.target);
+      },
+    ],
+    [
+      "typed array",
+      () => {
+        const a = new Uint8Array([1, 2, 3]);
+        return () => ({ a, arr: [a], s: new Set([a]) });
+      },
+      g => {
+        expect(g.arr[0]).toBe(g.a);
+        expect([...g.s][0]).toBe(g.a);
+      },
+    ],
+    [
+      "boxed primitive",
+      () => {
+        // eslint-disable-next-line no-new-wrappers
+        const a = new Number(42);
+        return () => ({ a, arr: [a], m: new Map([[a, a]]) });
+      },
+      g => {
+        expect(g.arr[0]).toBe(g.a);
+        const [[k, val]] = [...g.m];
+        expect(k).toBe(g.a);
+        expect(val).toBe(g.a);
+      },
+    ],
+    [
+      "Error",
+      () => {
+        const a = new Error("boom");
+        return () => ({ a, arr: [a], s: new Set([a]) });
+      },
+      g => {
+        expect(g.arr[0]).toBe(g.a);
+        expect([...g.s][0]).toBe(g.a);
+      },
+    ],
+    [
+      "Proxy",
+      () => {
+        const a = new Proxy({ x: 1 }, {});
+        return () => ({ a, arr: [a], wrap: { p: a } });
+      },
+      g => {
+        expect(g.arr[0]).toBe(g.a);
+        expect(g.wrap.p).toBe(g.a);
+        expect(g.a.x).toBe(1);
+      },
+    ],
+    [
+      "bound function",
+      () => {
+        function f(x: number, y: number) {
+          return x + y;
+        }
+        const a = f.bind(null, 1);
+        return () => ({ a, arr: [a], wrap: { b: a } });
+      },
+      g => {
+        expect(g.arr[0]).toBe(g.a);
+        expect(g.wrap.b).toBe(g.a);
+        expect(g.a(2)).toBe(3);
+      },
+    ],
+    [
+      "well-known global (Math)",
+      () => {
+        return () => ({ a: Math, arr: [Math], wrap: { m: Math } });
+      },
+      g => {
+        expect(g.a).toBe(Math);
+        expect(g.arr[0]).toBe(Math);
+        expect(g.wrap.m).toBe(Math);
+      },
+    ],
+    [
+      "genuine #private instance",
+      () => {
+        class K {
+          #p = 99;
+          peek() {
+            return this.#p;
+          }
+        }
+        const a = new K();
+        return () => ({ a, arr: [a], m: new Map([[a, a]]), s: new Set([a]) });
+      },
+      g => {
+        // The #private VALUE is a documented non-goal; identity dedup is not.
+        expect(g.arr[0]).toBe(g.a);
+        const [[k, val]] = [...g.m];
+        expect(k).toBe(g.a);
+        expect(val).toBe(g.a);
+        expect([...g.s][0]).toBe(g.a);
+      },
+    ],
+    [
+      "Symbol value",
+      () => {
+        const a = Symbol("tag");
+        return () => ({ a, arr: [a], m: new Map([[a, a]]), o: { [a]: 1, ref: a } });
+      },
+      g => {
+        expect(g.arr[0]).toBe(g.a);
+        const [[k, val]] = [...g.m];
+        expect(k).toBe(g.a);
+        expect(val).toBe(g.a);
+        expect(g.o.ref).toBe(g.a);
+      },
+    ],
+  ];
+
+  test.each(kinds)("%s: one instance, K>=3 paths -> single identity", async (_name, build, check) => {
+    const out = await roundtrip(build());
+    check((out as any)());
+  });
+
+  test("ArrayBuffer shared by multiple views stays shared", async () => {
+    const out = await roundtrip(() => {
+      const ab = new ArrayBuffer(16);
+      const u8 = new Uint8Array(ab, 0, 8);
+      const u8b = new Uint8Array(ab, 8, 8);
+      const f64 = new Float64Array(ab);
+      return { ab, u8, u8b, f64 };
+    });
+    const g = (out as any)();
+    expect(g.u8.buffer).toBe(g.ab);
+    expect(g.u8b.buffer).toBe(g.ab);
+    expect(g.f64.buffer).toBe(g.ab);
+    expect(g.u8.buffer).toBe(g.u8b.buffer);
+    expect(g.u8b.byteOffset).toBe(8);
+  });
+
+  test("cycle + aliasing: shared value participates in a self cycle", async () => {
+    const out = await roundtrip(() => {
+      const o: any = {};
+      o.self = o;
+      o.also = o;
+      return { a: o, b: o, arr: [o] };
+    });
+    const g = (out as any)();
+    expect(g.a).toBe(g.b);
+    expect(g.arr[0]).toBe(g.a);
+    expect(g.a.self).toBe(g.a);
+    expect(g.a.also).toBe(g.a);
+    expect(g.a.self.self.self).toBe(g.a);
+  });
+
+  test("mutual cycle where both nodes are aliased elsewhere", async () => {
+    const out = await roundtrip(() => {
+      const x: any = {};
+      const y: any = {};
+      x.y = y;
+      y.x = x;
+      return { x, y, arr: [x, y], ax: x, ay: y };
+    });
+    const g = (out as any)();
+    expect(g.x).toBe(g.ax);
+    expect(g.y).toBe(g.ay);
+    expect(g.x.y).toBe(g.y);
+    expect(g.y.x).toBe(g.x);
+    expect(g.arr[0]).toBe(g.x);
+    expect(g.arr[1]).toBe(g.y);
+    expect(g.x.y.x).toBe(g.x);
+  });
+
+  test("aliased value buried deep on one path, shallow on another", async () => {
+    const out = await roundtrip(() => {
+      const hub = { tag: "deep" };
+      let cur: any = { leaf: hub };
+      for (let i = 0; i < 25; i++) cur = { next: cur };
+      return { shallow: hub, deep: cur };
+    });
+    const g = (out as any)();
+    let c = g.deep;
+    for (let i = 0; i < 25; i++) c = c.next;
+    expect(c.leaf).toBe(g.shallow);
+  });
+
+  test("dedup direction: one value is Map key AND value AND Set member AND prop", async () => {
+    const out = await roundtrip(() => {
+      const x = { role: "all" };
+      const m = new Map([[x, x]]);
+      const s = new Set([x]);
+      return { prop: x, m, s };
+    });
+    const g = (out as any)();
+    const x = g.prop;
+    const [[k, val]] = [...g.m];
+    expect(k).toBe(x);
+    expect(val).toBe(x);
+    expect(g.m.get(x)).toBe(x); // key->value identity actually wired
+    expect([...g.s][0]).toBe(x);
+    expect(g.s.has(x)).toBe(true);
+  });
+
+  test("scale: a hub referenced by 500 distinct nodes is one identity, no blow-up", async () => {
+    const out = await roundtrip(() => {
+      const hub = { h: 1 };
+      const nodes: any[] = [];
+      for (let i = 0; i < 500; i++) nodes.push({ i, ref: hub });
+      return { hub, nodes };
+    });
+    const g = (out as any)();
+    expect(g.nodes).toHaveLength(500);
+    for (const node of g.nodes) expect(node.ref).toBe(g.hub);
+    expect(g.nodes[0].ref).toBe(g.nodes[499].ref);
+  });
+
+  test("free variable aliases a value also reachable in the returned object", async () => {
+    const out = await roundtrip(() => {
+      const shared = { fv: 1 };
+      const get = () => shared;
+      return { shared, get };
+    });
+    const g = (out as any)();
+    expect(g.shared).toBe(g.get());
+  });
+
+  test("two separate closures capturing the same cell reconstruct one identity", async () => {
+    const out = await roundtrip(() => {
+      const cell = { c: 1 };
+      const f = () => cell;
+      const h = () => cell;
+      return { f, h, cell };
+    });
+    const g = (out as any)();
+    expect(g.f()).toBe(g.cell);
+    expect(g.h()).toBe(g.cell);
+    expect(g.f()).toBe(g.h());
+  });
+
+  test("a getter's closed-over value is the same identity as a direct property", async () => {
+    const out = await roundtrip(() => {
+      const secret = { s: 1 };
+      return {
+        direct: secret,
+        get g() {
+          return secret;
+        },
+      };
+    });
+    const g = (out as any)();
+    expect(g.direct).toBe(g.g);
+  });
+
+  test("class static field aliases an instance field of the same value", async () => {
+    const out = await roundtrip(() => {
+      const shared = { s: 1 };
+      class K {
+        static hub = shared;
+        ref = shared;
+      }
+      const inst = new K();
+      return { Cls: K, inst };
+    });
+    const g = (out as any)();
+    expect(g.Cls.hub).toBe(g.inst.ref);
+  });
+
+  test("object reachable via plain, non-enumerable, and symbol keys is one identity", async () => {
+    const out = await roundtrip(() => {
+      const x = { x: 1 };
+      const o: any = { a: x };
+      Object.defineProperty(o, "b", { value: x, enumerable: false });
+      o[Symbol.for("aliasing-test-sym")] = x;
+      return { o, x };
+    });
+    const g = (out as any)();
+    expect(g.o.a).toBe(g.x);
+    expect(g.o.b).toBe(g.x);
+    expect(g.o[Symbol.for("aliasing-test-sym")]).toBe(g.x);
+  });
+
+  test("distinct empty objects must NOT be merged", async () => {
+    const out = await roundtrip(() => {
+      const a = {};
+      const b = {};
+      return { a, b, arr: [a, b] };
+    });
+    const g = (out as any)();
+    expect(g.a).not.toBe(g.b);
+    expect(g.arr[0]).not.toBe(g.arr[1]);
+    expect(g.arr[0]).toBe(g.a);
+    expect(g.arr[1]).toBe(g.b);
+  });
+
+  test("distinct boxed primitives with equal value must NOT be merged", async () => {
+    const out = await roundtrip(() => {
+      // eslint-disable-next-line no-new-wrappers
+      const a = new Number(5);
+      // eslint-disable-next-line no-new-wrappers
+      const b = new Number(5);
+      return { a, b };
+    });
+    const g = (out as any)();
+    expect(g.a).not.toBe(g.b);
+    expect(+g.a).toBe(5);
+    expect(+g.b).toBe(5);
+  });
+
+  test("self-referential array aliased elsewhere closes its cycle", async () => {
+    const out = await roundtrip(() => {
+      const a: any[] = [];
+      a.push(a);
+      a.push(a);
+      return { a, alias: a };
+    });
+    const g = (out as any)();
+    expect(g.a).toBe(g.alias);
+    expect(g.a[0]).toBe(g.a);
+    expect(g.a[1]).toBe(g.a);
+  });
+
+  test("Map whose key is the Map itself closes its cycle", async () => {
+    const out = await roundtrip(() => {
+      const m = new Map<any, any>();
+      m.set(m, "self");
+      return { m };
+    });
+    const g = (out as any)();
+    expect([...g.m.keys()][0]).toBe(g.m);
+    expect(g.m.get(g.m)).toBe("self");
+  });
+
+  test("two Maps sharing the same key object reconstruct one key identity", async () => {
+    const out = await roundtrip(() => {
+      const key = { k: 1 };
+      const m1 = new Map([[key, "a"]]);
+      const m2 = new Map([[key, "b"]]);
+      return { key, m1, m2 };
+    });
+    const g = (out as any)();
+    expect([...g.m1.keys()][0]).toBe(g.key);
+    expect([...g.m2.keys()][0]).toBe(g.key);
+    expect([...g.m1.keys()][0]).toBe([...g.m2.keys()][0]);
+  });
+
+  test("shared prototype object across two Object.create targets is one identity", async () => {
+    const out = await roundtrip(() => {
+      const proto = {
+        greet() {
+          return "hi";
+        },
+      };
+      const a = Object.create(proto);
+      const b = Object.create(proto);
+      return { a, b, proto };
+    });
+    const g = (out as any)();
+    expect(Object.getPrototypeOf(g.a)).toBe(g.proto);
+    expect(Object.getPrototypeOf(g.b)).toBe(g.proto);
+    expect(Object.getPrototypeOf(g.a)).toBe(Object.getPrototypeOf(g.b));
+  });
+
+  test("omni-container: shared value reachable through every kind plus a cycle", async () => {
+    const out = await roundtrip(() => {
+      const h = { hub: 1 };
+      const o: any = {
+        h,
+        arr: [h],
+        m: new Map([[h, h]]),
+        s: new Set([h]),
+        nest: { a: { b: h } },
+        fn: function () {
+          return h;
+        },
+      };
+      o.cycle = o;
+      return o;
+    });
+    const g = (out as any)();
+    const h = g.h;
+    expect(g.arr[0]).toBe(h);
+    const [[k, val]] = [...g.m];
+    expect(k).toBe(h);
+    expect(val).toBe(h);
+    expect([...g.s][0]).toBe(h);
+    expect(g.nest.a.b).toBe(h);
+    expect(g.cycle).toBe(g);
+    expect(g.fn()).toBe(h);
+  });
+});
+
+// ── Generality audit: replacer + property descriptors ────────────────────────
+// These prove the JSON.stringify-style `serialize(fn, replacer)` and the
+// property-descriptor handling are general across DEPTH, every container
+// (object / array / Map / Set / class instance / builtin subclass), cycles, and
+// every key kind (string / array-index / Map-key / Set-index / symbol / #private)
+// — not spot-checks. The replacer runs at serialize time; reconstruction is
+// imported and exercised in-process. Each test serializes a CAPTURED free
+// variable (`() => value`) so the replacer actually traverses the graph (a value
+// produced only as the function's RETURN value is never visited).
+describe("generality: replacer & descriptors", () => {
+  let n = 0;
+  // Serialize `() => value` with `replacer`, reconstruct, return the captured value.
+  async function rt<T>(value: T, replacer?: (key: string, val: unknown) => unknown): Promise<T> {
+    const cap = () => value;
+    const code = serialize(cap, replacer as any);
+    using dir = tempDir(`closure-gen-${n++}`, { "mod.mjs": code });
+    const { default: fn } = await import(`${String(dir)}/mod.mjs`);
+    return fn() as T;
+  }
+  const x100 = (_k: string, v: unknown) => (typeof v === "number" ? (v as number) * 100 : v);
+  const dropUndef = (val: unknown) => (val === "SECRET" ? undefined : val);
+
+  describe("replacer fires at every depth and position", () => {
+    test("transforms object properties 10 levels deep", async () => {
+      let deep: any = { v: 0 };
+      for (let i = 1; i <= 10; i++) deep = { v: i, child: deep };
+      const out: any = await rt(deep, x100);
+      let node = out;
+      const seen: number[] = [];
+      while (node) {
+        seen.push(node.v);
+        node = node.child;
+      }
+      expect(seen).toEqual([1000, 900, 800, 700, 600, 500, 400, 300, 200, 100, 0]);
+    });
+
+    test("transforms nested array elements at every level", async () => {
+      const out = await rt([1, [2, [3, [4]]]], x100);
+      expect(out).toEqual([100, [200, [300, [400]]]]);
+    });
+
+    test("transforms Map values (top-level and nested)", async () => {
+      const out = await rt(
+        {
+          m: new Map<string, number>([
+            ["a", 1],
+            ["b", 2],
+          ]),
+        },
+        x100,
+      );
+      expect([...out.m.entries()]).toEqual([
+        ["a", 100],
+        ["b", 200],
+      ]);
+    });
+
+    test("transforms Set members", async () => {
+      const out = await rt(new Set([1, 2, 3]), x100);
+      expect([...out.values()]).toEqual([100, 200, 300]);
+    });
+
+    test("transforms class-instance public fields at depth", async () => {
+      class Pt {
+        x: number;
+        y: number;
+        nested: { z: number };
+        constructor(x: number, y: number) {
+          this.x = x;
+          this.y = y;
+          this.nested = { z: 3 };
+        }
+      }
+      const out = await rt(new Pt(1, 2), x100);
+      expect([out.x, out.y, out.nested.z]).toEqual([100, 200, 300]);
+      expect(out).toBeInstanceOf(Object.getPrototypeOf(out).constructor);
+    });
+
+    test("transforms deeply-mixed object → Set → Map → array", async () => {
+      const out = await rt({ s: new Set([new Map<string, number[]>([["k", [1, 2]]])]) }, x100);
+      const inner = [...out.s][0];
+      expect([...inner.get("k")!]).toEqual([100, 200]);
+    });
+  });
+
+  describe("key semantics per position", () => {
+    test("Map value is keyed by its string entry-key", async () => {
+      const out = await rt(
+        new Map<string, number>([
+          ["keep", 1],
+          ["zap", 2],
+        ]),
+        (k, v) => (k === "zap" ? "X" : v),
+      );
+      expect([...out.entries()]).toEqual([
+        ["keep", 1],
+        ["zap", "X"],
+      ]);
+    });
+
+    test("Map value with a non-string key is keyed by positional index", async () => {
+      const out = await rt(
+        new Map<object, number>([
+          [{ id: 1 }, 10],
+          [{ id: 2 }, 20],
+        ]),
+        (k, v) => (k === "1" ? "X" : v),
+      );
+      expect([...out.values()]).toEqual([10, "X"]);
+    });
+
+    test("Set member is keyed by positional index", async () => {
+      const out = await rt(new Set([10, 20, 30]), (k, v) => (k === "1" ? "X" : v));
+      expect([...out.values()]).toEqual([10, "X", 30]);
+    });
+
+    test("array element is keyed by its index as a string", async () => {
+      const out = await rt([5, 6, 7], (k, v) => (k === "1" ? "X" : v));
+      expect(out).toEqual([5, "X", 7]);
+    });
+
+    test('dropping key "" does NOT wipe a Map (the old root-collision bug)', async () => {
+      const out = await rt(
+        new Map<string, number>([
+          ["a", 1],
+          ["b", 2],
+        ]),
+        (k, v) => (k === "" ? undefined : v),
+      );
+      expect([...out.entries()]).toEqual([
+        ["a", 1],
+        ["b", 2],
+      ]);
+    });
+
+    test('dropping key "" does NOT wipe a Set', async () => {
+      const out = await rt(new Set([10, 20]), (k, v) => (k === "" ? undefined : v));
+      expect([...out.values()]).toEqual([10, 20]);
+    });
+
+    test('dropping key "" does NOT wipe a NESTED Map/Set at depth', async () => {
+      const out = await rt({ lvl: { m: new Map([["a", 1]]), s: new Set([9]) } }, (k, v) => (k === "" ? undefined : v));
+      expect([...out.lvl.m.entries()]).toEqual([["a", 1]]);
+      expect([...out.lvl.s.values()]).toEqual([9]);
+    });
+
+    test("a #private field is passed under its #name", async () => {
+      class Secret {
+        #s: number;
+        constructor(s: number) {
+          this.#s = s;
+        }
+        reveal() {
+          return this.#s;
+        }
+      }
+      const keys: string[] = [];
+      const out = await rt(new Secret(7), (k, v) => {
+        keys.push(k);
+        return typeof v === "number" ? (v as number) * 100 : v;
+      });
+      expect(keys).toContain("#s");
+      expect(out.reveal()).toBe(700);
+    });
+  });
+
+  describe("drop (returning undefined) is general across key kinds and depth", () => {
+    test("drops an enumerable string property", async () => {
+      const out = await rt({ keep: 1, gone: "SECRET" }, (_k, v) => dropUndef(v));
+      expect(out).toEqual({ keep: 1 });
+    });
+
+    test("drops a NON-enumerable property", async () => {
+      const o: any = { shown: 1 };
+      Object.defineProperty(o, "hidden", { value: "SECRET", enumerable: false, configurable: true, writable: true });
+      const out = await rt(o, (_k, v) => dropUndef(v));
+      expect(Object.getOwnPropertyNames(out)).toEqual(["shown"]);
+    });
+
+    test("drops a SYMBOL-keyed property", async () => {
+      const S = Symbol("s");
+      const out = await rt({ [S]: "SECRET", v: 1 } as any, (_k, v) => dropUndef(v));
+      expect(Object.getOwnPropertySymbols(out)).toHaveLength(0);
+      expect(out.v).toBe(1);
+    });
+
+    test("drops a class-instance field", async () => {
+      class Pt {
+        x = 1;
+        y = "SECRET";
+      }
+      const out = await rt(new Pt(), (_k, v) => dropUndef(v));
+      expect("x" in out).toBe(true);
+      expect("y" in out).toBe(false);
+    });
+
+    test("drops at depth (level 5)", async () => {
+      let d: any = { leaf: "SECRET", keep: 1 };
+      for (let i = 0; i < 5; i++) d = { child: d, lvl: i };
+      const out = await rt(d, (_k, v) => dropUndef(v));
+      let x = out;
+      while (x.child) x = x.child;
+      expect("leaf" in x).toBe(false);
+      expect(x.keep).toBe(1);
+    });
+
+    test("dropping a Map/Set value keeps the entry with value undefined (NOT JSON-style removal)", async () => {
+      // Documented divergence from JSON.stringify: a Map/Set is a keyed/positional
+      // collection, so an entry is not removed — its value becomes undefined.
+      const m = await rt(
+        new Map<string, number>([
+          ["a", 1],
+          ["b", 2],
+        ]),
+        (k, v) => (k === "b" ? undefined : v),
+      );
+      expect([...m.entries()]).toEqual([
+        ["a", 1],
+        ["b", undefined],
+      ]);
+      const s = await rt(new Set([1, 2, 3]), (k, v) => (k === "1" ? undefined : v));
+      expect([...s.values()]).toEqual([1, undefined, 3]);
+    });
+  });
+
+  describe("transform-to-complex: the replacer's return value is fully (re)serialized", () => {
+    test("returning a new object is recursed into", async () => {
+      const out = await rt({ a: 1 }, (k, v) => (k === "a" ? { nested: 5 } : v));
+      expect(out).toEqual({ a: { nested: 5 } });
+    });
+
+    test("the returned object's children are themselves transformed at depth", async () => {
+      const out = await rt({ a: "X" }, (k, v) => {
+        if (k === "a") return { m: 3 };
+        return typeof v === "number" ? (v as number) * 100 : v;
+      });
+      expect(out).toEqual({ a: { m: 300 } });
+    });
+
+    test("returning a Map is serialized", async () => {
+      const out = await rt({ a: 1 }, (k, v) => (k === "a" ? new Map([["z", 9]]) : v));
+      expect([...out.a.entries()]).toEqual([["z", 9]]);
+    });
+
+    test("returning a fresh cycle is preserved (no infinite loop)", async () => {
+      const out = await rt({ a: 1 }, (k, v) => {
+        if (k === "a") {
+          const c: any = {};
+          c.loop = c;
+          return c;
+        }
+        return v;
+      });
+      expect(out.a.loop).toBe(out.a);
+    });
+  });
+
+  describe("cycles compose with the replacer", () => {
+    test("a self-referential graph is preserved while values are transformed", async () => {
+      const o: any = { n: 2 };
+      o.self = o;
+      const out: any = await rt(o, x100);
+      expect(out.self).toBe(out);
+      expect(out.n).toBe(200);
+    });
+  });
+
+  describe("`this` is the holder", () => {
+    test("object holder", async () => {
+      const out = await rt({ a: 1, b: 2 }, function (this: any, k, v) {
+        return k === "a" ? this.b : v;
+      });
+      expect(out.a).toBe(2);
+    });
+
+    test("array holder (this is the array)", async () => {
+      const out = await rt([10, 20, 30], function (this: any, k, v) {
+        return k === "0" ? this.length : v;
+      });
+      expect(out).toEqual([3, 20, 30]);
+    });
+
+    test("Map holder (this is the Map)", async () => {
+      const out = await rt(new Map([["a", 1]]), function (this: any, k, v) {
+        return k === "a" ? (this instanceof Map ? "ISMAP" : "NO") : v;
+      });
+      expect([...out.entries()]).toEqual([["a", "ISMAP"]]);
+    });
+
+    test("nested holder is the immediate parent", async () => {
+      const out = await rt({ outer: { inner: 1 } }, function (this: any, k, v) {
+        return k === "inner" ? (this.inner === 1 ? "PARENT_OK" : "NO") : v;
+      });
+      expect(out.outer.inner).toBe("PARENT_OK");
+    });
+  });
+
+  describe("replacer composes with builtins / proxies / bound fns at depth", () => {
+    test("Date passes through intact while siblings transform", async () => {
+      const out = await rt({ d: new Date(0), n: 5 }, x100);
+      expect(out.d).toBeInstanceOf(Date);
+      expect(out.d.getTime()).toBe(0);
+      expect(out.n).toBe(500);
+    });
+
+    test("typed array stays intact; sibling transforms", async () => {
+      const out = await rt({ ta: new Uint8Array([1, 2, 3]), n: 2 }, x100);
+      expect(out.ta).toBeInstanceOf(Uint8Array);
+      expect(Array.from(out.ta)).toEqual([1, 2, 3]);
+      expect(out.n).toBe(200);
+    });
+
+    test("Error passes through; sibling transforms", async () => {
+      const out = await rt({ e: new Error("msg"), n: 1 }, x100);
+      expect(out.e).toBeInstanceOf(Error);
+      expect(out.e.message).toBe("msg");
+      expect(out.n).toBe(100);
+    });
+
+    test("a builtin subclass (extends Map) has both entries and own fields transformed", async () => {
+      class MyMap extends Map<string, number> {
+        meta = 9;
+        constructor(e: [string, number][]) {
+          super(e);
+        }
+      }
+      const out = await rt(new MyMap([["a", 1]]), x100);
+      expect(out).toBeInstanceOf(Map);
+      expect(out.get("a")).toBe(100);
+      expect(out.meta).toBe(900);
+    });
+
+    test("Proxy target is traversed and transformed", async () => {
+      const out = await rt(new Proxy({ n: 4 }, {}), x100);
+      expect(out.n).toBe(400);
+    });
+
+    test("bound function's bound-this state is transformed", async () => {
+      const obj = { v: 3 };
+      function f(this: any) {
+        return this.v;
+      }
+      const bound = f.bind(obj);
+      const out = await rt(bound as any, x100);
+      expect((out as any)()).toBe(300);
+    });
+
+    test("frozen object's value is transformed and frozenness preserved", async () => {
+      const out = await rt(Object.freeze({ n: 5 }), x100);
+      expect(Object.isFrozen(out)).toBe(true);
+      expect(out.n).toBe(500);
+    });
+  });
+
+  describe("replacer failure modes", () => {
+    test("a throwing replacer (deep) propagates a clear serializer error", async () => {
+      // Capture the graph as a free variable so the replacer actually traverses it.
+      const value = { a: { b: 1 } };
+      const cap = () => value;
+      expect(() =>
+        serialize(cap, (k: string, v: unknown) => {
+          if (k === "b") throw new Error("boom-deep");
+          return v;
+        }),
+      ).toThrow("boom-deep");
+    });
+  });
+
+  describe("documented divergences from JSON.stringify", () => {
+    test("a getter's VALUE is NOT passed through the replacer (accessor preserved, getter not invoked)", async () => {
+      // JSON.stringify would invoke `g` and yield 500; the closure serializer
+      // preserves the accessor descriptor and never invokes the getter, so the
+      // replacer never sees its value. The data sibling `x` IS transformed.
+      const o: any = { x: 1 };
+      Object.defineProperty(o, "g", { get: () => 5, enumerable: true, configurable: true });
+      const out: any = await rt(o, x100);
+      expect(out.x).toBe(100);
+      expect(out.g).toBe(5);
+      expect(typeof Object.getOwnPropertyDescriptor(out, "g")!.get).toBe("function");
+    });
+
+    test("toJSON is NOT honored (consistently, at depth)", async () => {
+      const out: any = await rt({ wrap: { toJSON: () => "X", real: 1 } }, (_k, v) => v);
+      expect(out.wrap.real).toBe(1);
+    });
+
+    test("a getter that throws is preserved (not invoked during serialization)", async () => {
+      const o: any = { ok: 1 };
+      Object.defineProperty(o, "bad", {
+        get() {
+          throw new Error("nope");
+        },
+        enumerable: true,
+        configurable: true,
+      });
+      const out: any = await rt(o, (_k, v) => v);
+      expect(typeof Object.getOwnPropertyDescriptor(out, "bad")!.get).toBe("function");
+      expect(out.ok).toBe(1);
+    });
+  });
+
+  describe("descriptor preservation: full writable×enumerable×configurable matrix", () => {
+    const combos: Array<[number, number, number]> = [
+      [1, 1, 1],
+      [1, 1, 0],
+      [1, 0, 1],
+      [1, 0, 0],
+      [0, 1, 1],
+      [0, 1, 0],
+      [0, 0, 1],
+      [0, 0, 0],
+    ];
+    function matrixObj() {
+      const o: any = {};
+      for (const [w, e, c] of combos) {
+        Object.defineProperty(o, `k${w}${e}${c}`, {
+          value: 42,
+          writable: !!w,
+          enumerable: !!e,
+          configurable: !!c,
+        });
+      }
+      return o;
+    }
+    function dump(o: any) {
+      const d = Object.getOwnPropertyDescriptors(o);
+      const out: Record<string, number[]> = {};
+      for (const k of Object.keys(d)) {
+        const x = d[k];
+        out[k] = [x.value, +!!x.writable, +!!x.enumerable, +!!x.configurable];
+      }
+      return out;
+    }
+
+    test("preserved exactly at the root", async () => {
+      const src = matrixObj();
+      const out = await rt(src, (_k, v) => v);
+      expect(dump(out)).toEqual(dump(src));
+    });
+
+    test("preserved exactly when nested", async () => {
+      const src = matrixObj();
+      const out = await rt({ inner: src }, (_k, v) => v);
+      expect(dump(out.inner)).toEqual(dump(src));
+    });
+
+    test("preserved on a non-index array own property", async () => {
+      const a: any = [1];
+      Object.defineProperty(a, "extra", { value: 42, writable: false, enumerable: false, configurable: true });
+      const out = await rt(a, (_k, v) => v);
+      const d = Object.getOwnPropertyDescriptor(out, "extra")!;
+      expect([d.value, d.writable, d.enumerable, d.configurable]).toEqual([42, false, false, true]);
+    });
+
+    test("preserved on a class instance", async () => {
+      class C {}
+      const src: any = new C();
+      Object.defineProperty(src, "p", { value: 7, writable: false, enumerable: false, configurable: true });
+      const out = await rt(src, (_k, v) => v);
+      const d = Object.getOwnPropertyDescriptor(out, "p")!;
+      expect([d.value, d.writable, d.enumerable, d.configurable]).toEqual([7, false, false, true]);
+      expect(out).toBeInstanceOf(Object.getPrototypeOf(out).constructor);
+    });
+  });
+
+  describe("accessor descriptors at every position/depth", () => {
+    function accObj() {
+      const o: any = {};
+      Object.defineProperty(o, "getter", { get: () => 7, enumerable: true, configurable: false });
+      Object.defineProperty(o, "setter", { set() {}, enumerable: false, configurable: true });
+      Object.defineProperty(o, "both", { get: () => 9, set() {}, enumerable: true, configurable: true });
+      return o;
+    }
+
+    test("get-only descriptor + flags preserved", async () => {
+      const out = await rt(accObj(), (_k, v) => v);
+      const d = Object.getOwnPropertyDescriptor(out, "getter")!;
+      expect(typeof d.get).toBe("function");
+      expect(d.set).toBeUndefined();
+      expect([d.enumerable, d.configurable]).toEqual([true, false]);
+      expect(out.getter).toBe(7);
+    });
+
+    test("set-only descriptor + flags preserved", async () => {
+      const out = await rt(accObj(), (_k, v) => v);
+      const d = Object.getOwnPropertyDescriptor(out, "setter")!;
+      expect(d.get).toBeUndefined();
+      expect(typeof d.set).toBe("function");
+      expect([d.enumerable, d.configurable]).toEqual([false, true]);
+    });
+
+    test("get+set descriptor preserved", async () => {
+      const out = await rt(accObj(), (_k, v) => v);
+      const d = Object.getOwnPropertyDescriptor(out, "both")!;
+      expect(typeof d.get).toBe("function");
+      expect(typeof d.set).toBe("function");
+      expect(out.both).toBe(9);
+    });
+
+    test("get===set deduped to one function", async () => {
+      const o: any = {};
+      function f(this: any, x?: number) {
+        if (arguments.length) this._v = x;
+        return this._v ?? 11;
+      }
+      Object.defineProperty(o, "p", { get: f, set: f, enumerable: true, configurable: true });
+      const out = await rt(o, (_k, v) => v);
+      const d = Object.getOwnPropertyDescriptor(out, "p")!;
+      expect(d.get).toBe(d.set);
+      expect(out.p).toBe(11);
+    });
+
+    test("accessor preserved when it is a Map value (depth)", async () => {
+      const inner: any = {};
+      Object.defineProperty(inner, "g", { get: () => 5, enumerable: true, configurable: true });
+      inner.d = 2;
+      const out = await rt(new Map([["k", inner]]), x100);
+      const got = out.get("k")!;
+      expect(typeof Object.getOwnPropertyDescriptor(got, "g")!.get).toBe("function");
+      expect(got.g).toBe(5);
+      expect(got.d).toBe(200);
+    });
+
+    test("non-enumerable accessor preserved at depth", async () => {
+      const o: any = { level: {} };
+      Object.defineProperty(o.level, "a", { get: () => 3, enumerable: false, configurable: true });
+      const out = await rt(o, (_k, v) => v);
+      const d = Object.getOwnPropertyDescriptor(out.level, "a")!;
+      expect(d.enumerable).toBe(false);
+      expect(out.level.a).toBe(3);
+    });
+  });
+
+  describe("symbol-keyed descriptors and key ordering", () => {
+    function symKeyed() {
+      const S = Symbol.for("reg");
+      const o: any = { first: 1 };
+      Object.defineProperty(o, S, { value: 2, writable: false, enumerable: true, configurable: false });
+      o.second = 3;
+      return o;
+    }
+
+    test("registered-symbol descriptor + flags preserved", async () => {
+      const out = await rt(symKeyed(), (_k, v) => v);
+      const d = Object.getOwnPropertyDescriptor(out, Symbol.for("reg"))!;
+      expect([d.value, d.writable, d.enumerable, d.configurable]).toEqual([2, false, true, false]);
+    });
+
+    test("string keys precede symbol keys (ordering preserved)", async () => {
+      const out = await rt(symKeyed(), (_k, v) => v);
+      expect(Reflect.ownKeys(out).map(k => (typeof k === "symbol" ? "SYM" : k))).toEqual(["first", "second", "SYM"]);
+    });
+
+    test("a symbol-keyed descriptor at depth (inside an array element) is preserved", async () => {
+      const S = Symbol.for("x");
+      const o: any = {};
+      Object.defineProperty(o, S, { value: 7, writable: false, enumerable: true, configurable: false });
+      const out = await rt([o], (_k, v) => v);
+      const d = Object.getOwnPropertyDescriptor(out[0], S)!;
+      expect([d.value, d.writable, d.configurable]).toEqual([7, false, false]);
+    });
+
+    test("a unique (non-registered) symbol-keyed value transforms at depth", async () => {
+      const S = Symbol.for("d");
+      const out = await rt({ wrap: { [S]: 4 } } as any, x100);
+      expect(out.wrap[S]).toBe(400);
+    });
+  });
+
+  describe("__proto__ as an OWN property (not the prototype)", () => {
+    test("own data property named __proto__ is preserved without affecting the prototype", async () => {
+      const o: any = {};
+      Object.defineProperty(o, "__proto__", { value: "literal", writable: true, enumerable: true, configurable: true });
+      const out = await rt(o, (_k, v) => v);
+      expect(Object.getOwnPropertyDescriptor(out, "__proto__")!.value).toBe("literal");
+      expect(Object.getPrototypeOf(out)).toBe(Object.prototype);
+    });
+
+    test("own accessor named __proto__ is preserved", async () => {
+      const o: any = {};
+      Object.defineProperty(o, "__proto__", { get: () => "viaGetter", enumerable: true, configurable: true });
+      const out = await rt(o, (_k, v) => v);
+      expect(out.__proto__).toBe("viaGetter");
+      expect(Object.getPrototypeOf(out)).toBe(Object.prototype);
+    });
+  });
+});

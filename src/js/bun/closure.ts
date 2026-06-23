@@ -258,36 +258,33 @@ function serialize(fn: Function, replacer?: Replacer): string {
 // path (it neutralizes static initializers and emits no restore). Such a root must go through the
 // binding path (emitFunction → emitFunctionContent), which restores that state via emitOwnProperties.
 function rootNeedsBindingForOwnState(fn: Function): boolean {
-  const hasEnumerableOwn = (o: object, isFn: boolean): boolean => {
-    for (const key of ObjectGetOwnPropertyNames(o)) {
-      if (isFn && (key === "length" || key === "name" || key === "prototype")) continue;
-      if (ObjectGetOwnPropertyDescriptor(o, key)!.enumerable) return true;
-    }
-    for (const sym of ObjectGetOwnPropertySymbols(o)) {
-      if (ObjectGetOwnPropertyDescriptor(o, sym)!.enumerable) return true;
-    }
+  const source = fn.toString();
+  const memberKeys = sourceDefinedMemberKeys(source);
+  // Any own property the source doesn't already declare (a static field, an externally-assigned or
+  // non-enumerable prop, a monkey-patched prototype member) is runtime state the inline path drops.
+  // Route to the binding path on any of these. A false positive only makes output slightly more
+  // verbose; a false negative silently loses data.
+  const hasRuntimeOwn = (o: object, skip: Set<PropertyKey>): boolean => {
+    for (const key of ReflectOwnKeys(o)) if (!skip.has(key)) return true;
     return false;
   };
-  if (hasEnumerableOwn(fn, true)) return true;
-  // Non-enumerable integrity/identity state the inline path also drops. Routing to the binding
-  // path on any of these is always SAFE (it restores them); a false positive only makes output
-  // slightly more verbose, while a false negative silently loses data.
-  // - frozen / sealed / preventExtensions on the function itself
+  if (hasRuntimeOwn(fn, memberKeys.staticKeys)) return true;
+  // frozen / sealed / preventExtensions on the function itself
   if (!ObjectIsExtensible(fn)) return true;
-  // - an overridden `.name` (a plain function's `.name` is its source-derived id; if the live
-  //   name can't be produced by the source, the binding path must restore it)
-  if (typeof fn.name === "string" && fn.name !== "") {
-    const declaredName = parseFunctionNode(fn.toString())?.id?.name;
-    if (fn.name !== declaredName) return true;
+  // an overridden `.name` (a plain function's `.name` is its source-derived id, or "" when none;
+  // if the live name can't be produced by the source, the binding path must restore it)
+  if (typeof fn.name === "string") {
+    const declaredName = parseFunctionNode(source)?.id?.name;
+    if (fn.name !== (declaredName ?? "")) return true;
   }
-  // - an overridden `.length` (descriptor value differs from natural arity)
-  const natural = naturalArityFromSource(fn.toString());
+  // an overridden `.length` (descriptor value differs from natural arity)
+  const natural = naturalArityFromSource(source);
   if (natural !== undefined && fn.length !== natural) return true;
   const proto = (fn as { prototype?: object }).prototype;
   if (typeof proto === "object" && proto !== null && proto !== Function.prototype) {
-    // - frozen / sealed / preventExtensions on the prototype object
+    // frozen / sealed / preventExtensions on the prototype, or a monkey-patched member
     if (!ObjectIsExtensible(proto)) return true;
-    if (hasEnumerableOwn(proto, false)) return true;
+    if (hasRuntimeOwn(proto, memberKeys.instanceKeys)) return true;
   }
   return false;
 }
@@ -848,6 +845,56 @@ function naturalArityFromSource(source: string): number | undefined {
     count++;
   }
   return count;
+}
+
+// The own-property KEY a class member declares, or undefined for a `#private` field or an
+// unresolvable computed key. Resolves plain string/number keys, computed string literals, and the
+// two statically-knowable symbol forms (`[Symbol.iterator]`, `[Symbol.for("x")]`).
+function memberKeyOf(m: any): string | symbol | undefined {
+  const key = m?.key;
+  if (key === undefined || key === null) return undefined;
+  if (key.type === "PrivateIdentifier") return undefined;
+  if (typeof key.value === "string") return key.value; // StringLiteral (incl. computed `["x"]`)
+  if (typeof key.value === "number") return String(key.value);
+  if (m.computed !== true && typeof key.name === "string") return key.name; // Identifier
+  if (key.type === "MemberExpression" && key.object?.name === "Symbol" && typeof key.property?.name === "string") {
+    const s = (Symbol as any)[key.property.name];
+    if (typeof s === "symbol") return s;
+  }
+  if (
+    key.type === "CallExpression" &&
+    key.callee?.object?.name === "Symbol" &&
+    key.callee?.property?.name === "for" &&
+    typeof key.arguments?.[0]?.value === "string"
+  ) {
+    return Symbol.for(key.arguments[0].value);
+  }
+  return undefined;
+}
+
+// The own-property keys a class/function's RECONSTRUCTED SOURCE already defines, so emitting them
+// again would duplicate a member or clobber a genuine-method reference. The constructor side gets
+// the structural keys (name/length/prototype) + static member keys; the prototype side gets
+// `constructor` + instance member keys. A plain function declares no members, so only the
+// structural keys are skipped — letting emitOwnProperties (with enumerableOnly=false) emit
+// runtime-added own props of ANY enumerability, fixing the non-enumerable-drop.
+function sourceDefinedMemberKeys(source: string): { staticKeys: Set<PropertyKey>; instanceKeys: Set<PropertyKey> } {
+  const staticKeys = new SetCtor<PropertyKey>(["name", "length", "prototype"]);
+  const instanceKeys = new SetCtor<PropertyKey>(["constructor"]);
+  const node = parseFunctionNode(source);
+  const body = node?.body?.body;
+  if ((node?.type === "ClassDeclaration" || node?.type === "ClassExpression") && $isJSArray(body)) {
+    for (const m of body) {
+      // Only METHODS/accessors are recreated by the class expression and must be skipped. A static
+      // FIELD is declared but its value was neutralized to `undefined` (so the reify factory re-runs
+      // no side effects) and must be RESTORED by emitOwnProperties — so it is NOT skipped.
+      if (m?.type !== "MethodDefinition") continue;
+      const k = memberKeyOf(m);
+      if (k === undefined) continue;
+      (m.static === true ? staticKeys : instanceKeys).add(k);
+    }
+  }
+  return { staticKeys, instanceKeys };
 }
 
 // True if `mangledSource` (the post-`#x`-rewrite form — `#x` outside a class body is a
@@ -2676,7 +2723,7 @@ function emitOwnProperties(
   name: string,
   value: object,
   ctx: Context,
-  skip?: Set<string>,
+  skip?: Set<PropertyKey>,
   enumerableOnly = false,
 ): void {
   // Access-path pruning: when the closure only reads a known subset of this
@@ -2693,7 +2740,7 @@ function emitOwnProperties(
     return p !== null && p !== Object.prototype ? p : null;
   })();
   for (const key of ReflectOwnKeys(value)) {
-    if (skip !== undefined && typeof key === "string" && skip.has(key)) {
+    if (skip !== undefined && skip.has(key)) {
       continue;
     }
     if (enumerableOnly && !ObjectGetOwnPropertyDescriptor(value, key)!.enumerable) {
@@ -3300,7 +3347,7 @@ function emitFunctionContent(fn: Function, name: string, ctx: Context): void {
     if (gm.kind === "method") {
       ctx.module.push(`const ${name} = ${classRef}.prototype[${keyExpr}];`);
     } else {
-      ctx.module.push(`const ${name} = Object.getOwnPropertyDescriptor(.prototype, ${keyExpr}).${gm.kind};`);
+      ctx.module.push(`const ${name} = Object.getOwnPropertyDescriptor(${classRef}.prototype, ${keyExpr}).${gm.kind};`);
     }
     return;
   }
@@ -3338,9 +3385,11 @@ function emitFunctionContent(fn: Function, name: string, ctx: Context): void {
   // (`const f = () => {}` → `.name === "f"`, but the standalone reconstruction has no name).
   // When it differs from the source's declared id, restore it explicitly (matching the spec's
   // name descriptor: writable:false, enumerable:false, configurable:true).
-  if (typeof fn.name === "string" && fn.name !== "") {
+  if (typeof fn.name === "string") {
     const declaredName = parseFunctionNode(reconstructed.source)?.id?.name;
-    if (fn.name !== declaredName) {
+    // A function with no source id produces `.name === ""`; compare against "" so an explicit
+    // `name` override TO the empty string (differing from a non-empty source id) is also restored.
+    if (fn.name !== (declaredName ?? "")) {
       ctx.module.push(
         `Object.defineProperty(${name}, "name", { value: ${JSONStringify(fn.name)}, writable: false, enumerable: false, configurable: true });`,
       );
@@ -3368,19 +3417,19 @@ function emitFunctionContent(fn: Function, name: string, ctx: Context): void {
     );
     ctx.classReify.set(fn, { factory, fields: reconstructed.genuinePrivate.fields });
   }
-  // Functions can carry their own properties (e.g. `fn.version = 2`, or a class's
-  // externally-assigned statics like `C.instance = ...`). Emit the ENUMERABLE
-  // ones — that skips `name`/`length`/`prototype` and non-enumerable static
-  // methods (already reconstructed from the class source).
-  emitOwnProperties(name, fn, ctx, undefined, true);
-  // Imperatively-assigned prototype members (`Ctor.prototype.method = ...`, the classic
-  // pre-ES6 pattern, or a monkey-patched class prototype) live on the `.prototype` object,
-  // not in the function's source — so emit its ENUMERABLE own properties onto
-  // `<name>.prototype`. Class methods declared in source are non-enumerable and skipped;
-  // `constructor` is non-enumerable too. (`Function.prototype` itself is shared and has no
-  // such additions; arrows/methods have no `.prototype`.)
+  // Functions/classes can carry runtime-added own properties (`fn.version = 2`, a class's
+  // externally-assigned `C.instance = ...`, a non-enumerable hidden config). Emit ALL of them
+  // (enumerable OR not, data/accessor/symbol-keyed) EXCEPT the keys the source already defines —
+  // name/length/prototype and the static members (methods/fields the class expression recreates),
+  // which would otherwise be duplicated or clobber a genuine-method reference.
+  const memberKeys = sourceDefinedMemberKeys(reconstructed.source);
+  emitOwnProperties(name, fn, ctx, memberKeys.staticKeys, false);
+  // Imperatively-assigned prototype members (`Ctor.prototype.method = ...`, the classic pre-ES6
+  // pattern, or a monkey-patched class prototype) live on the `.prototype` object, not in the
+  // function's source — emit its own properties (any enumerability) onto `<name>.prototype`,
+  // skipping `constructor` and the instance members the class source already declares.
   if (typeof ownProto === "object" && ownProto !== null) {
-    emitOwnProperties(`${name}.prototype`, ownProto, ctx, PROTOTYPE_SKIP_KEYS, true);
+    emitOwnProperties(`${name}.prototype`, ownProto, ctx, memberKeys.instanceKeys, false);
   }
   // A frozen/sealed/non-extensible class prototype or constructor is emitted via this function
   // path, never through emitObject, so its extensibility state would otherwise be lost. Apply
