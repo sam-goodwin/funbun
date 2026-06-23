@@ -12664,6 +12664,54 @@ describe("class method pruning (non-#private)", () => {
     expect(fn("write")).toBe("WRITE_D");
   });
 
+  test("dynamic dispatch through `this[name]()` INSIDE a method keeps all methods", async () => {
+    class Svc {
+      dispatch(name: string) {
+        return (this as any)[name](); // computed `this` access → can't statically prune
+      }
+      read() {
+        return "READ_T";
+      }
+      write() {
+        return "WRITE_T";
+      }
+    }
+    const svc = new Svc();
+    // The closure only calls `dispatch`, but `dispatch` can reach ANY method via `this[name]()`,
+    // discovered through this-following — so every method must survive.
+    const root = (name: string) => svc.dispatch(name);
+
+    const { code } = serializeCollect(root);
+    expect(code).toContain("READ_T");
+    expect(code).toContain("WRITE_T");
+
+    const fn = await rt(root);
+    expect(fn("read")).toBe("READ_T");
+    expect(fn("write")).toBe("WRITE_T");
+  });
+
+  test("passing the instance as a value (Reflect/apply) keeps all methods", async () => {
+    class Svc {
+      read() {
+        return "READ_V";
+      }
+      write() {
+        return "WRITE_V";
+      }
+    }
+    const svc = new Svc();
+    // `Reflect.get(svc, name)` hands the whole instance to a foreign call → can't prune.
+    const root = (name: string) => (Reflect.get(svc, name) as () => string).call(svc);
+
+    const { code } = serializeCollect(root);
+    expect(code).toContain("READ_V");
+    expect(code).toContain("WRITE_V");
+
+    const fn = await rt(root);
+    expect(fn("read")).toBe("READ_V");
+    expect(fn("write")).toBe("WRITE_V");
+  });
+
   test("a getter reached through a kept method is preserved; an unused one is pruned", async () => {
     class Svc {
       get config() {
