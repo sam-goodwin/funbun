@@ -95,6 +95,16 @@ const SharedArrayBufferCtor = typeof SharedArrayBuffer !== "undefined" ? SharedA
 const ArrayCtor = Array;
 const Uint8ArrayCtor = Uint8Array;
 
+// A function's source. `fn.toString()` looks `toString` up THROUGH fn's prototype chain to
+// Function.prototype — for a deep `class extends` chain that walks the whole superclass chain
+// (O(depth)) on EVERY `.toString()`, and source is read several times per class during analysis
+// and emission (an O(N²) trap). Calling the captured Function.prototype.toString directly skips the
+// inherited lookup (O(1) lookup + O(source)). Also tamper-proof.
+const functionToStringMethod = Function.prototype.toString;
+function funcSource(fn: Function): string {
+  return functionToStringMethod.$call(fn);
+}
+
 // An `import` statement re-creating an external import binding (native / node:*
 // / builtin) that can't be inlined.
 function importStatement(variable: FreeVariable): string {
@@ -224,7 +234,7 @@ function rootSupportsAlsWrap(fn: Function): boolean {
   if (ctorName === "GeneratorFunction" || ctorName === "AsyncGeneratorFunction") return false;
   let source: string;
   try {
-    source = fn.toString();
+    source = funcSource(fn);
   } catch {
     return false;
   }
@@ -258,7 +268,7 @@ function serialize(fn: Function, replacer?: Replacer): string {
 // path (it neutralizes static initializers and emits no restore). Such a root must go through the
 // binding path (emitFunction → emitFunctionContent), which restores that state via emitOwnProperties.
 function rootNeedsBindingForOwnState(fn: Function): boolean {
-  const source = fn.toString();
+  const source = funcSource(fn);
   const memberKeys = sourceDefinedMemberKeys(source);
   // Any own property the source doesn't already declare (a static field, an externally-assigned or
   // non-enumerable prop, a monkey-patched prototype member) is runtime state the inline path drops.
@@ -352,7 +362,7 @@ function serializeImpl(fn: Function, replacer?: Replacer): string {
   if (
     (fn as any)[Symbol.boundFunction] !== undefined ||
     ctx.hostedArrows.has(fn) ||
-    isNativeFunctionSource(fn.toString()) ||
+    isNativeFunctionSource(funcSource(fn)) ||
     rootNeedsBindingForOwnState(fn)
   ) {
     exportExpr = emitFunction(fn, ctx);
@@ -665,7 +675,7 @@ function analyzeSharedCells(root: Function): { sharedIds: Set<number>; cellInfo:
     seenFns.add(fn);
     let source: string;
     try {
-      source = fn.toString();
+      source = funcSource(fn);
     } catch {
       return;
     }
@@ -1276,7 +1286,7 @@ function computeGenuineClasses(root: unknown, sharedIdsArg?: Set<number>): Genui
     if (!structure.has(C)) {
       let s: ClassStructure | null = null;
       try {
-        s = classStructure(C.toString());
+        s = classStructure(funcSource(C));
       } catch {}
       structure.set(C, s);
     }
@@ -1350,7 +1360,7 @@ function computeGenuineClasses(root: unknown, sharedIdsArg?: Set<number>): Genui
     });
     let hosts = classHosts.get(classFn);
     if (hosts === undefined) classHosts.set(classFn, (hosts = []));
-    hosts.push({ hostKey, source: arrow.toString(), params: captures.map(v => v.name) });
+    hosts.push({ hostKey, source: funcSource(arrow), params: captures.map(v => v.name) });
   }
   return { genuine: candidate, hostedArrows, classHosts };
 }
@@ -1360,7 +1370,7 @@ function computeGenuineClasses(root: unknown, sharedIdsArg?: Set<number>): Genui
 function hostableEscapedArrow(fn: Function): boolean {
   let src: string;
   try {
-    src = fn.toString();
+    src = funcSource(fn);
   } catch {
     return false;
   }
@@ -1499,7 +1509,7 @@ function instanceChainClasses(o: object, memo: Map<object, Function[]>): Functio
       break;
     }
     const c = ownConstructor(p);
-    if (c !== undefined && isNativeFunctionSource(c.toString())) {
+    if (c !== undefined && isNativeFunctionSource(funcSource(c))) {
       memo.set(p, EMPTY_CLASSES); // native base: it and everything above contribute nothing
       break;
     }
@@ -1546,7 +1556,7 @@ function perClassDisqualified(C: Function, fields: string[], funcs: Set<Function
     if (g === C || allMethods.has(g) || hostableEscapedArrow(g)) continue;
     let src: string;
     try {
-      src = g.toString();
+      src = funcSource(g);
     } catch {
       continue;
     }
@@ -1857,7 +1867,7 @@ function computeKeepSets(root: Function): Map<object, Set<string> | "all"> {
     seenFns.add(fn);
     let source: string;
     try {
-      source = fn.toString();
+      source = funcSource(fn);
     } catch {
       return;
     }
@@ -1972,7 +1982,7 @@ interface ReconstructedFunction {
 // Returns an expression that evaluates to a reconstruction of `fn`, wrapping its
 // captured variables in an IIFE scope when it has any.
 function reconstructFunctionExpr(fn: Function, ctx: Context): ReconstructedFunction {
-  const original = fn.toString();
+  const original = funcSource(fn);
   if (isNativeFunctionSource(original)) {
     throw new TypeError("Cannot serialize a native function (no JavaScript source is available)");
   }
@@ -2417,7 +2427,7 @@ function recoverComputedKeyValues(fn: Function, members: any[], boundNames: Set<
       if (typeof f !== "function") continue;
       let src: string;
       try {
-        src = f.toString();
+        src = funcSource(f);
       } catch {
         continue;
       }
@@ -3430,7 +3440,7 @@ function capturedFunctions(fn: Function, ctx: Context): Function[] {
   if (ctx.genuineMethods.has(fn)) return [];
   let source: string;
   try {
-    source = fn.toString();
+    source = funcSource(fn);
   } catch {
     return [];
   }
@@ -3542,7 +3552,7 @@ function emitFunctionContent(fn: Function, name: string, ctx: Context): void {
   // has no JS source but a stable identity reachable from globalThis — reference
   // it by its path rather than trying to reconstruct it. This is what lets a
   // captured native function round-trip, and `class X extends Error` work.
-  if (isNativeFunctionSource(fn.toString())) {
+  if (isNativeFunctionSource(funcSource(fn))) {
     const path = nativeFunctionPath(fn);
     if (path !== undefined) {
       ctx.module.push(`const ${name} = ${path};`);
@@ -4155,7 +4165,7 @@ async function bundle(fn: Function, replacer?: Replacer): Promise<string> {
   if ((fn as any)[Symbol.boundFunction] !== undefined) {
     throw new TypeError("Cannot bundle a bound function as the root; use serialize() instead");
   }
-  const source = fn.toString();
+  const source = funcSource(fn);
   if (isNativeFunctionSource(source)) {
     throw new TypeError("Cannot bundle a native function (no JavaScript source is available)");
   }
