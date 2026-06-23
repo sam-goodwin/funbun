@@ -7497,3 +7497,229 @@ describe("adversarial regressions: round 7", () => {
     expect(out.auto).toBeInstanceOf(TypeError);
   });
 });
+
+describe("native object & prototype references (allowlist)", () => {
+  // Built-in prototypes were deep-copied (identity broken, internal-slot key leak) or threw
+  // "native function"; host singletons crypto/performance were deep-copied. All now referenced.
+  test("built-in prototypes keep identity (=== Promise.prototype etc.)", async () => {
+    const refs = {
+      promiseProto: Promise.prototype,
+      errorProto: Error.prototype,
+      typeErrorProto: TypeError.prototype,
+      numberProto: Number.prototype,
+      mapProto: Map.prototype,
+      dateProto: Date.prototype,
+      regexpProto: RegExp.prototype,
+    };
+    void refs;
+    const out = (await roundtrip(() => refs))() as any;
+    expect(out.promiseProto).toBe(Promise.prototype);
+    expect(out.errorProto).toBe(Error.prototype);
+    expect(out.typeErrorProto).toBe(TypeError.prototype);
+    expect(out.numberProto).toBe(Number.prototype);
+    expect(out.mapProto).toBe(Map.prototype);
+    expect(out.dateProto).toBe(Date.prototype);
+    expect(out.regexpProto).toBe(RegExp.prototype);
+  });
+
+  test("typed-array prototypes and the shared %TypedArray%.prototype keep identity", async () => {
+    const TypedArrayProto = Object.getPrototypeOf(Uint8Array.prototype);
+    const refs = {
+      u8: Uint8Array.prototype,
+      f64: Float64Array.prototype,
+      bi64: BigInt64Array.prototype,
+      shared: TypedArrayProto,
+    };
+    void refs;
+    const out = (await roundtrip(() => refs))() as any;
+    expect(out.u8).toBe(Uint8Array.prototype);
+    expect(out.f64).toBe(Float64Array.prototype);
+    expect(out.bi64).toBe(BigInt64Array.prototype);
+    expect(out.shared).toBe(TypedArrayProto);
+    expect(Object.getPrototypeOf(out.u8)).toBe(out.shared);
+  });
+
+  test("host singletons crypto / performance keep identity", async () => {
+    const refs = { crypto: globalThis.crypto, performance: globalThis.performance };
+    void refs;
+    const out = (await roundtrip(() => refs))() as any;
+    expect(out.crypto).toBe(globalThis.crypto);
+    expect(out.performance).toBe(globalThis.performance);
+    expect(typeof out.performance.now()).toBe("number");
+  });
+
+  // The native-object map is snapshotted EAGERLY at `import "bun:closure"`. A user object assigned
+  // to a fresh global AFTER import must NOT be referenced by that global path — serialized by value.
+  test("a user object assigned to a global after import is serialized by value, not by path", async () => {
+    const userObj = { secret: 1234, tag: "USER_OBJECT_NOT_A_GLOBAL" };
+    serialize(() => 1); // warmup
+    (globalThis as any).__closureTamperTarget = userObj;
+    try {
+      const code = serialize(() => userObj);
+      expect(code).not.toContain("__closureTamperTarget");
+      const out = (await roundtrip(() => userObj))() as any;
+      expect(out).toEqual({ secret: 1234, tag: "USER_OBJECT_NOT_A_GLOBAL" });
+      expect(out).not.toBe(userObj);
+    } finally {
+      delete (globalThis as any).__closureTamperTarget;
+    }
+  });
+});
+
+describe("root own-state integrity (non-enumerable) survives serialize", () => {
+  test("frozen root class stays frozen", async () => {
+    class C {
+      static x = 1;
+    }
+    Object.freeze(C);
+    const Out = (await roundtrip(C as any)) as any;
+    expect(Object.isFrozen(Out)).toBe(true);
+    expect(Out.x).toBe(1);
+  });
+
+  test("sealed root class stays sealed (not frozen)", async () => {
+    // A writable static makes sealed distinguishable from frozen (an empty class has only
+    // non-writable own props, so sealing it is also freezing it).
+    class C {
+      static x = 1;
+    }
+    Object.seal(C);
+    const Out = (await roundtrip(C as any)) as any;
+    expect(Object.isSealed(Out)).toBe(true);
+    expect(Object.isFrozen(Out)).toBe(false); // x stays writable under seal
+    Out.x = 2;
+    expect(Out.x).toBe(2);
+  });
+
+  test("non-extensible root function stays non-extensible", async () => {
+    function f() {
+      return 1;
+    }
+    Object.preventExtensions(f);
+    const Out = (await roundtrip(f)) as any;
+    expect(Object.isExtensible(Out)).toBe(false);
+    expect(Object.isSealed(Out)).toBe(false);
+    expect(Out()).toBe(1);
+  });
+
+  test("frozen root prototype stays frozen", async () => {
+    class C {}
+    Object.freeze(C.prototype);
+    const Out = (await roundtrip(C as any)) as any;
+    expect(Object.isFrozen(Out.prototype)).toBe(true);
+  });
+
+  test("overridden root name survives (function and class)", async () => {
+    function f() {}
+    Object.defineProperty(f, "name", { value: "custom", configurable: true });
+    const Of = (await roundtrip(f)) as any;
+    expect(Of.name).toBe("custom");
+    class C {}
+    Object.defineProperty(C, "name", { value: "Renamed", configurable: true });
+    const Oc = (await roundtrip(C as any)) as any;
+    expect(Oc.name).toBe("Renamed");
+  });
+
+  test("overridden length survives (root and nested)", async () => {
+    function f(a: number, b: number) {
+      return a + b;
+    }
+    Object.defineProperty(f, "length", { value: 99, configurable: true });
+    const Of = (await roundtrip(f)) as any;
+    expect(Of.length).toBe(99);
+    expect(Of(1, 2)).toBe(3);
+
+    function inner(a: number) {
+      return a;
+    }
+    Object.defineProperty(inner, "length", { value: 42, configurable: true });
+    const outer = () => inner;
+    const Oo = (await roundtrip(outer)) as any;
+    expect(Oo().length).toBe(42);
+    expect(Oo()(7)).toBe(7);
+  });
+
+  // Negative contract: a plain root closure with NO own state must still take the inline path.
+  test("plain root arrow round-trips and stays extensible", async () => {
+    const x = 5;
+    const f = () => x;
+    const Out = (await roundtrip(f)) as any;
+    expect(Out()).toBe(5);
+    expect(Object.isExtensible(Out)).toBe(true);
+    expect(Out.length).toBe(0);
+  });
+});
+
+describe("genuine #private: idempotent re-serialization", () => {
+  // Round 1 emits a class referencing the module-level mutable reify slot, a __bunReifyPatch
+  // method, and field guards. Re-serializing must NOT re-bind the reify slot as a local const
+  // (which would re-run every initializer) nor accumulate duplicate patch methods (unbounded growth).
+  test("re-serializing a reconstructed #private class does not re-run initializers or grow", async () => {
+    using dir = tempDir(`closure-gp-reserialize-${counter++}`, {
+      "gen.mjs": [
+        `import { serialize } from "bun:closure";`,
+        `import { writeFileSync } from "node:fs";`,
+        `import { pathToFileURL } from "node:url";`,
+        `globalThis.__ctorRuns = 0;`,
+        `class C {`,
+        `  #v = (globalThis.__ctorRuns++, 7);`,
+        `  get() { return this.#v; }`,
+        `}`,
+        `let inst = new C();`,
+        `const runsAfterLiveConstruct = globalThis.__ctorRuns;`,
+        `const rounds = [];`,
+        `for (let round = 1; round <= 3; round++) {`,
+        `  const code = serialize(() => inst);`,
+        `  const runsBefore = globalThis.__ctorRuns;`,
+        `  const file = new URL("./round-" + round + ".mjs", import.meta.url);`,
+        `  writeFileSync(file, code);`,
+        `  const mod = await import(pathToFileURL(file.pathname).href);`,
+        `  inst = mod.default();`,
+        `  rounds.push({`,
+        `    round,`,
+        `    initRuns: globalThis.__ctorRuns - runsBefore,`,
+        `    value: inst.get(),`,
+        `    publicKeys: Object.keys(inst),`,
+        `    length: code.length,`,
+        `    patchMethods: (code.match(/__bunReifyPatch\\(/g) || []).length,`,
+        `  });`,
+        `}`,
+        `console.log(JSON.stringify({ runsAfterLiveConstruct, rounds }));`,
+      ].join("\n"),
+    });
+
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), `${String(dir)}/gen.mjs`],
+      env: bunEnv,
+      cwd: String(dir),
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect({ stdout: stdout.length > 0, stderr: stderr.includes("error:") ? stderr : "", exitCode }).toEqual({
+      stdout: true,
+      stderr: "",
+      exitCode: 0,
+    });
+
+    const report = JSON.parse(stdout.trim()) as {
+      runsAfterLiveConstruct: number;
+      rounds: Array<{
+        round: number;
+        initRuns: number;
+        value: number;
+        publicKeys: string[];
+        length: number;
+        patchMethods: number;
+      }>;
+    };
+    expect(report.runsAfterLiveConstruct).toBe(1);
+    expect(report.rounds).toHaveLength(3);
+    for (const r of report.rounds) {
+      expect(r.initRuns).toBe(0); // BUG 1: reconstruction must not re-run initializers
+      expect(r.value).toBe(7);
+      expect(r.publicKeys).toEqual([]);
+      expect(r.patchMethods).toBe(1); // BUG 2: exactly one patch method every round
+    }
+    expect(report.rounds[2].length).toBe(report.rounds[1].length); // stable size after round 1
+  });
+});

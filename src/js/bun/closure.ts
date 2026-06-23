@@ -269,8 +269,27 @@ function rootNeedsBindingForOwnState(fn: Function): boolean {
     return false;
   };
   if (hasEnumerableOwn(fn, true)) return true;
+  // Non-enumerable integrity/identity state the inline path also drops. Routing to the binding
+  // path on any of these is always SAFE (it restores them); a false positive only makes output
+  // slightly more verbose, while a false negative silently loses data.
+  // - frozen / sealed / preventExtensions on the function itself
+  if (!ObjectIsExtensible(fn)) return true;
+  // - an overridden `.name` (a plain function's `.name` is its source-derived id; if the live
+  //   name can't be produced by the source, the binding path must restore it)
+  if (typeof fn.name === "string" && fn.name !== "") {
+    const declaredName = parseFunctionNode(fn.toString())?.id?.name;
+    if (fn.name !== declaredName) return true;
+  }
+  // - an overridden `.length` (descriptor value differs from natural arity)
+  const natural = naturalArityFromSource(fn.toString());
+  if (natural !== undefined && fn.length !== natural) return true;
   const proto = (fn as { prototype?: object }).prototype;
-  return typeof proto === "object" && proto !== null && proto !== Function.prototype && hasEnumerableOwn(proto, false);
+  if (typeof proto === "object" && proto !== null && proto !== Function.prototype) {
+    // - frozen / sealed / preventExtensions on the prototype object
+    if (!ObjectIsExtensible(proto)) return true;
+    if (hasEnumerableOwn(proto, false)) return true;
+  }
+  return false;
 }
 
 function serializeImpl(fn: Function, replacer?: Replacer): string {
@@ -800,6 +819,37 @@ function parseFunctionNode(source: string): any | null {
   return parseWithOffset(source)?.node ?? null;
 }
 
+// The natural `.length` (arity) a function's source produces: the count of leading formal params,
+// stopping BEFORE the first one with a default (AssignmentPattern) or a rest element (RestElement)
+// — neither is counted, matching the spec. A `class` carries its constructor's params on the
+// constructor method. Returns undefined if the source can't be parsed. Used to detect a
+// `defineProperty(fn,"length",{value:N})` override, otherwise indistinguishable from the natural one.
+function naturalArityFromSource(source: string): number | undefined {
+  const node = parseFunctionNode(source);
+  let params: any[] | undefined;
+  if (node?.type === "ClassDeclaration" || node?.type === "ClassExpression") {
+    const body = node.body?.body;
+    if ($isJSArray(body)) {
+      for (const member of body) {
+        if (member?.kind === "constructor") {
+          params = member.value?.params;
+          break;
+        }
+      }
+    }
+    if (params === undefined) return 0; // no explicit constructor → arity 0
+  } else if (node !== null && typeof node === "object") {
+    params = node.params;
+  }
+  if (!$isJSArray(params)) return undefined;
+  let count = 0;
+  for (const p of params!) {
+    if (p?.type === "AssignmentPattern" || p?.type === "RestElement") break;
+    count++;
+  }
+  return count;
+}
+
 // True if `mangledSource` (the post-`#x`-rewrite form — `#x` outside a class body is a
 // syntax error to parse standalone) is an arrow function that reads a private through its
 // lexical `this`: `this.<mangled>` or `"<mangled>" in this`. Such an arrow is reconstructed
@@ -929,6 +979,18 @@ const REIFY_SLOT = "$bunClosureReify$";
 // The per-class method injected to install that class's private fields from a values
 // object, called on the bare instance AFTER all instances exist (so cycles work).
 const PATCH_METHOD = "__bunReifyPatch";
+
+// Names that the reconstruction machinery itself introduces into a class's source and must
+// NEVER be treated as a user free variable / re-bound on RE-serialization:
+//   - `#private` brands are recreated by the class body itself (the receiver carries the slot).
+//   - `$bunClosureReify$` (REIFY_SLOT) appears as a bare identifier in a reconstructed class's
+//     field-init guard `<key> = $bunClosureReify$ ? undefined : (<init>)` and in the constructor
+//     reify branch. It is reconstructed by the MODULE (the hoisted `let`), so re-binding it to a
+//     LOCAL `const $bunClosureReify$ = false` inside the class's IIFE would shadow the module-level
+//     mutable slot the reify factory toggles — the "bare" construct would then re-run every
+//     instance initializer. Filtered on EVERY path that gathers free variables (Symbol.freeVariables
+//     scan AND the AST-driven field-initializer scan), so re-serialization stays idempotent.
+const isInternalFreeVariableName = (name: string): boolean => name.startsWith("#") || name === REIFY_SLOT;
 // Builtin bases a genuine subclass can extend: their no-arg `super()` yields a valid empty
 // instance and their content is restorable (Map.set/Set.add/array indices) after construction.
 const RECONSTRUCTABLE_BUILTIN_BASES: Set<unknown> = new SetCtor([MapCtor, SetCtor, ArrayCtor]);
@@ -977,17 +1039,33 @@ function injectReifyConstructor(
   keyPrefix: string,
 ): string {
   const { fields, isDerived, node, offset } = info;
+  // RE-serialization idempotency: a class whose source we reconstructed in an earlier round
+  // already carries the reify branch, the `__bunReifyPatch` method, and any host methods (the
+  // `#x` fields and the genuine-private gate still re-clear it as genuine). Re-injecting on top
+  // would APPEND a second patch method (and a second branch) every round — unbounded growth and
+  // a redundant scaffold. Detect the already-injected patch and skip BOTH injections: the
+  // existing scaffolding is reused as-is (the host-method set is stable for a given graph).
+  const alreadyInjected = $isJSArray(node.body?.body)
+    ? node.body.body.some(
+        (m: any) => m?.type === "MethodDefinition" && m.static !== true && m.key?.value === PATCH_METHOD,
+      )
+    : false;
   const branch = `if(${REIFY_SLOT}){` + (isDerived ? "super();" : "") + `return;}`;
   // Patch keys are namespaced by class id so a same-named private across an inheritance
   // chain still maps to this class's own genuine slot.
-  const patch = fields.length
-    ? `${PATCH_METHOD}(v){${fields.map(f => `this.${f}=v[${JSONStringify(keyPrefix + f)}];`).join("")}}`
-    : "";
-  const classBodyInjections = patch + hostMethods.join("");
+  const patch =
+    !alreadyInjected && fields.length
+      ? `${PATCH_METHOD}(v){${fields.map(f => `this.${f}=v[${JSONStringify(keyPrefix + f)}];`).join("")}}`
+      : "";
+  const classBodyInjections = alreadyInjected ? "" : patch + hostMethods.join("");
   // The class body `{` — `node.body` (ClassBody) start is reliable and, crucially, points at
   // THIS class's brace, not a `{` inside the heritage (`extends class A {…}` / `extends
   // mixin({…})`), which `source.indexOf("{")` would wrongly find.
   const classBrace = typeof node.body?.start === "number" ? node.body.start - offset : source.indexOf("{");
+
+  // Already reconstructed: the constructor branch + patch + host methods are all present and
+  // the field guards are already in place — nothing more to inject (idempotent re-serialization).
+  if (alreadyInjected) return source;
 
   const ctor = node.body.body.find(
     (m: any) => m.type === "MethodDefinition" && m.static !== true && m.key?.value === "constructor",
@@ -1050,6 +1128,11 @@ function neutralizeClassInitializers(
       if (m.static === true) {
         if (m.key?.type !== "PrivateIdentifier") edits.push({ start: s, end: e, replace: "undefined" });
       } else if (guardInstanceFields) {
+        // RE-serialization idempotency: a reconstructed class's instance field is already guarded
+        // (`<key> = $bunClosureReify$ ? undefined : (<init>)`). Re-wrapping would nest a second
+        // identical guard every round (unbounded growth). The guard's leading token is the reify
+        // slot, so skip a field whose initializer already begins with it.
+        if (source.slice(s, e).trimStart().startsWith(REIFY_SLOT)) continue;
         edits.push({ start: s, end: s, replace: `${REIFY_SLOT}?undefined:(` });
         edits.push({ start: e, end: e, replace: ")" });
       }
@@ -1987,13 +2070,9 @@ function allFreeVariables(fn: Function, source: string): FreeVariable[] {
   const refs = node !== null && !containsUnsupportedNode(node) ? freeIdentifiersOfNode(node) : null;
   const isRealRef = (v: FreeVariable) => refs === null || refs.has(v.name);
 
-  // The genuine-private reify slot (`$bunClosureReify$`) appears as a bare identifier in a
-  // reconstructed class's field-init guard `<key> = $bunClosureReify$ ? undefined : (<init>)`.
-  // On RE-serialization it would be reported as a free variable and bound to a LOCAL
-  // `const $bunClosureReify$ = false` inside the class's IIFE, shadowing the module-level slot
-  // the reify factory toggles — so the "bare" reify construct would re-run every initializer.
-  // It's reconstructed by the module itself (the hoisted `let`), never an external capture.
-  const isInternal = (name: string): boolean => name.startsWith("#") || name === REIFY_SLOT;
+  // Filter the reconstruction machinery's own identifiers (`#brand`, the reify slot) so they
+  // are never re-bound as external captures on RE-serialization (see isInternalFreeVariableName).
+  const isInternal = isInternalFreeVariableName;
 
   if (!source.trimStart().startsWith("class")) {
     // `#name` private brands are recreated by the mangling rewrite (the receiver
@@ -2023,9 +2102,9 @@ function collectMemberFreeVariables(holder: object, classFn: Function, byId: Map
       if (!memberVars) continue;
       for (const variable of memberVars) {
         // A reference to the class's own name resolves to the class expression's
-        // binding, and `#name` private brands are recreated by the class body —
-        // neither should be bound externally.
-        if (variable.value === classFn || variable.name.startsWith("#") || variable.name === REIFY_SLOT) continue;
+        // binding, and reconstruction-internal names (`#brand`, the reify slot) are
+        // recreated by the class body / module — none should be bound externally.
+        if (variable.value === classFn || isInternalFreeVariableName(variable.name)) continue;
         if (!byId.has(variable.id)) byId.set(variable.id, variable);
       }
     }
@@ -2165,6 +2244,14 @@ function fieldInitializerBindings(fn: Function, source: string, boundNames: Set<
   const bindings: string[] = [];
   for (const name of names) {
     if (boundNames.has(name)) continue;
+    // The reify slot (`$bunClosureReify$`) appears in a reconstructed class's field-init guard
+    // `<key> = $bunClosureReify$ ? undefined : (<init>)`. On RE-serialization the AST surfaces it
+    // here, and resolving it against the class's scope would bind a LOCAL `const $bunClosureReify$
+    // = false` inside the IIFE — shadowing the module-level mutable slot the reify factory toggles,
+    // so the bare construct would re-run every initializer. It (and any `#brand`) is reconstructed
+    // by the module/class itself, never an external capture — skip it. Keeps re-serialization
+    // idempotent (round 2+ must NOT shadow the slot; see isInternalFreeVariableName).
+    if (isInternalFreeVariableName(name)) continue;
     const resolved = $resolveClosureBinding(fn, name) as { found: boolean; value: unknown };
     if (!resolved.found) continue; // a global, or not in the class's scope — leave as-is
     boundNames.add(name);
@@ -3259,6 +3346,17 @@ function emitFunctionContent(fn: Function, name: string, ctx: Context): void {
       );
     }
   }
+  // `.length` is non-enumerable too, so emitOwnProperties skips it. The reconstructed source
+  // reproduces the natural arity; a `defineProperty(fn,"length",{value:N})` override differs from
+  // that and must be restored explicitly (same spec descriptor shape as `name`).
+  if (typeof fn.length === "number") {
+    const naturalLength = naturalArityFromSource(reconstructed.source);
+    if (naturalLength !== undefined && fn.length !== naturalLength) {
+      ctx.module.push(
+        `Object.defineProperty(${name}, "length", { value: ${JSONStringify(fn.length)}, writable: false, enumerable: false, configurable: true });`,
+      );
+    }
+  }
   // A genuine-private class needs a reify factory: set the module-level flag, construct a
   // BARE instance (the constructor's reify branch skips the original body), then clear the
   // flag. Privates are installed afterward by the patch method (see emitGenuinePrivateInstance)
@@ -3417,6 +3515,8 @@ function buildNativePathMap(): Map<Function, string> {
 // that would wrongly reference a user's own global object (`globalThis.myConfig`) instead of
 // serializing it by value.
 const NATIVE_OBJECT_PATHS = [
+  // Host / intrinsic singletons (some absent depending on platform — each guarded by the
+  // try/catch + typeof check in buildNativeObjectMap).
   "Math",
   "JSON",
   "Reflect",
@@ -3426,13 +3526,71 @@ const NATIVE_OBJECT_PATHS = [
   "process",
   "Bun",
   "WebAssembly",
+  "crypto",
+  "performance",
+  "navigator",
+  // The `.prototype` of every standard built-in constructor. These are HOST/INTRINSIC objects
+  // shared across the realm — deep-copying them breaks identity (`x === Promise.prototype`), leaks
+  // internal-slot keys, and (for prototypes carrying native methods) throws "Cannot serialize a
+  // native function" when the walk reaches a method. Reference them by path instead.
   "Object.prototype",
   "Array.prototype",
   "Function.prototype",
+  "Promise.prototype",
+  "Error.prototype",
+  "EvalError.prototype",
+  "RangeError.prototype",
+  "ReferenceError.prototype",
+  "SyntaxError.prototype",
+  "TypeError.prototype",
+  "URIError.prototype",
+  "AggregateError.prototype",
+  "Number.prototype",
+  "String.prototype",
+  "Boolean.prototype",
+  "Symbol.prototype",
+  "BigInt.prototype",
+  "Map.prototype",
+  "Set.prototype",
+  "WeakMap.prototype",
+  "WeakSet.prototype",
+  "WeakRef.prototype",
+  "Date.prototype",
+  "RegExp.prototype",
+  "ArrayBuffer.prototype",
+  "SharedArrayBuffer.prototype",
+  "DataView.prototype",
+  "Int8Array.prototype",
+  "Uint8Array.prototype",
+  "Uint8ClampedArray.prototype",
+  "Int16Array.prototype",
+  "Uint16Array.prototype",
+  "Int32Array.prototype",
+  "Uint32Array.prototype",
+  "Float32Array.prototype",
+  "Float64Array.prototype",
+  "BigInt64Array.prototype",
+  "BigUint64Array.prototype",
+  // The shared %TypedArray%.prototype — the abstract base of every typed-array prototype. Not
+  // reachable by a plain dotted path; resolved specially in buildNativeObjectMap. Its re-resolving
+  // expression in the reconstructed module is `Object.getPrototypeOf(Uint8Array.prototype)`.
+  "Object.getPrototypeOf(Uint8Array.prototype)",
+  // Intl sub-constructor prototypes (each guarded — older platforms lack some).
+  "Intl.DateTimeFormat.prototype",
+  "Intl.NumberFormat.prototype",
+  "Intl.Collator.prototype",
+  "Intl.PluralRules.prototype",
+  "Intl.RelativeTimeFormat.prototype",
+  "Intl.ListFormat.prototype",
+  "Intl.Locale.prototype",
+  "Intl.Segmenter.prototype",
 ];
-let nativeObjectMap: Map<object, string> | undefined;
+// Built EAGERLY at module load (not lazily) so it snapshots the REAL globals before any user code
+// that runs AFTER `import "bun:closure"` can reassign one (`globalThis.console = userObject`). A
+// lazy build would record the user's object at path "console" and later (wrongly) reference a USER
+// object by a global path. Resolving the captured globals here is safe: every alias this depends on
+// (MapCtor, Uint8ArrayCtor, ObjectGetPrototypeOf) is declared earlier at module top.
 function nativeObjectPath(value: object): string | undefined {
-  if (nativeObjectMap === undefined) nativeObjectMap = buildNativeObjectMap();
   return nativeObjectMap.get(value);
 }
 function buildNativeObjectMap(): Map<object, string> {
@@ -3440,16 +3598,28 @@ function buildNativeObjectMap(): Map<object, string> {
   const g = globalThis as any;
   map.set(g, "globalThis");
   for (const path of NATIVE_OBJECT_PATHS) {
-    let v: unknown = g;
+    let v: unknown;
     try {
-      for (const part of path.split(".")) v = (v as any)[part];
+      // The %TypedArray%.prototype entry is an expression, not a dotted member path; resolve it
+      // from the captured Object/Uint8Array aliases (re-resolves in the reconstructed module via
+      // the literal path string, which is a valid expression).
+      if (path === "Object.getPrototypeOf(Uint8Array.prototype)") {
+        v = ObjectGetPrototypeOf(Uint8ArrayCtor.prototype);
+      } else {
+        v = g;
+        for (const part of path.split(".")) v = (v as any)[part];
+      }
     } catch {
       continue;
     }
+    // Only a genuine object identical to the resolved global is recorded. A USER object identical
+    // to nothing here is never matched, so it is always serialized BY VALUE (invariant preserved).
     if (typeof v === "object" && v !== null && !map.has(v as object)) map.set(v as object, path);
   }
   return map;
 }
+// Snapshot at module load. See the comment on buildNativeObjectMap for why this is eager.
+const nativeObjectMap: Map<object, string> = buildNativeObjectMap();
 
 function serializeNumber(value: number): string {
   if (value !== value) return "NaN";
