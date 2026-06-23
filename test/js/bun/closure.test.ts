@@ -7453,3 +7453,47 @@ describe("adversarial regressions: round 6", () => {
     expect(Object.getOwnPropertySymbols(out).length).toBe(0);
   });
 });
+
+describe("adversarial regressions: round 7", () => {
+  // Well-known global namespace objects / singletons were either deep-copied (losing intrinsic
+  // identity — `captured === Math` was false) or, for ones holding native methods with no
+  // reachable path (console/globalThis/process), threw "Cannot serialize a native function".
+  // They are now emitted as a REFERENCE to their global path, preserving identity.
+  test("well-known globals captured as values keep their identity (=== global)", async () => {
+    const out = (await roundtrip(() => ({ Math, JSON, Reflect, console, gt: globalThis, process })))() as any;
+    expect(out.Math).toBe(Math);
+    expect(out.JSON).toBe(JSON);
+    expect(out.Reflect).toBe(Reflect);
+    expect(out.console).toBe(console);
+    expect(out.gt).toBe(globalThis);
+    expect(out.process).toBe(process);
+  });
+
+  // The same must hold when the global is reached through a captured free VARIABLE (the analysis
+  // pre-passes previously walked into the global's native internals and collected an
+  // unserializable internal function — e.g. a node validator with no global path).
+  test("a captured variable holding a global round-trips by reference", async () => {
+    const c1 = console;
+    const cfg = { logger: console, root: globalThis };
+    void [c1, cfg];
+    const out = (await roundtrip(() => ({ c1, cfg })))() as any;
+    expect(out.c1).toBe(console);
+    expect(out.cfg.logger).toBe(console);
+    expect(out.cfg.root).toBe(globalThis);
+  });
+
+  // An Error's `stack` own property was dropped. A deliberately-set stack is now preserved, and
+  // a normal error still carries a stack string.
+  test("an Error's stack own property is preserved", async () => {
+    const e: any = new Error("boom");
+    e.stack = "ZZZ_CUSTOM_STACK";
+    e.code = "E_X";
+    const auto = new TypeError("auto");
+    const out = (await roundtrip(() => ({ e, auto })))() as any;
+    expect(out.e.stack).toBe("ZZZ_CUSTOM_STACK");
+    expect(out.e.code).toBe("E_X");
+    expect(out.e.message).toBe("boom");
+    expect(typeof out.auto.stack).toBe("string");
+    expect(out.auto).toBeInstanceOf(TypeError);
+  });
+});

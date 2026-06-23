@@ -618,6 +618,9 @@ function analyzeSharedCells(root: Function): { sharedIds: Set<number>; cellInfo:
   function processObj(o: object): void {
     if (seenObjs.has(o)) return;
     seenObjs.add(o);
+    // A well-known global (Math/console/globalThis/...) is emitted as a reference to its path,
+    // not walked — don't descend into its (native, host-specific) internals during analysis.
+    if (nativeObjectPath(o) !== undefined) return;
     if (ArrayIsArray(o)) {
       const arr = o as unknown[];
       for (const i of arrayPresentIndices(arr)) enqueue(arr[i]);
@@ -1090,6 +1093,8 @@ function computeGenuineClasses(root: unknown, sharedIdsArg?: Set<number>): Genui
       seen.add(v);
       // Never walk a Proxy's internals (would trip its traps / observable side effects).
       if ($isProxyObject(v as object)) continue;
+      // A well-known global is referenced by path, not walked — skip its native internals.
+      if (typeof v === "object" && nativeObjectPath(v as object) !== undefined) continue;
       if (typeof v === "function") {
         funcs.add(v);
         const fv = (v as any)[Symbol.freeVariables] as FreeVariable[] | undefined;
@@ -1487,6 +1492,7 @@ function computeKeepSets(root: Function): Map<object, Set<string> | "all"> {
       if (keepSets.get(o) === "all") continue;
       keepSets.set(o, "all");
       if (isAsyncLocalStorage(o)) continue; // reconstructed wholesale; don't walk internals
+      if (nativeObjectPath(o) !== undefined) continue; // referenced by path; don't walk internals
       if ($isProxyObject(o)) continue; // emitted via emitProxy, not keep-sets
       if ($isJSArray(o)) {
         const arr = o as unknown[];
@@ -1597,6 +1603,8 @@ function computeKeepSets(root: Function): Map<object, Set<string> | "all"> {
   }
   function processValueFns(value: unknown): void {
     if (isAsyncLocalStorage(value as object)) return; // reconstructed wholesale; opaque
+    // A well-known global is referenced by path, not walked — don't descend into its internals.
+    if (value !== null && typeof value === "object" && nativeObjectPath(value) !== undefined) return;
     if ($isProxyObject(value)) {
       const handler = $getProxyInternalField(value, $proxyFieldHandler);
       if (handler === null) return;
@@ -2292,6 +2300,19 @@ function emitObject(value: object, ctx: Context): string {
         `(its suspended execution state is not expressible as source). ` +
         `Serialize the generator function instead and re-create the iterator after reconstruction.`,
     );
+  }
+
+  // Well-known global namespace objects / singletons (globalThis, Math, JSON, Reflect, console,
+  // process, ...) are reachable by a stable global path. Emit a REFERENCE to that path — preserving
+  // identity (`captured === Math`) and avoiding both a useless deep copy and the
+  // recurse-into-native-methods failure — exactly as a captured native FUNCTION is referenced by
+  // its nativeFunctionPath. The reconstructed module re-binds to its own realm's globals.
+  const nativeObjPath = nativeObjectPath(value);
+  if (nativeObjPath !== undefined) {
+    const refName = REF_PREFIX + ctx.counter++;
+    ctx.refs.set(value, refName);
+    ctx.module.push(`const ${refName} = ${nativeObjPath};`);
+    return refName;
   }
 
   const name = REF_PREFIX + ctx.counter++;
@@ -3013,10 +3034,11 @@ function builtinErrorBase(value: object): string {
 }
 
 // Reconstructs an Error: create the right builtin base (with [[ErrorData]]),
-// then restore every own property — `message`, `cause` (incl. circular), an
-// AggregateError's `errors`, and any custom fields (`code`, `status`, ...) —
-// and, for a subclass, its prototype. `stack` is intentionally not pinned to the
-// original location.
+// then restore every own property — `message`, `stack`, `cause` (incl. circular),
+// an AggregateError's `errors`, and any custom fields (`code`, `status`, ...) —
+// and, for a subclass, its prototype. `stack` is preserved as-is: it's a real own
+// property (a user may have set it deliberately), and the original location is more
+// faithful than the meaningless `new Error()` frame the reconstruction would produce.
 // Emits the error's `const name = new Base(msg)` declaration synchronously and returns a thunk
 // that restores its own properties and (for a subclass) its prototype.
 function emitErrorBody(value: Error, name: string, ctx: Context): () => void {
@@ -3027,7 +3049,7 @@ function emitErrorBody(value: Error, name: string, ctx: Context): () => void {
     ctx.module.push(`const ${name} = new ${base}(${JSONStringify(value.message)});`);
   }
   return () => {
-    emitOwnProperties(name, value, ctx, ERROR_SKIP_KEYS);
+    emitOwnProperties(name, value, ctx);
     const proto = ObjectGetPrototypeOf(value);
     if (proto !== (globalThis as any)[base].prototype) {
       // Link to the reconstructed subclass's OWN `.prototype` (not a standalone rebuilt copy)
@@ -3043,7 +3065,6 @@ function emitErrorBody(value: Error, name: string, ctx: Context): () => void {
   };
 }
 
-const ERROR_SKIP_KEYS = new SetCtor(["stack"]);
 const REGEXP_SKIP_KEYS = new SetCtor(["lastIndex"]);
 
 // Reconstructs a Proxy as `new Proxy(target, handler)`. Both the target and the
@@ -3386,6 +3407,46 @@ function buildNativePathMap(): Map<Function, string> {
     } else if (typeof v === "object" && v !== null) {
       walkMembers(v, name); // namespace methods (Math.max, JSONParse, console.log, ...)
     }
+  }
+  return map;
+}
+
+// Well-known global namespace objects / singletons that are HOST or INTRINSIC state (never user
+// data), reachable by a stable global path. A captured value identical to one of these is emitted
+// as a reference to its path rather than walked. NOT an open walk of globalThis's own properties —
+// that would wrongly reference a user's own global object (`globalThis.myConfig`) instead of
+// serializing it by value.
+const NATIVE_OBJECT_PATHS = [
+  "Math",
+  "JSON",
+  "Reflect",
+  "Atomics",
+  "Intl",
+  "console",
+  "process",
+  "Bun",
+  "WebAssembly",
+  "Object.prototype",
+  "Array.prototype",
+  "Function.prototype",
+];
+let nativeObjectMap: Map<object, string> | undefined;
+function nativeObjectPath(value: object): string | undefined {
+  if (nativeObjectMap === undefined) nativeObjectMap = buildNativeObjectMap();
+  return nativeObjectMap.get(value);
+}
+function buildNativeObjectMap(): Map<object, string> {
+  const map = new MapCtor<object, string>();
+  const g = globalThis as any;
+  map.set(g, "globalThis");
+  for (const path of NATIVE_OBJECT_PATHS) {
+    let v: unknown = g;
+    try {
+      for (const part of path.split(".")) v = (v as any)[part];
+    } catch {
+      continue;
+    }
+    if (typeof v === "object" && v !== null && !map.has(v as object)) map.set(v as object, path);
   }
   return map;
 }
