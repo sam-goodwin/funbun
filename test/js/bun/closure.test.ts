@@ -7383,6 +7383,58 @@ describe("tamper resistance (hostile primordials)", () => {
     expect(chkCode).toBe(0);
     void chkErr;
   });
+
+  // Instance CONTENT was read through user-mutable PROTOTYPE members (`Map.prototype.entries`,
+  // `Set.prototype.values`, `Date.prototype.getTime`, the `RegExp.prototype.source`/`flags`
+  // getters, boxed `valueOf`) — so a caller could FORGE the serialized contents of a captured
+  // Map/Set/Date/RegExp/boxed primitive. These are now read through snapshots taken at module load.
+  test("forged prototype extractors cannot corrupt captured Map/Set/Date/RegExp contents", async () => {
+    using dir = tempDir("closure-tamper-extract", {
+      "serialize.mjs": `
+        import { serialize } from "bun:closure";
+        import { writeFileSync } from "node:fs";
+        const data = {
+          m: new Map([["real", "REAL_V"]]),
+          s: new Set(["REAL_S"]),
+          d: new Date(1000),
+          re: /realpat/gi,
+          n: new Number(42),
+        };
+        // Forge every extraction path AFTER constructing the real values.
+        Map.prototype.entries = function* () { yield ["forged", "FORGED_V"]; };
+        Set.prototype.values = function* () { yield "FORGED_S"; };
+        Date.prototype.getTime = () => 999999;
+        Object.defineProperty(RegExp.prototype, "source", { get: () => "FORGEDPAT", configurable: true });
+        Object.defineProperty(RegExp.prototype, "flags", { get: () => "m", configurable: true });
+        Number.prototype.valueOf = () => 13;
+        writeFileSync(new URL("./out.mjs", import.meta.url), serialize(() => data));
+        process.stdout.write("SERIALIZED");
+      `,
+      "check.mjs": `
+        import out from "./out.mjs";
+        const v = out();
+        process.stdout.write(JSON.stringify({
+          m: [...v.m.entries()], s: [...v.s], d: v.d.getTime(), src: v.re.source, flags: v.re.flags, n: +v.n,
+        }));
+      `,
+    });
+    await using ser = Bun.spawn({ cmd: [bunExe(), "serialize.mjs"], env: bunEnv, cwd: String(dir), stderr: "pipe" });
+    const [sOut, sErr, sCode] = await Promise.all([ser.stdout.text(), ser.stderr.text(), ser.exited]);
+    expect({ sOut, sErr: sErr.includes("rror") ? sErr : "", sCode }).toEqual({
+      sOut: "SERIALIZED",
+      sErr: "",
+      sCode: 0,
+    });
+
+    await using chk = Bun.spawn({ cmd: ["node", "check.mjs"], env: bunEnv, cwd: String(dir), stderr: "pipe" });
+    const [cOut, cErr, cCode] = await Promise.all([chk.stdout.text(), chk.stderr.text(), chk.exited]);
+    // The REAL contents survive; nothing forged leaked in.
+    expect(cOut).toBe(
+      JSON.stringify({ m: [["real", "REAL_V"]], s: ["REAL_S"], d: 1000, src: "realpat", flags: "gi", n: 42 }),
+    );
+    expect(cCode).toBe(0);
+    void cErr;
+  });
 });
 
 describe("adversarial regressions: round 6", () => {
@@ -12591,6 +12643,38 @@ describe("generators: Tier A (suspended-start + completed, portable)", () => {
     void g;
     expect(() => serialize(() => g)).toThrow(/[Aa]sync ?[Gg]enerator/);
   });
+
+  // A reserved word that's legal as a METHOD name (`*yield(){}`) is NOT legal as a generator
+  // function-expression name; reconstruction must fall back to anonymous, not emit `function* yield`.
+  test("a suspended generator with a reserved-word method name round-trips (anonymous)", async () => {
+    const obj = {
+      *yield() {
+        yield 10;
+        yield 20;
+      },
+    };
+    const g = obj.yield();
+    void g;
+    const out = (await roundtrip(() => g))() as Generator<number>;
+    expect([...out]).toEqual([10, 20]);
+  });
+
+  // A suspended generator whose body reads a #private field can't be rebuilt standalone
+  // (`function* (){ … this.#x … }` is a syntax error) — must be a CLEAR error, not broken output.
+  test("a suspended generator reading a #private field is a clear error", () => {
+    function make() {
+      class C {
+        #x = 7;
+        *g() {
+          yield this.#x;
+        }
+      }
+      return new C().g();
+    }
+    const g = make();
+    void g;
+    expect(() => serialize(() => g)).toThrow(/#private|reconstructed standalone/);
+  });
 });
 
 // ── Class method pruning (non-#private) ──────────────────────────────────────
@@ -12990,6 +13074,27 @@ describe("class method pruning (non-#private)", () => {
 
     const fn = await rt(root);
     expect(fn()).toBe("DIRECT_HELPER_MARK:9");
+  });
+
+  // A GENERATOR method's body surfaces `yield` as an opaque AST node that hides the `this.helper()`
+  // call inside it; pruning must not drop a method reached only through such a body — it keeps the
+  // whole receiver conservatively rather than mis-pruning.
+  test("a method called inside a reachable GENERATOR method's body is kept", async () => {
+    class Svc {
+      base = 100;
+      *gen() {
+        yield this.helper(1);
+        yield this.helper(2);
+      }
+      helper(x: number) {
+        return x + this.base;
+      }
+    }
+    const svc = new Svc();
+    const root = () => [...svc.gen()];
+
+    const fn = await rt(root);
+    expect(fn()).toEqual([101, 102]); // helper survived (not pruned)
   });
 
   test("pruning the method immediately before a `static {}` block stays valid syntax", async () => {

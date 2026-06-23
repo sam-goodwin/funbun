@@ -94,6 +94,43 @@ const ArrayBufferCtor = ArrayBuffer;
 const SharedArrayBufferCtor = typeof SharedArrayBuffer !== "undefined" ? SharedArrayBuffer : undefined;
 const ArrayCtor = Array;
 const Uint8ArrayCtor = Uint8Array;
+// Instance CONTENT is extracted through these snapshotted prototype methods/getters — never a live
+// `value.getTime()` / `Map.prototype.entries` / `re.source` read, which goes through the
+// user-mutable prototype and would let a caller forge a captured Map/Set/Date/RegExp/boxed
+// primitive's serialized contents (the constructors above are snapshotted, but the prototype
+// members are not). Mirrors `funcSource` snapshotting `Function.prototype.toString`.
+const MapProtoEntries = Map.prototype.entries;
+const SetProtoValues = Set.prototype.values;
+const DateProtoGetTime = Date.prototype.getTime;
+const NumberProtoValueOf = Number.prototype.valueOf;
+const StringProtoValueOf = String.prototype.valueOf;
+const BooleanProtoValueOf = Boolean.prototype.valueOf;
+const RegExpSourceGetter = ObjectGetOwnPropertyDescriptor(RegExp.prototype, "source")!.get!;
+const RegExpFlagsGetter = ObjectGetOwnPropertyDescriptor(RegExp.prototype, "flags")!.get!;
+// The Map/Set iterator's own `.next` is snapshotted too, so draining can't be redirected by
+// overriding `%MapIteratorPrototype%.next`; entries are read by index, never destructured (which
+// would consult a user-mutable Array `[Symbol.iterator]`).
+const MapIterNext = ObjectGetPrototypeOf(MapProtoEntries.$call(new MapCtor()) as object).next;
+const SetIterNext = ObjectGetPrototypeOf(SetProtoValues.$call(new SetCtor()) as object).next;
+
+// Drain a real Map's entries tamper-proof (caller guarantees a genuine [[MapData]] receiver).
+function mapEachEntry(m: object, visit: (k: unknown, v: unknown) => void): void {
+  const it = MapProtoEntries.$call(m as Map<unknown, unknown>) as object;
+  for (;;) {
+    const r = MapIterNext.$call(it) as { done?: boolean; value: [unknown, unknown] };
+    if (r.done) break;
+    visit(r.value[0], r.value[1]);
+  }
+}
+// Drain a real Set's values tamper-proof.
+function setEachValue(s: object, visit: (v: unknown) => void): void {
+  const it = SetProtoValues.$call(s as Set<unknown>) as object;
+  for (;;) {
+    const r = SetIterNext.$call(it) as { done?: boolean; value: unknown };
+    if (r.done) break;
+    visit(r.value);
+  }
+}
 
 // A function's source. `fn.toString()` looks `toString` up THROUGH fn's prototype chain to
 // Function.prototype — for a deep `class extends` chain that walks the whole superclass chain
@@ -601,12 +638,12 @@ function forEachMapSetEntry(o: object, visit: (v: unknown) => void): void {
   // simply has no entries to walk.
   try {
     if (o instanceof MapCtor) {
-      for (const entry of MapCtor.prototype.entries.$call(o as Map<unknown, unknown>)) {
-        visit(entry[0]);
-        visit(entry[1]);
-      }
+      mapEachEntry(o, (k, v) => {
+        visit(k);
+        visit(v);
+      });
     } else if (o instanceof SetCtor) {
-      for (const el of SetCtor.prototype.values.$call(o as Set<unknown>)) visit(el);
+      setEachValue(o, visit);
     }
   } catch {}
 }
@@ -1988,6 +2025,14 @@ function computeKeepSets(root: Function): KeepSetResult {
       keepAll(obj);
       return;
     }
+    // A generator / async method body surfaces `yield`/`await` as opaque `Unsupported` AST nodes,
+    // which HIDE the `this.X` reads/calls nested inside them — so the access scan would miss a
+    // `this.helper()` and wrongly prune `helper`. When the body is incompletely representable,
+    // fall back to keeping the whole receiver (conservative; never under-keeps).
+    if (containsUnsupportedNode(fnNode.body)) {
+      keepAll(obj);
+      return;
+    }
     const thisNode = analyzeAccess(fnNode, new SetCtor(["this"])).get("this");
     if (thisNode === undefined) return; // doesn't touch `this`
     apply(obj, thisNode); // its `this.X` reads are reads on `obj`
@@ -2763,6 +2808,66 @@ function isModuleNamespaceObject(value: object): boolean {
 // engine-internal slots (the locals are keyed by numeric register, their source names discarded
 // by the compiler) and cannot be expressed as source — reject clearly. Returns undefined to let
 // the caller fall through to the generic reject when no source is introspectable.
+
+// Reserved words that are legal as a METHOD name but NOT as a function-expression binding name in
+// strict/module code (the emitted output is ESM). `ecmaName()` can hand us any of these.
+const RESERVED_FUNCTION_NAMES = new SetCtor<string>([
+  "yield",
+  "await",
+  "let",
+  "static",
+  "implements",
+  "interface",
+  "package",
+  "private",
+  "protected",
+  "public",
+  "if",
+  "else",
+  "for",
+  "while",
+  "do",
+  "switch",
+  "case",
+  "default",
+  "break",
+  "continue",
+  "return",
+  "function",
+  "class",
+  "extends",
+  "super",
+  "new",
+  "delete",
+  "typeof",
+  "instanceof",
+  "in",
+  "void",
+  "this",
+  "null",
+  "true",
+  "false",
+  "var",
+  "const",
+  "throw",
+  "try",
+  "catch",
+  "finally",
+  "with",
+  "debugger",
+  "export",
+  "import",
+  "enum",
+]);
+// True when `name` is safe to use as a generator function-expression name: a plain ASCII binding
+// identifier that isn't a reserved word. Non-ASCII / non-identifier / reserved names fall back to
+// anonymous (the name is cosmetic), so reconstruction never emits un-parseable source.
+function isUsableFunctionName(name: string): boolean {
+  if (name === "" || RESERVED_FUNCTION_NAMES.has(name)) return false;
+  if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name)) return false;
+  return true;
+}
+
 function emitGenerator(
   value: object,
   gs: { state: number; this: unknown; name: string; body: string; fn: Function },
@@ -2817,8 +2922,24 @@ function emitGenerator(
     }
   }
   // gs.body is the generator body block (`{ ... }`); the parameters are captured by value, so the
-  // rebuilt function takes none. An anonymous generator keeps an empty name.
-  const wrappedSource = `function* ${gs.name} () ${gs.body}`;
+  // rebuilt function takes none. The name is purely cosmetic (`.name`) — but `ecmaName()` can be a
+  // RESERVED word (a `*yield(){}` method) or a non-identifier string key (`{ "a-b": *(){} }`),
+  // neither of which is legal as a generator-function-expression name; fall back to anonymous so we
+  // never emit un-importable source. (A non-ASCII identifier name also falls back — cosmetic only.)
+  const genName = isUsableFunctionName(gs.name) ? gs.name : "";
+  const wrappedSource = `function* ${genName} () ${gs.body}`;
+  // The body must be reconstructable as a STANDALONE generator. If it reads a `#private` field (or
+  // any syntax invalid outside its defining class/scope), `function* (){ … this.#x … }` won't parse
+  // — reject clearly instead of emitting source that throws a SyntaxError at import.
+  if (parseWithOffset(wrappedSource) === null) {
+    ctx.refs.delete(value);
+    ctx.counter--;
+    throw new TypeError(
+      "Cannot serialize a generator whose body can't be reconstructed standalone (it reads a " +
+        "#private field, or uses syntax not valid outside its defining scope). Capture the values " +
+        "you need into named variables before the first `yield`.",
+    );
+  }
   const rec = reconstructFunctionExpr(gs.fn, ctx, wrappedSource);
   const thisExpr = emitValue(transform(undefined, "this", gs.this, ctx), ctx);
   ctx.module.push(`const ${refName} = (${rec.expr}).call(${thisExpr});`);
@@ -3093,20 +3214,20 @@ function restoreBuiltinContent(value: object, name: string, ctx: Context): Set<s
   // restore reproduces the exact live contents. (The array branch assigns indices directly.)
   if (value instanceof MapCtor) {
     let i = 0;
-    for (const [k, v] of MapCtor.prototype.entries.$call(value as Map<unknown, unknown>)) {
+    mapEachEntry(value, (k, v) => {
       const kx = emitValue(k, ctx);
       const vx = emitValue(transform(value, mapReplacerKey(k, i), v, ctx), ctx);
       ctx.module.push(`Map.prototype.set.call(${name}, ${kx}, ${vx});`);
       i++;
-    }
+    });
     return undefined;
   }
   if (value instanceof SetCtor) {
     let i = 0;
-    for (const v of SetCtor.prototype.values.$call(value as Set<unknown>)) {
+    setEachValue(value, v => {
       ctx.module.push(`Set.prototype.add.call(${name}, ${emitValue(transform(value, String(i), v, ctx), ctx)});`);
       i++;
-    }
+    });
     return undefined;
   }
   if (ArrayIsArray(value)) {
@@ -3441,7 +3562,7 @@ function emitBuiltin(value: object, name: string, ctx: Context): { proto: object
   // (which made serialization O(depth²)). Promise is slot-based ($isPromise, above) and unaffected.
   if (!chainHasBuiltinPrototype(value)) return null;
   if (value instanceof DateCtor && hasSlot(value, slotProbeDate)) {
-    ctx.module.push(`const ${name} = new Date(${(value as Date).getTime()});`);
+    ctx.module.push(`const ${name} = new Date(${DateProtoGetTime.$call(value as Date)});`);
     return {
       proto: DateCtor.prototype,
       // Extra own properties (`d.label = ...`) are only otherwise restored on the subclass
@@ -3454,7 +3575,9 @@ function emitBuiltin(value: object, name: string, ctx: Context): { proto: object
   }
   if (value instanceof RegExpCtor && hasSlot(value, slotProbeRegExp)) {
     const re = value as RegExp;
-    ctx.module.push(`const ${name} = new RegExp(${JSONStringify(re.source)}, ${JSONStringify(re.flags)});`);
+    const reSource = RegExpSourceGetter.$call(re) as string;
+    const reFlags = RegExpFlagsGetter.$call(re) as string;
+    ctx.module.push(`const ${name} = new RegExp(${JSONStringify(reSource)}, ${JSONStringify(reFlags)});`);
     // lastIndex is the iteration cursor of a global/sticky regex — stateful, must be restored.
     if (re.lastIndex !== 0) ctx.module.push(`${name}.lastIndex = ${re.lastIndex};`);
     return {
@@ -3476,12 +3599,12 @@ function emitBuiltin(value: object, name: string, ctx: Context): { proto: object
       proto: MapCtor.prototype,
       body: () => {
         let i = 0;
-        for (const entry of MapCtor.prototype.entries.$call(value as Map<unknown, unknown>)) {
-          const k = emitValue(entry[0], ctx);
-          const v = emitValue(transform(value, mapReplacerKey(entry[0], i), entry[1], ctx), ctx);
+        mapEachEntry(value, (key, val) => {
+          const k = emitValue(key, ctx);
+          const v = emitValue(transform(value, mapReplacerKey(key, i), val, ctx), ctx);
           ctx.module.push(`Map.prototype.set.call(${name}, ${k}, ${v});`);
           i++;
-        }
+        });
         // A plain Map can also carry extra own properties (`m.meta = ...`); a subclass's go
         // through restoreSubclass, so only emit them here when the prototype is the natural one.
         if (ObjectGetPrototypeOf(value) === MapCtor.prototype) emitOwnProperties(name, value, ctx);
@@ -3494,12 +3617,12 @@ function emitBuiltin(value: object, name: string, ctx: Context): { proto: object
       proto: SetCtor.prototype,
       body: () => {
         let i = 0;
-        for (const element of SetCtor.prototype.values.$call(value as Set<unknown>)) {
+        setEachValue(value, element => {
           ctx.module.push(
             `Set.prototype.add.call(${name}, ${emitValue(transform(value, String(i), element, ctx), ctx)});`,
           );
           i++;
-        }
+        });
         if (ObjectGetPrototypeOf(value) === SetCtor.prototype) emitOwnProperties(name, value, ctx);
       },
     };
@@ -3570,11 +3693,11 @@ function emitBuiltin(value: object, name: string, ctx: Context): { proto: object
   // Boxed primitives (new Number/String/Boolean) — objects wrapping a primitive. Extra own props
   // are restored here for the natural-prototype case (a subclass goes through restoreSubclass).
   if (value instanceof NumberCtor && hasSlot(value, slotProbeNumber)) {
-    ctx.module.push(`const ${name} = new Number(${serializeNumber((value as Number).valueOf())});`);
+    ctx.module.push(`const ${name} = new Number(${serializeNumber(NumberProtoValueOf.$call(value) as number)});`);
     return { proto: NumberCtor.prototype, body: () => emitBuiltinOwnProps(name, value, ctx, NumberCtor.prototype) };
   }
   if (value instanceof StringCtor && hasSlot(value, slotProbeString)) {
-    ctx.module.push(`const ${name} = new String(${JSONStringify((value as String).valueOf())});`);
+    ctx.module.push(`const ${name} = new String(${JSONStringify(StringProtoValueOf.$call(value) as string)});`);
     return {
       proto: StringCtor.prototype,
       body: () => {
@@ -3588,7 +3711,7 @@ function emitBuiltin(value: object, name: string, ctx: Context): { proto: object
     };
   }
   if (value instanceof BooleanCtor && hasSlot(value, slotProbeBoolean)) {
-    ctx.module.push(`const ${name} = new Boolean(${(value as Boolean).valueOf()});`);
+    ctx.module.push(`const ${name} = new Boolean(${BooleanProtoValueOf.$call(value) as boolean});`);
     return { proto: BooleanCtor.prototype, body: () => emitBuiltinOwnProps(name, value, ctx, BooleanCtor.prototype) };
   }
   // A WeakRef snapshots its live referent. If already collected at serialize
