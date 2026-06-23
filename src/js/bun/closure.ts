@@ -1135,8 +1135,15 @@ function pruneClassMethods(fn: Function, source: string, cs: ClassStructure, ctx
   const closeBrace = typeof cs.node.body?.closeBrace === "number" ? cs.node.body.closeBrace - cs.offset : -1;
   if (closeBrace < 0) return source;
 
+  // `memberStart` is the member's true textual start (BEFORE leading modifiers/decorators) — the
+  // correct deletion boundary. For a StaticBlock it differs from `.start` (which is the block's
+  // `{`); using `.start` there would eat the preceding member's `static` keyword. Fall back to
+  // `.start` only if memberStart is somehow absent.
   const starts: number[] = [];
-  for (const m of members) starts.push(typeof m.start === "number" ? m.start - cs.offset : -1);
+  for (const m of members) {
+    const s = typeof m.memberStart === "number" ? m.memberStart : m.start;
+    starts.push(typeof s === "number" ? s - cs.offset : -1);
+  }
 
   const cuts: Array<{ start: number; end: number }> = [];
   const pruned = new SetCtor<PropertyKey>();
@@ -1849,11 +1856,14 @@ function computeKeepSets(root: Function): KeepSetResult {
       const d = lookupDescriptor(obj, prop);
       if (d !== undefined && "value" in d) {
         apply(d.value, childNode);
-      } else if (d !== undefined && typeof d.get === "function") {
-        // Reading `obj.prop` invokes the getter with `this === obj`; fold its
-        // `this.X` reads into obj's keep-set. The getter's result is a fresh
-        // value, so the child path past it is opaque (handled conservatively).
-        thisFollowFn(obj, d.get);
+      } else if (d !== undefined) {
+        // An accessor property reached on `obj`: reading invokes the getter, WRITING invokes the
+        // setter — both run with `this === obj`. The access analysis doesn't distinguish read from
+        // write, so fold BOTH bodies' `this.X` reads/calls into obj's keep-set (conservative: a
+        // setter the closure actually fires would otherwise have its called methods pruned). The
+        // accessor's result is a fresh value, so the child path past it is opaque.
+        if (typeof d.get === "function") thisFollowFn(obj, d.get);
+        if (typeof d.set === "function") thisFollowFn(obj, d.set);
       }
       // missing props: kept (added above), nothing to recurse.
     }

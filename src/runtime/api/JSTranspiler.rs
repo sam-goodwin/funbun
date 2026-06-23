@@ -1979,6 +1979,10 @@ impl<'a> AstJsConverter<'a> {
                 // The closing `}` position, so a consumer can empty the block by AST offset.
                 node.put(self.global, "closeBrace", JSValue::js_number(block.close_loc.start as f64));
             }
+            // `start` is the block's `{` (used to empty the block in place); `memberStart` is the
+            // `static` keyword — the member's true textual start, used as a deletion boundary by a
+            // neighbouring pruned member (the closure serializer). They differ here, unlike methods.
+            node.put(self.global, "memberStart", JSValue::js_number(p.member_start.start as f64));
             let kind = self.str(b"staticBlock")?;
             node.put(self.global, "kind", kind);
             return Ok(node);
@@ -1998,10 +2002,13 @@ impl<'a> AstJsConverter<'a> {
         } else {
             "PropertyDefinition"
         };
-        // `start` is the member's true start (before leading `static`/`get`/`async`/`*`/decorators)
-        // so a source-rewriting consumer (the closure serializer's method pruning) can delete a
-        // whole member by the span `[member[i].start, member[i+1].start)`.
+        // `start` / `memberStart` are both the member's true start (before leading
+        // `static`/`get`/`async`/`*`/decorators) so a source-rewriting consumer (the closure
+        // serializer's method pruning) can delete a whole member by the span
+        // `[member[i].memberStart, member[i+1].memberStart)`. (`memberStart` is also surfaced on
+        // StaticBlock, where it differs from `start` — see above — so consumers read it uniformly.)
         let node = self.node(ty, p.member_start.start)?;
+        node.put(self.global, "memberStart", JSValue::js_number(p.member_start.start as f64));
         if let Some(key) = p.key {
             let k = self.expr(&key)?;
             node.put(self.global, "key", k);

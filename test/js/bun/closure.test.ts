@@ -12800,4 +12800,82 @@ describe("class method pruning (non-#private)", () => {
     const fn = await rt(root);
     expect((fn() as () => string).call(null)).toBe("READ_REF");
   });
+
+  test("a method reached through an INVOKED setter (this.x = v) is kept", async () => {
+    class Svc {
+      log = "";
+      go() {
+        this.s = 5; // fires the setter, which calls this.helper()
+        return this.log;
+      }
+      set s(v: number) {
+        this.helper(v);
+      }
+      helper(v: number) {
+        this.log = "HELPER_MARK:" + v;
+      }
+      unused() {
+        return "UNUSED_SETTER_MARK";
+      }
+    }
+    const svc = new Svc();
+    const root = () => svc.go();
+
+    const { code } = serializeCollect(root);
+    expect(code).toContain("HELPER_MARK"); // reached via the setter body
+    expect(code).not.toContain("UNUSED_SETTER_MARK");
+
+    const fn = await rt(root);
+    expect(fn()).toBe("HELPER_MARK:5");
+  });
+
+  test("a method reached through a DIRECT setter write (svc.x = v) is kept", async () => {
+    class Svc {
+      log = "";
+      set s(v: number) {
+        this.helper(v);
+      }
+      helper(v: number) {
+        this.log = "DIRECT_HELPER_MARK:" + v;
+      }
+      idle() {
+        return "IDLE_SETTER_MARK";
+      }
+    }
+    const svc = new Svc();
+    const root = () => {
+      svc.s = 9;
+      return svc.log;
+    };
+
+    const { code } = serializeCollect(root);
+    expect(code).toContain("DIRECT_HELPER_MARK");
+    expect(code).not.toContain("IDLE_SETTER_MARK");
+
+    const fn = await rt(root);
+    expect(fn()).toBe("DIRECT_HELPER_MARK:9");
+  });
+
+  test("pruning the method immediately before a `static {}` block stays valid syntax", async () => {
+    class Svc {
+      hidden() {
+        return "HIDDEN_STATIC_MARK";
+      }
+      static {
+        // a static block sitting right after the pruned method
+        void 0;
+      }
+      greet() {
+        return "GREET_MARK";
+      }
+    }
+    const svc = new Svc();
+    const root = () => svc.greet();
+
+    const code = serialize(root);
+    expect(code).not.toContain("HIDDEN_STATIC_MARK"); // hidden pruned
+
+    const fn = await rt(root);
+    expect(fn()).toBe("GREET_MARK"); // imports cleanly (no orphaned `{}`), runs
+  });
 });
