@@ -925,6 +925,48 @@ function sourceDefinedMemberKeys(source: string): { staticKeys: Set<PropertyKey>
   return { staticKeys, instanceKeys };
 }
 
+// The instance-method keys whose live prototype function was REPLACED at runtime after the class
+// was declared (`Class.prototype.read = fn`, or `Object.defineProperty(Class.prototype, "read", …)`).
+// The emitted class source is reprinted from `toString()`, which still shows the ORIGINAL body, and
+// the prototype's own-property emit normally SKIPS every key the class body declares — so an
+// override would be silently lost (the stale original wins). These keys must be un-skipped so the
+// live override is re-emitted (overwriting the inline original on the reconstructed prototype).
+//
+// Detection is by source identity, robust across method kinds and override mechanisms: an
+// un-replaced class method's own `toString()` is byte-identical to its text inside the class
+// source, so if the class source does NOT contain the live function's source at the member's start,
+// the method was replaced. `original` MUST be the unmodified `fn.toString()` (not a mangled/pruned
+// reconstruction) so a `#private`-reading method's live `#x` source still matches. Only
+// string/identifier-keyed, non-static, non-computed instance methods/accessors are considered.
+function overriddenPrototypeKeys(fn: Function, original: string): Set<PropertyKey> {
+  const result = new SetCtor<PropertyKey>();
+  const proto = (fn as { prototype?: object }).prototype;
+  if (typeof proto !== "object" || proto === null) return result;
+  const parsed = parseWithOffset(original);
+  const members = parsed?.node?.body?.body;
+  if (parsed === null || !$isJSArray(members)) return result;
+  for (const m of members) {
+    if (m?.type !== "MethodDefinition" || m.static === true || m.computed === true) continue;
+    if (m.key?.type === "PrivateIdentifier") continue;
+    const key = memberKeyOf(m);
+    if (key === undefined || key === "constructor") continue;
+    const d = ObjectGetOwnPropertyDescriptor(proto, key);
+    if (d === undefined) continue;
+    const live = m.kind === "get" ? d.get : m.kind === "set" ? d.set : d.value;
+    if (typeof live !== "function") continue;
+    const at = typeof m.memberStart === "number" ? m.memberStart - parsed.offset : -1;
+    if (at < 0) continue;
+    let liveSrc: string;
+    try {
+      liveSrc = funcSource(live);
+    } catch {
+      continue;
+    }
+    if (!original.startsWith(liveSrc, at)) result.add(key);
+  }
+  return result;
+}
+
 // True if `mangledSource` (the post-`#x`-rewrite form — `#x` outside a class body is a
 // syntax error to parse standalone) is an arrow function that reads a private through its
 // lexical `this`: `this.<mangled>` or `"<mangled>" in this`. Such an arrow is reconstructed
@@ -3901,13 +3943,19 @@ function emitFunctionContent(fn: Function, name: string, ctx: Context): void {
   // pattern, or a monkey-patched class prototype) live on the `.prototype` object, not in the
   // function's source — emit its own properties (any enumerability) onto `<name>.prototype`,
   // skipping `constructor`, the instance members the class source already declares, and any
-  // methods pruneClassMethods removed (those are deliberately gone — don't resurrect them).
+  // methods pruneClassMethods removed (those are deliberately gone — don't resurrect them). A
+  // source-declared method REPLACED at runtime is un-skipped so its override re-emits over the
+  // inline original (overriddenPrototypeKeys, detected against the un-mangled original source).
   if (typeof ownProto === "object" && ownProto !== null) {
     const pruned = ctx.prunedMethods.get(fn);
+    const overridden = overriddenPrototypeKeys(fn, funcSource(fn));
     let skip = memberKeys.instanceKeys;
-    if (pruned !== undefined && pruned.size > 0) {
+    if ((pruned !== undefined && pruned.size > 0) || overridden.size > 0) {
       skip = new SetCtor<PropertyKey>(skip);
-      for (const k of pruned) skip.add(k);
+      if (pruned !== undefined) for (const k of pruned) skip.add(k);
+      // A pruned (unreachable) method stays gone even if also overridden; otherwise un-skip the
+      // override so emitOwnProperties re-emits it.
+      for (const k of overridden) if (pruned === undefined || !pruned.has(k)) skip.delete(k);
     }
     emitOwnProperties(`${name}.prototype`, ownProto, ctx, skip, false);
   }

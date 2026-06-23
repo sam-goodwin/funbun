@@ -10760,6 +10760,51 @@ describe("generality: prototype member preservation", () => {
     expect(new (C as any)().m()).toBe(21);
   });
 
+  // A class-source method REPLACED at runtime (`Svc.prototype.read = ...`) must serialize the
+  // LIVE override, not the stale class-body version. The class source is reprinted from
+  // `toString()` (which still shows the original body), and the prototype's own-property emit
+  // skips keys the class body declares — so the override has to be detected and re-emitted.
+  test("a runtime override of a class-source method wins over the original body", async () => {
+    class Svc {
+      read() {
+        return "SOURCE_READ";
+      }
+    }
+    Svc.prototype.read = function () {
+      return "PATCHED_READ";
+    };
+    const svc = new Svc();
+    // Pruning path: the closure calls the (overridden) method directly.
+    expect((await roundtrip(() => svc.read()))()).toBe("PATCHED_READ");
+    // Whole-capture path (pruning disabled): the reconstructed instance runs the override.
+    expect(((await roundtrip(() => svc))() as any).read()).toBe("PATCHED_READ");
+  });
+
+  // Mixed: only one of several source methods is overridden — the override wins, the untouched
+  // siblings keep their original bodies (no over-emission clobbering them).
+  test("an override coexists with untouched source methods", async () => {
+    class Svc {
+      a() {
+        return "A_ORIG";
+      }
+      b() {
+        return "B_ORIG";
+      }
+      get g() {
+        return "G_ORIG";
+      }
+    }
+    Svc.prototype.a = function () {
+      return "A_PATCHED";
+    };
+    Object.defineProperty(Svc.prototype, "g", { get: () => "G_PATCHED", configurable: true });
+    const svc = new Svc();
+    const out = (await roundtrip(() => svc))() as any;
+    expect(out.a()).toBe("A_PATCHED"); // overridden method
+    expect(out.b()).toBe("B_ORIG"); // untouched method preserved
+    expect(out.g).toBe("G_PATCHED"); // overridden getter
+  });
+
   // KNOWN BUG: a NON-enumerable prototype member is dropped (emitOwnProperties on
   // <name>.prototype also uses enumerableOnly=true).
   test("non-enumerable prototype method round-trips", async () => {
