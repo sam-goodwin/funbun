@@ -159,6 +159,7 @@ using namespace JSC;
     macro(port) \
     macro(finalizationRegistrySnapshot) \
     macro(bunClosureUnserializableTag) \
+    macro(bunGeneratorState) \
     macro(resolveClosureBinding) \
     macro(weakCollectionSnapshot) \
     macro(post) \

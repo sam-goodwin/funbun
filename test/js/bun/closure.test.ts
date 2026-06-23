@@ -3072,8 +3072,10 @@ describe("generators, iterators, and the live-generator hazard", () => {
     expect(out.constructor.name).toBe("Stream");
   });
 
-  // The hazard: a generator OBJECT holds suspended engine state not expressible
-  // as source. Each of these must throw a CLEAR error (not silently corrupt).
+  // The hazard: a generator OBJECT paused MID-ITERATION holds suspended engine state (its yield
+  // point and live locals, keyed by numeric register) that is not expressible as source — those
+  // must throw a CLEAR error (not silently corrupt). A not-yet-started or completed generator IS
+  // reconstructable (Tier A) and is covered by the "generators: Tier A" suite.
   test("partially-executed generator object throws a clear error", () => {
     function* g() {
       yield 1;
@@ -3084,16 +3086,17 @@ describe("generators, iterators, and the live-generator hazard", () => {
     expect(live.next()).toEqual({ value: 1, done: false });
     let captured = live;
     void captured;
-    expect(() => serialize(() => captured)).toThrow(/suspended execution state/i);
+    expect(() => serialize(() => captured)).toThrow(/started iterating/);
   });
 
-  test("freshly-created generator object throws a clear error", () => {
+  test("freshly-created (not-started) generator object reconstructs", async () => {
     function* g() {
       yield 1;
     }
     let captured = g();
     void captured;
-    expect(() => serialize(() => captured)).toThrow(/suspended execution state/i);
+    const out = (await roundtrip(() => captured))() as Generator<number>;
+    expect([...out]).toEqual([1]);
   });
 
   test("async generator object throws a clear error", async () => {
@@ -3119,12 +3122,13 @@ describe("generators, iterators, and the live-generator hazard", () => {
   test("a live generator nested inside a captured object throws a clear error", () => {
     function* g() {
       yield 1;
+      yield 2;
     }
     const live = g();
     live.next();
     const wrapper = { label: "box", it: live };
     void wrapper;
-    expect(() => serialize(() => wrapper)).toThrow(/suspended execution state/i);
+    expect(() => serialize(() => wrapper)).toThrow(/started iterating/);
   });
 });
 
@@ -5221,13 +5225,16 @@ describe("interactions: guards fire when nested", () => {
     expect(out.inner).toBeInstanceOf(WeakMap);
     expect(out.inner.get(out.key)).toBe("v");
   });
-  test("a generator object nested in a Map still throws", () => {
+  test("a mid-iteration generator object nested in a Map still throws", () => {
     function* g() {
       yield 1;
+      yield 2;
     }
-    const m = new Map([["gen", g()]]);
+    const live = g();
+    live.next();
+    const m = new Map([["gen", live]]);
     void m;
-    expect(() => serialize(() => m)).toThrow(/suspended execution state/i);
+    expect(() => serialize(() => m)).toThrow(/started iterating/);
   });
 });
 
@@ -7298,15 +7305,18 @@ describe("adversarial regressions: round 5", () => {
     expect(out[Symbol.toStringTag]).toBe("Generator");
   });
 
-  test("a real generator with its toStringTag stripped is still rejected", () => {
+  test("a real mid-iteration generator with its toStringTag stripped is still rejected", () => {
     function* gen() {
       yield 1;
+      yield 2;
     }
     const g: any = gen();
+    g.next(); // mid-iteration: unserializable regardless of any tag spoofing
     // Shadow the prototype's tag with an own `undefined` so `toString` no longer reports it.
     Object.defineProperty(g, Symbol.toStringTag, { value: undefined, configurable: true });
     expect(Object.prototype.toString.call(g)).toBe("[object Object]");
-    expect(() => serialize(() => g)).toThrow(/Cannot serialize a Generator object/);
+    // Detected by the actual JSC cell type (via the native generator-state probe), not the tag.
+    expect(() => serialize(() => g)).toThrow(/started iterating/);
   });
 
   test("a Map iterator is rejected with its precise native type label", () => {
@@ -12301,5 +12311,147 @@ describe("generality: deep prototype chains scale", () => {
     // instanceof through the reconstructed inheritance chain holds at both ends.
     expect(out.inst instanceof out.Leaf).toBe(true);
     expect(out.inst instanceof out.Base).toBe(true);
+  });
+});
+
+describe("generators: Tier A (suspended-start + completed, portable)", () => {
+  // A not-yet-iterated (SuspendedStart) generator reconstructs as an equivalent fresh generator —
+  // its full sequence is unchanged because nothing has been consumed. arity 0, no `arguments`.
+  test("a not-started generator round-trips and yields its full sequence", async () => {
+    function* gen() {
+      yield 1;
+      yield 2;
+      yield 3;
+    }
+    const g = gen();
+    void g;
+    const out = (await roundtrip(() => g))() as Generator<number>;
+    expect([...out]).toEqual([1, 2, 3]);
+  });
+
+  test("a not-started generator capturing a free variable round-trips", async () => {
+    const base = 10;
+    function* gen() {
+      yield base;
+      yield base + 1;
+    }
+    const g = gen();
+    void g;
+    const out = (await roundtrip(() => g))() as Generator<number>;
+    expect([...out]).toEqual([10, 11]);
+  });
+
+  test("a not-started method generator capturing `this` round-trips", async () => {
+    const obj = {
+      v: 5,
+      *gen(this: { v: number }) {
+        yield this.v;
+        yield this.v * 2;
+      },
+    };
+    const g = obj.gen();
+    void g;
+    const out = (await roundtrip(() => g))() as Generator<number>;
+    expect([...out]).toEqual([5, 10]);
+  });
+
+  test("a not-started generator captured twice keeps one identity", async () => {
+    function* gen() {
+      yield 1;
+      yield 2;
+    }
+    const g = gen();
+    void g;
+    const out = (await roundtrip(() => ({ a: g, b: g })))() as any;
+    expect(out.a).toBe(out.b);
+    expect([...out.a]).toEqual([1, 2]);
+  });
+
+  test("a completed generator round-trips as an immediately-done generator", async () => {
+    function* gen() {
+      yield 1;
+    }
+    const g = gen();
+    [...g]; // drive to completion
+    void g;
+    const out = (await roundtrip(() => g))() as Generator<number>;
+    expect(out.next()).toEqual({ value: undefined, done: true });
+    expect([...out]).toEqual([]);
+  });
+
+  // Cross-runtime: the emitted module + reconstruction must run in any JS runtime (Node), not Bun.
+  test("a reconstructed not-started generator runs in Node", async () => {
+    using dir = tempDir("closure-gen-node", {
+      "gen.mjs": `
+        import { serialize } from "bun:closure";
+        import { writeFileSync } from "node:fs";
+        const base = 7;
+        function* g() { yield base; yield base + 1; yield base + 2; }
+        const inst = g();
+        writeFileSync(new URL("./out.mjs", import.meta.url), serialize(() => inst));
+        process.stdout.write("SERIALIZED");
+      `,
+      "check.mjs": `
+        import build from "./out.mjs";
+        const it = build();
+        process.stdout.write(JSON.stringify([...it]));
+      `,
+    });
+    await using ser = Bun.spawn({ cmd: [bunExe(), "gen.mjs"], env: bunEnv, cwd: String(dir), stderr: "pipe" });
+    const [sOut, sErr, sCode] = await Promise.all([ser.stdout.text(), ser.stderr.text(), ser.exited]);
+    expect({ sOut, sErr: sErr.includes("error") ? sErr : "", sCode }).toEqual({
+      sOut: "SERIALIZED",
+      sErr: "",
+      sCode: 0,
+    });
+
+    await using chk = Bun.spawn({ cmd: ["node", "check.mjs"], env: bunEnv, cwd: String(dir), stderr: "pipe" });
+    const [cOut, cErr, cCode] = await Promise.all([chk.stdout.text(), chk.stderr.text(), chk.exited]);
+    expect(cOut).toBe(JSON.stringify([7, 8, 9]));
+    expect(cCode).toBe(0);
+    void cErr;
+  });
+
+  // An unstarted generator of arity ≥ 1 reconstructs: the parameters were bound to their
+  // argument values, which JSC surfaces as captured free variables of the body, so they are
+  // re-bound by value and the rebuilt generator takes no parameters.
+  test("an unstarted generator created with arguments reconstructs (params captured by value)", async () => {
+    function* gen(a: number, b: number) {
+      yield a + b;
+      yield a * b;
+    }
+    const g = gen(3, 4);
+    void g;
+    const out = (await roundtrip(() => g))() as Generator<number>;
+    expect([...out]).toEqual([7, 12]);
+  });
+
+  // ── Clear errors (out of Tier A scope) ──
+  test("a started (mid-iteration) generator is a clear error", () => {
+    function* gen() {
+      yield 1;
+      yield 2;
+    }
+    const g = gen();
+    g.next(); // now mid-iteration
+    expect(() => serialize(() => g)).toThrow(/started iterating/);
+  });
+
+  test("an unstarted generator that reads `arguments` is a clear error", () => {
+    function* gen() {
+      yield arguments.length;
+    }
+    const g = (gen as any)(1, 2);
+    void g;
+    expect(() => serialize(() => g)).toThrow(/arguments/);
+  });
+
+  test("an async generator is a clear error", () => {
+    async function* agen() {
+      yield 1;
+    }
+    const g = agen();
+    void g;
+    expect(() => serialize(() => g)).toThrow(/[Aa]sync ?[Gg]enerator/);
   });
 });

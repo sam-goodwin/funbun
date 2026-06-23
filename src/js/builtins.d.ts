@@ -846,3 +846,5 @@ declare type $ReadableStreamBYOBReader = ReadableStreamBYOBReader;
 declare type $ReadableStreamDefaultReader = ReadableStreamDefaultReader;
 declare type $ReadableStreamDefaultController = ReadableStreamDefaultController;
 declare type $ReadableStreamDirectController = ReadableStreamDirectController;
+/** Generator introspection for the closure serializer: `{ state, this, name, body, fn }` for a JSGenerator, else undefined. */
+declare function $bunGeneratorState(value: object): { state: number; this: unknown; name: string; body: string; fn: Function } | undefined;

@@ -1981,7 +1981,13 @@ interface ReconstructedFunction {
 
 // Returns an expression that evaluates to a reconstruction of `fn`, wrapping its
 // captured variables in an IIFE scope when it has any.
-function reconstructFunctionExpr(fn: Function, ctx: Context): ReconstructedFunction {
+function reconstructFunctionExpr(fn: Function, ctx: Context, sourceOverride?: string): ReconstructedFunction {
+  // A generator reconstructs through a caller-supplied source (`function* name(){body}` built
+  // from native introspection); skip the class/#private/super machinery — it's a plain
+  // function expression whose free variables (including captured parameters) come from `fn`.
+  if (sourceOverride !== undefined) {
+    return reconstructFromSource(fn, ctx, sourceOverride, undefined);
+  }
   const original = funcSource(fn);
   if (isNativeFunctionSource(original)) {
     throw new TypeError("Cannot serialize a native function (no JavaScript source is available)");
@@ -2053,6 +2059,20 @@ function reconstructFunctionExpr(fn: Function, ctx: Context): ReconstructedFunct
     }
   }
 
+  return reconstructFromSource(fn, ctx, source, genuinePrivate);
+}
+
+// The shared tail of function reconstruction: given a function and its (possibly
+// rewritten) source, resolve free variables into a binding prelude, handle class
+// heritage / field-initializer captures, and wrap the result as an expression with
+// the source-map offsets. Used both for ordinary functions and for the synthetic
+// `function* name(){body}` source a suspended generator reconstructs through.
+function reconstructFromSource(
+  fn: Function,
+  ctx: Context,
+  source: string,
+  genuinePrivate: { fields: string[] } | undefined,
+): ReconstructedFunction {
   const freeVariables = allFreeVariables(fn, source);
   let location = (fn as any)[Symbol.sourceLocation] as ReconstructedFunction["location"];
   // A class's own Symbol.sourceLocation is unreliable (empty url, line always 1), so its
@@ -2494,6 +2514,80 @@ function isModuleNamespaceObject(value: object): boolean {
   return ObjectGetOwnPropertyDescriptor(value, Symbol.toStringTag)?.value === "Module";
 }
 
+// A (sync) generator object's reconstructable states (Tier A), fork-free and portable:
+//   - SuspendedStart (state 0): never `.next()`-ed. The generator's body source and original
+//     name are read natively; parameters were bound to their argument values and surface as
+//     captured free variables of the body function, so a generator of ANY arity is rebuilt as
+//     `function* name() {body}`, its free variables re-bound, then `.call(this)` to obtain a
+//     fresh not-yet-started generator with the same first-resume behavior.
+//   - Completed (state -1): exhausted; yields {value: undefined, done: true} forever and its
+//     body/frame are no longer observable — emit a minimal pre-exhausted generator.
+// A generator paused mid-iteration (state > 0) keeps its yield point and live locals in
+// engine-internal slots (the locals are keyed by numeric register, their source names discarded
+// by the compiler) and cannot be expressed as source — reject clearly. Returns undefined to let
+// the caller fall through to the generic reject when no source is introspectable.
+function emitGenerator(
+  value: object,
+  gs: { state: number; this: unknown; name: string; body: string; fn: Function },
+  ctx: Context,
+): string | undefined {
+  const { state } = gs;
+  if (state > 0) {
+    throw new TypeError(
+      "Cannot serialize a generator that has started iterating: its paused execution state " +
+        "(the current yield point and live local variables) lives in engine-internal slots that " +
+        "are not expressible as source. Serialize it before the first .next() call, or re-create " +
+        "the iterator from its generator function after reconstruction.",
+    );
+  }
+  if (state === -2) {
+    throw new TypeError("Cannot serialize a generator while it is executing.");
+  }
+
+  const refName = REF_PREFIX + ctx.counter++;
+  // Record BEFORE recursing into `this` / captured free variables so a cycle (a generator
+  // captured by the very object that is its `this`) resolves back to this declaration.
+  ctx.refs.set(value, refName);
+
+  if (state === -1) {
+    ctx.module.push(`const ${refName} = (() => { const g = (function* () {})(); g.next(); return g; })();`);
+    return refName;
+  }
+
+  // SuspendedStart. Without an introspectable body we can't rebuild it — undo the ref record
+  // and fall through to the generic reject.
+  if (typeof gs.body !== "string" || typeof gs.name !== "string") {
+    ctx.refs.delete(value);
+    ctx.counter--;
+    return undefined;
+  }
+  // A generator that reads `arguments` cannot be rebuilt parameter-free: JSC captures the
+  // outer `arguments` object as a free variable of the body, but an arguments object's identity
+  // (and its callee) is not reconstructable. Detect it via the captured-variable name (the
+  // engine surfaces it as a free variable) rather than scanning source, and reject clearly.
+  const freeVars = (gs.fn as any)[Symbol.freeVariables] as Array<{ name: string }> | undefined;
+  if ($isJSArray(freeVars)) {
+    for (const v of freeVars) {
+      if (v.name === "arguments") {
+        ctx.refs.delete(value);
+        ctx.counter--;
+        throw new TypeError(
+          "Cannot serialize a generator that reads `arguments`: the arguments object is not " +
+            "recoverable once the generator is suspended. Capture the values you need into named " +
+            "variables before the first `yield`.",
+        );
+      }
+    }
+  }
+  // gs.body is the generator body block (`{ ... }`); the parameters are captured by value, so the
+  // rebuilt function takes none. An anonymous generator keeps an empty name.
+  const wrappedSource = `function* ${gs.name} () ${gs.body}`;
+  const rec = reconstructFunctionExpr(gs.fn, ctx, wrappedSource);
+  const thisExpr = emitValue(transform(undefined, "this", gs.this, ctx), ctx);
+  ctx.module.push(`const ${refName} = (${rec.expr}).call(${thisExpr});`);
+  return refName;
+}
+
 function emitObject(value: object, ctx: Context): string {
   const existing = ctx.refs.get(value);
   if (existing !== undefined) return existing;
@@ -2511,6 +2605,15 @@ function emitObject(value: object, ctx: Context): string {
         "Await it first, or serialize the settled value.",
     );
   }
+  // A (sync) generator object in a reconstructable state — not-yet-started (SuspendedStart) or
+  // completed — is rebuilt from its body source + captured free variables (Tier A). Mid-iteration
+  // generators, async generators, and built-in iterators fall through to the reject below.
+  const generatorState = $bunGeneratorState(value);
+  if (generatorState !== undefined) {
+    const emitted = emitGenerator(value, generatorState, ctx);
+    if (emitted !== undefined) return emitted;
+  }
+
   // Generator / async-generator objects and built-in iterator objects hold suspended execution
   // state (the yield point and local frame) in engine slots that aren't reachable via reflection
   // and can't be expressed as source. Reject clearly instead of walking their native prototype

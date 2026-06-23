@@ -3212,6 +3212,34 @@ JSC_DEFINE_HOST_FUNCTION(functionBunClosureUnserializableTag, (JSC::JSGlobalObje
     return JSC::JSValue::encode(JSC::jsString(vm, String::fromLatin1(label)));
 }
 
+// Generator introspection for the closure serializer's Tier-A support: returns
+// `{ state, this, name, body, fn }` for a JSGenerator (undefined for anything else, incl.
+// AsyncGenerator — those keep the existing reject path). `state` is JSC's resume index (0 = not
+// started, >0 = paused at yield #N, -1 = completed, -2 = executing). `body` is the generator body
+// source `{...}` (read WITHOUT calling the generator-body function, which uses a generator-only
+// calling convention). `fn` is that body function — exposed only so the JS side can read its
+// `Symbol.freeVariables` (the generator's captured vars AND its params, by value).
+JSC_DEFINE_HOST_FUNCTION(functionBunGeneratorState, (JSC::JSGlobalObject * globalObject, JSC::CallFrame* callFrame))
+{
+    JSC::VM& vm = JSC::getVM(globalObject);
+    JSC::JSValue arg = callFrame->argument(0);
+    auto* generator = arg.isCell() ? dynamicDowncast<JSC::JSGenerator>(arg) : nullptr;
+    if (!generator)
+        return JSC::JSValue::encode(JSC::jsUndefined());
+
+    JSC::JSObject* result = JSC::constructEmptyObject(globalObject);
+    result->putDirect(vm, JSC::Identifier::fromString(vm, "state"_s), JSC::jsNumber(generator->state()), 0);
+    result->putDirect(vm, JSC::Identifier::fromString(vm, "this"_s), generator->thisValue(), 0);
+    result->putDirect(vm, JSC::Identifier::fromString(vm, "fn"_s), generator->next(), 0);
+    if (auto* nextFn = dynamicDowncast<JSC::JSFunction>(generator->next())) {
+        if (auto* exec = nextFn->jsExecutable()) {
+            result->putDirect(vm, JSC::Identifier::fromString(vm, "body"_s), JSC::jsString(vm, exec->source().view().toString()), 0);
+            result->putDirect(vm, JSC::Identifier::fromString(vm, "name"_s), JSC::jsString(vm, exec->ecmaName().string()), 0);
+        }
+    }
+    return JSC::JSValue::encode(result);
+}
+
 JSC_DEFINE_CUSTOM_GETTER(functionFreeVariablesGetter, (JSC::JSGlobalObject * globalObject, JSC::EncodedJSValue thisValue, JSC::PropertyName))
 {
     JSC::VM& vm = JSC::getVM(globalObject);
@@ -3630,6 +3658,7 @@ void GlobalObject::addBuiltinGlobals(JSC::VM& vm)
         GlobalPropertyInfo(builtinNames.weakCollectionSnapshotPrivateName(), JSFunction::create(vm, this, 1, String(), functionWeakCollectionSnapshot, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
         GlobalPropertyInfo(builtinNames.finalizationRegistrySnapshotPrivateName(), JSFunction::create(vm, this, 1, String(), functionFinalizationRegistrySnapshot, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
         GlobalPropertyInfo(builtinNames.bunClosureUnserializableTagPrivateName(), JSFunction::create(vm, this, 1, String(), functionBunClosureUnserializableTag, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
+        GlobalPropertyInfo(builtinNames.bunGeneratorStatePrivateName(), JSFunction::create(vm, this, 1, String(), functionBunGeneratorState, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
         GlobalPropertyInfo(builtinNames.getInternalWritableStreamPrivateName(), JSFunction::create(vm, this, 1, String(), getInternalWritableStream, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
         GlobalPropertyInfo(builtinNames.createWritableStreamFromInternalPrivateName(), JSFunction::create(vm, this, 1, String(), createWritableStreamFromInternal, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
         GlobalPropertyInfo(builtinNames.fulfillModuleSyncPrivateName(), JSFunction::create(vm, this, 1, String(), functionFulfillModuleSync, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
