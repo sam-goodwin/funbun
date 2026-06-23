@@ -10921,3 +10921,739 @@ describe("generality: native global references", () => {
     expect(out.u).not.toBe(u);
   });
 });
+
+describe("generality: destructuring captures", () => {
+  // The serializer must capture a variable introduced by a destructuring pattern.
+  // These verify that across pattern form, nesting depth, defaults, computed keys,
+  // renames, array holes, rest, destructuring-assignment, loop/catch positions,
+  // and value complexity, the reconstructed closure computes the same value
+  // (proving the binding was captured with the correct value/identity).
+
+  describe("nesting", () => {
+    test("4-level object nesting captures the leaf", async () => {
+      const obj = { a: { b: { c: { d: 42 } } } };
+      const { a: { b: { c: { d } } } } = obj;
+      const out = await roundtrip(() => d);
+      expect(out()).toBe(42);
+    });
+    test("6-level object nesting captures the leaf", async () => {
+      const obj = { a: { b: { c: { d: { e: { f: 5 } } } } } };
+      const { a: { b: { c: { d: { e: { f } } } } } } = obj;
+      const out = await roundtrip(() => f);
+      expect(out()).toBe(5);
+    });
+    test("mixed object/array pattern", async () => {
+      const obj = { a: [{ b: 7 }] };
+      const { a: [{ b }] } = obj;
+      const out = await roundtrip(() => b);
+      expect(out()).toBe(7);
+    });
+    test("nested array-of-array-of-object", async () => {
+      const arr = [[{ x: 9 }]];
+      const [[{ x }]] = arr;
+      const out = await roundtrip(() => x);
+      expect(out()).toBe(9);
+    });
+    test("two bindings at different depths", async () => {
+      const obj = { a: { b: 1, q: { c: 2 } } };
+      const { a: { b, q: { c } } } = obj;
+      const out = await roundtrip(() => b + c);
+      expect(out()).toBe(3);
+    });
+    test("destructure whose source is itself a destructured binding", async () => {
+      const root = { inner: { val: 70 } };
+      const { inner } = root;
+      const { val } = inner;
+      const out = await roundtrip(() => val);
+      expect(out()).toBe(70);
+    });
+  });
+
+  describe("defaults", () => {
+    test("default is an object literal (key absent)", async () => {
+      const o: { x?: { k: number } } = {};
+      const { x = { k: 1 } } = o;
+      const out = await roundtrip(() => x);
+      expect(out()).toEqual({ k: 1 });
+    });
+    test("default is an array literal", async () => {
+      const o: { x?: number[] } = {};
+      const { x = [1, 2, 3] } = o;
+      const out = await roundtrip(() => x);
+      expect(out()).toEqual([1, 2, 3]);
+    });
+    test("default references a captured free variable", async () => {
+      const cap = 99;
+      const o: { x?: number } = {};
+      const { x = cap } = o;
+      const out = await roundtrip(() => x);
+      expect(out()).toBe(99);
+    });
+    test("default references an earlier binding in the same pattern", async () => {
+      const o = { a: 5 } as { a: number; b?: number };
+      const { a, b = a } = o;
+      const out = await roundtrip(() => b);
+      expect(out()).toBe(5);
+    });
+    test("default is an expression over an earlier binding", async () => {
+      const o = { a: 1 } as { a: number; b?: number };
+      const { a, b = a * 2 } = o;
+      const out = await roundtrip(() => b);
+      expect(out()).toBe(2);
+    });
+    test("default uses a property of an earlier binding", async () => {
+      const o = { a: { foo: 8 } } as { a: { foo: number }; x?: number };
+      const { a, x = a.foo } = o;
+      const out = await roundtrip(() => x);
+      expect(out()).toBe(8);
+    });
+    test("nested default with empty fallback object (outer key absent)", async () => {
+      const o: { a?: { b?: number } } = {};
+      const { a: { b = 5 } = {} } = o;
+      const out = await roundtrip(() => b);
+      expect(out()).toBe(5);
+    });
+    test("nested default with present outer", async () => {
+      const o: { a?: { b?: number } } = { a: {} };
+      const { a: { b = 7 } = {} } = o;
+      const out = await roundtrip(() => b);
+      expect(out()).toBe(7);
+    });
+    test("default fires on an explicit undefined property", async () => {
+      const cap = 11;
+      const o = { z: undefined } as { z?: number };
+      const { z = cap } = o;
+      const out = await roundtrip(() => z);
+      expect(out()).toBe(11);
+    });
+    test("default is a function literal that is then called", async () => {
+      const o: { fn?: (z: number) => number } = {};
+      const { fn = (z: number) => z * 2 } = o;
+      const out = await roundtrip(() => fn(4));
+      expect(out()).toBe(8);
+    });
+    test("default is a spread over a captured object", async () => {
+      const base = { x: 1 };
+      const o: { merged?: object } = {};
+      const { merged = { ...base, y: 2 } } = o;
+      const out = await roundtrip(() => merged);
+      expect(out()).toEqual({ x: 1, y: 2 });
+    });
+    test("default calls a captured function", async () => {
+      const fn = (z: number) => z * 3;
+      const o: { r?: number } = {};
+      const { r = fn(5) } = o;
+      const out = await roundtrip(() => r);
+      expect(out()).toBe(15);
+    });
+    test("binding captured ONLY through a default expression", async () => {
+      const secret = 88;
+      const o: { captured?: number } = {};
+      const { captured = secret } = o;
+      const out = await roundtrip(() => captured);
+      expect(out()).toBe(88);
+    });
+    test("deeply nested default referencing a capture used only there", async () => {
+      const deep = 9;
+      const o: { a?: { b?: number } } = { a: {} };
+      const { a: { b = deep } = {} } = o;
+      const out = await roundtrip(() => b);
+      expect(out()).toBe(9);
+    });
+    test("array default references a prior element", async () => {
+      const arr = [5];
+      const [a, b = a + 1] = arr;
+      const out = await roundtrip(() => b);
+      expect(out()).toBe(6);
+    });
+  });
+
+  describe("computed keys", () => {
+    test("computed key from a captured string", async () => {
+      const k = "foo";
+      const o = { foo: 8 };
+      const { [k]: v } = o;
+      const out = await roundtrip(() => v);
+      expect(out()).toBe(8);
+    });
+    test("computed key from an expression", async () => {
+      const k1 = "a", k2 = "b";
+      const o = { ab: 3 };
+      const { [k1 + k2]: v } = o;
+      const out = await roundtrip(() => v);
+      expect(out()).toBe(3);
+    });
+    test("computed key from a captured symbol", async () => {
+      const s = Symbol.for("zz");
+      const o = { [s]: 9 };
+      const { [s]: v } = o;
+      const out = await roundtrip(() => v);
+      expect(out()).toBe(9);
+    });
+    test("free var used only as an outer computed key", async () => {
+      const onlyKey = "kk";
+      const o = { kk: 6 };
+      const { [onlyKey]: val } = o;
+      const out = await roundtrip(() => val);
+      expect(out()).toBe(6);
+    });
+    test("free var used only as a computed key inside a default pattern", async () => {
+      const innerKey = "ik";
+      const o: { a?: Record<string, number> } = {};
+      const { a: { [innerKey]: v } = { ik: 41 } } = o;
+      const out = await roundtrip(() => v);
+      expect(out()).toBe(41);
+    });
+    test("computed key evaluated once is not re-run on reconstruction", async () => {
+      let count = 0;
+      const k = (() => { count++; return "p"; })();
+      const o = { p: 5 };
+      const { [k]: v } = o;
+      const out = await roundtrip(() => v);
+      expect(out()).toBe(5);
+    });
+  });
+
+  describe("renaming", () => {
+    test("rename with default (key present)", async () => {
+      const o = { a: 6 } as { a?: number };
+      const { a: b = 5 } = o;
+      const out = await roundtrip(() => b);
+      expect(out()).toBe(6);
+    });
+    test("rename with default (key absent)", async () => {
+      const o: { a?: number } = {};
+      const { a: b = 5 } = o;
+      const out = await roundtrip(() => b);
+      expect(out()).toBe(5);
+    });
+    test("multiple renames", async () => {
+      const o = { a: 1, c: 2 };
+      const { a: b, c: d } = o;
+      const out = await roundtrip(() => b + d);
+      expect(out()).toBe(3);
+    });
+    test("rename + nested default + computed combined", async () => {
+      const k = "zz";
+      const o: { p?: Record<string, number> } = { p: {} };
+      const { p: { [k]: w = 60 } = {} } = o;
+      const out = await roundtrip(() => w);
+      expect(out()).toBe(60);
+    });
+  });
+
+  describe("array holes and rest", () => {
+    test("leading hole", async () => {
+      const arr = [1, 2, 3];
+      const [, x] = arr;
+      const out = await roundtrip(() => x);
+      expect(out()).toBe(2);
+    });
+    test("middle hole", async () => {
+      const arr = [1, 2, 3];
+      const [a, , c] = arr;
+      const out = await roundtrip(() => a + c);
+      expect(out()).toBe(4);
+    });
+    test("hole with default", async () => {
+      const arr = [1];
+      const [a, b = 9] = arr;
+      const out = await roundtrip(() => a + b);
+      expect(out()).toBe(10);
+    });
+    test("object rest", async () => {
+      const o = { a: 1, b: 2, c: 3 };
+      const { a, ...rest } = o;
+      void a;
+      const out = await roundtrip(() => rest);
+      expect(out()).toEqual({ b: 2, c: 3 });
+    });
+    test("array rest", async () => {
+      const arr = [1, 2, 3, 4];
+      const [a, ...rest] = arr;
+      void a;
+      const out = await roundtrip(() => rest);
+      expect(out()).toEqual([2, 3, 4]);
+    });
+    test("nested object rest", async () => {
+      const o = { a: { b: 1, c: 2, d: 3 } };
+      const { a: { b, ...rest } } = o;
+      void b;
+      const out = await roundtrip(() => rest);
+      expect(out()).toEqual({ c: 2, d: 3 });
+    });
+    test("nested array rest", async () => {
+      const arr = [[1, 2, 3, 4]];
+      const [[h, ...t]] = arr;
+      void h;
+      const out = await roundtrip(() => t);
+      expect(out()).toEqual([2, 3, 4]);
+    });
+  });
+
+  describe("destructuring assignment (not declaration)", () => {
+    test("object assignment", async () => {
+      let a: number, b: number;
+      const o = { a: 1, b: 2 };
+      ({ a, b } = o);
+      const out = await roundtrip(() => a + b);
+      expect(out()).toBe(3);
+    });
+    test("array assignment", async () => {
+      let a: number, b: number;
+      const arr = [4, 5];
+      [a, b] = arr;
+      const out = await roundtrip(() => a + b);
+      expect(out()).toBe(9);
+    });
+    test("assignment to an existing captured variable", async () => {
+      let a = 1;
+      const f = () => a;
+      const o = { a: 42 };
+      ({ a } = o);
+      const out = await roundtrip(f);
+      expect(out()).toBe(42);
+    });
+    test("assignment mixing a member target and a binding", async () => {
+      const target: { a?: number } = {};
+      const o = { a: 1, b: 2 };
+      let b: number;
+      ({ a: target.a, b } = o);
+      const out = await roundtrip(() => [target.a, b]);
+      expect(out()).toEqual([1, 2]);
+    });
+  });
+
+  describe("other binding positions", () => {
+    test("for-of object pattern, closure from last iteration", async () => {
+      const items = [{ x: 1 }, { x: 2 }];
+      const fns: Array<() => number> = [];
+      for (const { x } of items) fns.push(() => x);
+      const out = await roundtrip(fns[fns.length - 1]);
+      expect(out()).toBe(2);
+    });
+    test("for-of object pattern, closure from first iteration (per-iteration binding)", async () => {
+      const items = [{ x: 1 }, { x: 2 }, { x: 3 }];
+      const fns: Array<() => number> = [];
+      for (const { x } of items) fns.push(() => x);
+      const out = await roundtrip(fns[0]);
+      expect(out()).toBe(1);
+    });
+    test("for-of Map entry array pattern", async () => {
+      const m = new Map([["k", 10]]);
+      let f!: () => number;
+      for (const [k, v] of m) { void k; f = () => v; }
+      const out = await roundtrip(f);
+      expect(out()).toBe(10);
+    });
+    test("while-loop destructure", async () => {
+      const data = [{ y: 10 }];
+      let f!: () => number;
+      let i = 0;
+      while (i < data.length) { const { y } = data[i]; f = () => y; i++; }
+      const out = await roundtrip(f);
+      expect(out()).toBe(10);
+    });
+    test("catch clause destructure", async () => {
+      let f!: () => string;
+      try { throw new Error("boom"); } catch ({ message }) { f = () => message as string; }
+      const out = await roundtrip(f);
+      expect(out()).toBe("boom");
+    });
+    test("function parameter object pattern", async () => {
+      function mk({ p }: { p: number }) { return () => p; }
+      const out = await roundtrip(mk({ p: 21 }));
+      expect(out()).toBe(21);
+    });
+    test("function parameter array pattern", async () => {
+      function mk([p]: number[]) { return () => p; }
+      const out = await roundtrip(mk([22]));
+      expect(out()).toBe(22);
+    });
+    test("function parameter nested pattern", async () => {
+      function mk({ a: { b } }: { a: { b: number } }) { return () => b; }
+      const out = await roundtrip(mk({ a: { b: 23 } }));
+      expect(out()).toBe(23);
+    });
+    test("function parameter pattern with default", async () => {
+      function mk({ p = 24 }: { p?: number }) { return () => p; }
+      const out = await roundtrip(mk({}));
+      expect(out()).toBe(24);
+    });
+  });
+
+  describe("value complexity and identity", () => {
+    test("binding and its source property share identity after roundtrip", async () => {
+      const inner = { v: 1 };
+      const obj = { a: inner };
+      const { a } = obj;
+      const out = await roundtrip(() => [a, obj.a] as const);
+      const [x, y] = out();
+      expect(x).toBe(y);
+      expect(x.v).toBe(1);
+    });
+    test("destructured Map", async () => {
+      const o = { m: new Map([["k", 5]]) };
+      const { m } = o;
+      const out = await roundtrip(() => m);
+      const got = out();
+      expect(got).toBeInstanceOf(Map);
+      expect(got.get("k")).toBe(5);
+    });
+    test("destructured class instance", async () => {
+      class C { x = 7; }
+      const o = { c: new C() };
+      const { c } = o;
+      const out = await roundtrip(() => c.x);
+      expect(out()).toBe(7);
+    });
+    test("destructured function value", async () => {
+      const o = { f: (z: number) => z + 1 };
+      const { f } = o;
+      const out = await roundtrip(() => f(9));
+      expect(out()).toBe(10);
+    });
+    test("destructured global keeps reference identity", async () => {
+      const o = { J: JSON };
+      const { J } = o;
+      const out = await roundtrip(() => J === JSON);
+      expect(out()).toBe(true);
+    });
+    test("destructured value forming a cycle", async () => {
+      const a: any = {};
+      a.self = a;
+      const o = { a };
+      const { a: cap } = o;
+      const out = await roundtrip(() => cap.self === cap);
+      expect(out()).toBe(true);
+    });
+    test("destructured bigint", async () => {
+      const o = { n: 9007199254740993n };
+      const { n } = o;
+      const out = await roundtrip(() => n === 9007199254740993n);
+      expect(out()).toBe(true);
+    });
+    test("destructured getter snapshots the value", async () => {
+      let calls = 0;
+      const o = { get a() { calls++; return 50; } };
+      const { a } = o;
+      const out = await roundtrip(() => a);
+      expect(out()).toBe(50);
+    });
+  });
+
+  describe("scoping and shadowing", () => {
+    test("var destructure", async () => {
+      var o1 = { a: 1 };
+      var { a: va } = o1;
+      const out = await roundtrip(() => va);
+      expect(out()).toBe(1);
+    });
+    test("block-scoped destructure", async () => {
+      const o = { a: 1 };
+      {
+        const { a } = o;
+        const out = await roundtrip(() => a);
+        expect(out()).toBe(1);
+      }
+    });
+    test("inner destructure shadows outer", async () => {
+      const o1 = { a: 1 }, o2 = { a: 2 };
+      const { a } = o1;
+      void a;
+      {
+        const { a } = o2;
+        const out = await roundtrip(() => a);
+        expect(out()).toBe(2);
+      }
+    });
+    test("shadow across a function boundary", async () => {
+      const a = 1;
+      void a;
+      function outer() { const o = { a: 2 }; const { a } = o; return () => a; }
+      const out = await roundtrip(outer());
+      expect(out()).toBe(2);
+    });
+    test("body-local destructure shadows a captured outer name", async () => {
+      const a = 5;
+      void a;
+      const out = await roundtrip(() => { const o = { a: 99 }; const { a } = o; return a; });
+      expect(out()).toBe(99);
+    });
+    test("nested arrow captures a deeply-destructured binding", async () => {
+      const o = { a: { b: { c: 13 } } };
+      const { a: { b: { c } } } = o;
+      const out = await roundtrip(() => () => c);
+      const inner = out();
+      expect(inner()).toBe(13);
+    });
+  });
+
+  describe("multi-declarator and shared statements", () => {
+    test("two closures capture different bindings of one statement", async () => {
+      const o = { a: 1, b: 2 };
+      const { a, b } = o;
+      const fa = await roundtrip(() => a);
+      const fb = await roundtrip(() => b);
+      expect(fa()).toBe(1);
+      expect(fb()).toBe(2);
+    });
+    test("second declarator default cross-references the first", async () => {
+      const o1 = { a: 3 };
+      const { a } = o1, { b = a * 10 } = {} as { b?: number };
+      const out = await roundtrip(() => b);
+      expect(out()).toBe(30);
+    });
+  });
+
+  describe("destructuring inside the serialized body", () => {
+    test("body destructures a captured object", async () => {
+      const capObj = { a: 33 };
+      const out = await roundtrip(() => { const { a } = capObj; return a; });
+      expect(out()).toBe(33);
+    });
+    test("body array destructure with a hole", async () => {
+      const capArr = [1, 2, 3];
+      const out = await roundtrip(() => { const [, x] = capArr; return x; });
+      expect(out()).toBe(2);
+    });
+    test("body destructure default references another capture", async () => {
+      const capObj: { z?: number } = {};
+      const fallback = 77;
+      const out = await roundtrip(() => { const { z = fallback } = capObj; return z; });
+      expect(out()).toBe(77);
+    });
+    test("body destructure computed key from a capture", async () => {
+      const capObj = { dynk: 5 };
+      const key = "dynk";
+      const out = await roundtrip(() => { const { [key]: v } = capObj; return v; });
+      expect(out()).toBe(5);
+    });
+    test("destructure inside a parameter default expression", async () => {
+      const f = (x = (() => { const { q } = { q: 4 }; return q; })()) => x;
+      const out = await roundtrip(f);
+      expect(out()).toBe(4);
+    });
+  });
+});
+
+describe("generality: destructuring parameters", () => {
+  // Every function KIND with destructuring params round-trips its source + behavior.
+  test("object/array/default params across function kinds", async () => {
+    const f1 = await roundtrip(function ({ a, b = 5 }: any) {
+      return a + b;
+    });
+    expect(f1({ a: 1 })).toBe(6);
+    expect(f1({ a: 1, b: 10 })).toBe(11);
+    expect(f1.length).toBe(1);
+
+    const f2 = await roundtrip(({ a }: any, { b }: any) => a + b);
+    expect(f2({ a: 1 }, { b: 2 })).toBe(3);
+    expect(f2.length).toBe(2);
+
+    const f3 = await roundtrip(async ({ a }: any) => a);
+    await expect(f3({ a: 9 })).resolves.toBe(9);
+
+    const f4 = await roundtrip(function* ({ a }: any) {
+      yield a;
+      yield a + 1;
+    });
+    expect([...f4({ a: 5 })]).toEqual([5, 6]);
+
+    const f5 = await roundtrip(async function* ({ a }: any) {
+      yield a;
+      yield a + 1;
+    });
+    const out: number[] = [];
+    for await (const v of f5({ a: 5 })) out.push(v);
+    expect(out).toEqual([5, 6]);
+  });
+
+  test("object method, constructor, setter, and class-field arrow with destructure params", async () => {
+    const obj = {
+      m({ a }: any) {
+        return a * 2;
+      },
+    };
+    expect((await roundtrip(obj.m))({ a: 6 })).toBe(12);
+
+    class C {
+      s: number;
+      constructor({ a, b }: any) {
+        this.s = a + b;
+      }
+    }
+    const Ctor = (await roundtrip(C as any)) as any;
+    expect(new Ctor({ a: 1, b: 2 }).s).toBe(3);
+
+    const sObj = {
+      _v: 0,
+      set x([a]: any) {
+        this._v = a;
+      },
+    };
+    const setter = Object.getOwnPropertyDescriptor(sObj, "x")!.set!;
+    const target = { _v: 0 } as any;
+    (await roundtrip(setter)).call(target, [77]);
+    expect(target._v).toBe(77);
+
+    class D {
+      f = ({ a }: any) => a + 1;
+    }
+    expect((await roundtrip(new D().f))({ a: 5 })).toBe(6);
+  });
+
+  // Defaults that CAPTURE free variables — including capture-only-via-default.
+  test("param defaults capture free variables", async () => {
+    const captured = 42;
+    const f1 = await roundtrip(function ({ x = captured }: any = {}) {
+      return x;
+    });
+    expect(f1()).toBe(42);
+    expect(f1({ x: 1 })).toBe(1);
+
+    const onlyInDefault = 777;
+    const f2 = await roundtrip(function ({ x = onlyInDefault }: any) {
+      return x * 2;
+    });
+    expect(f2({})).toBe(1554);
+
+    const obj = { z: 99 };
+    const cap = () => 100;
+    const map = new Map([["k", 1]]);
+    class Cap {
+      v = 5;
+    }
+    expect((await roundtrip(function ({ x = obj }: any = {}) { return x.z; }))()).toBe(99);
+    expect((await roundtrip(function ({ x = cap }: any = {}) { return x(); }))()).toBe(100);
+    expect((await roundtrip(function ({ x = cap() }: any = {}) { return x; }))()).toBe(100);
+    expect((await roundtrip(function ({ x = map }: any = {}) { return x.get("k"); }))()).toBe(1);
+    expect((await roundtrip(function ({ x = Cap }: any = {}) { return new x().v; }))()).toBe(5);
+
+    const c2 = 42;
+    const f3 = await roundtrip(function ({ a: { b = c2 } = {} }: any) {
+      return b;
+    });
+    expect(f3({})).toBe(42);
+  });
+
+  test("defaults reference earlier params/bindings; param shadows outer; param-default not confused with outer", async () => {
+    const f1 = await roundtrip(function (a: number, b = a) {
+      return a + b;
+    });
+    expect(f1(5)).toBe(10);
+    expect(f1(5, 1)).toBe(6);
+
+    const f2 = await roundtrip(function ({ a }: any, b = a) {
+      return a + b;
+    });
+    expect(f2({ a: 4 })).toBe(8);
+
+    const outer = 999;
+    void outer;
+    const f3 = await roundtrip(function (p: number, q = p) {
+      return q;
+    });
+    expect(f3(5)).toBe(5);
+
+    const a = 999;
+    void a;
+    const f4 = await roundtrip(function ({ a }: any) {
+      return a;
+    });
+    expect(f4({ a: 5 })).toBe(5);
+  });
+
+  test("deep nesting, holes, rest, renaming, whole-param defaults", async () => {
+    expect((await roundtrip(function ({ a: { b: { c } } }: any) { return c; }))({ a: { b: { c: 7 } } })).toBe(7);
+    expect((await roundtrip(function ([[{ x }]]: any) { return x; }))([[{ x: 9 }]])).toBe(9);
+    expect((await roundtrip(function ([, x]: any) { return x; }))([10, 20])).toBe(20);
+    expect((await roundtrip(function ([a, , c]: any) { return [a, c]; }))([1, 2, 3])).toEqual([1, 3]);
+    expect((await roundtrip(function ([a, ...rest]: any) { return [a, rest]; }))([1, 2, 3])).toEqual([1, [2, 3]]);
+    expect((await roundtrip(function ({ a, ...rest }: any) { return [a, rest]; }))({ a: 1, b: 2, c: 3 })).toEqual([
+      1,
+      { b: 2, c: 3 },
+    ]);
+    expect((await roundtrip(function ({ a: b = 5 }: any) { return b; }))({})).toBe(5);
+    expect((await roundtrip(function ({ a: b, c: d = 7 }: any) { return [b, d]; }))({ a: 1 })).toEqual([1, 7]);
+
+    const f1 = await roundtrip(function ({ a, b }: any = { a: 1, b: 2 }) {
+      return a + b;
+    });
+    expect(f1()).toBe(3);
+    expect(f1({ a: 5, b: 5 })).toBe(10);
+    expect(f1.length).toBe(0);
+
+    const f2 = await roundtrip(function ([x, y]: any = [10, 20]) {
+      return x + y;
+    });
+    expect(f2()).toBe(30);
+    expect(f2.length).toBe(0);
+  });
+
+  test("computed keys (captured string / Symbol.for / well-known) in param patterns", async () => {
+    const key = "dyn";
+    expect((await roundtrip(function ({ [key]: v }: any) { return v; }))({ dyn: 55 })).toBe(55);
+
+    const reg = Symbol.for("generality-param-sym");
+    expect((await roundtrip(function ({ [reg]: v }: any) { return v; }))({ [reg]: 9 })).toBe(9);
+
+    expect(
+      (await roundtrip(function ({ [Symbol.iterator]: v }: any) { return typeof v; }))({ [Symbol.iterator]: () => {} }),
+    ).toBe("function");
+  });
+
+  // A captured UNIQUE symbol can't equal one from another realm (unforgeable), so a reconstructed
+  // closure must mint its own. Identity is preserved INTERNALLY: when the closure captures both the
+  // symbol and an object keyed by it, the computed-key destructure resolves correctly.
+  test("captured unique Symbol is internally consistent as a computed key", async () => {
+    const key = Symbol("c");
+    const obj = { [key]: 42 };
+    const fn = await roundtrip(() => {
+      const { [key]: v } = obj;
+      return v;
+    });
+    expect(fn()).toBe(42);
+  });
+
+  test("arguments / this / new.target / .length with destructure params", async () => {
+    const f1 = await roundtrip(function ({ a }: any) {
+      return [a, arguments.length];
+    });
+    expect(f1({ a: 1 }, 2, 3)).toEqual([1, 3]);
+
+    const obj = {
+      t: 9,
+      m({ a }: any) {
+        return this.t + a;
+      },
+    };
+    expect((await roundtrip(obj.m)).bind({ t: 9 })({ a: 1 })).toBe(10);
+
+    const f3 = (await roundtrip(function ({ a }: any) {
+      return [a, new.target !== undefined];
+    } as any)) as any;
+    expect(new f3({ a: 1 })).toEqual([1, true]);
+
+    const f4 = await roundtrip(function ({ a }: any, b: number, c = 1) {
+      return a + b + c;
+    });
+    expect(f4({ a: 1 }, 2)).toBe(4);
+    expect(f4.length).toBe(2);
+
+    const f5 = await roundtrip(function (a: number, { b }: any, c: number) {
+      return a + b + c;
+    });
+    expect(f5(1, { b: 2 }, 3)).toBe(6);
+    expect(f5.length).toBe(3);
+  });
+
+  test("a destructure-param function survives a second round-trip", async () => {
+    const once = await roundtrip(function ({ a, b = 5 }: any) {
+      return a + b;
+    });
+    const twice = await roundtrip(once);
+    expect(twice({ a: 1 })).toBe(6);
+    expect(twice.length).toBe(1);
+  });
+});
