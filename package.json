@@ -36,6 +36,7 @@
     "ci:watch": "bun scripts/find-build.ts --watch",
     "ci:slowest": "bun scripts/ci-slowest-tests.ts",
     "pr:comments": "bun scripts/pr-comments.ts",
+    "closure:coverage": "bun test/js/bun/closure-coverage.ts",
     "watch": "cargo watch -x 'check --workspace --message-format=short'",
     "watch-windows": "cargo watch -x \"check --workspace --target x86_64-pc-windows-msvc --message-format=short\"",
     "bd:v": "bun scripts/build.ts --profile=debug",

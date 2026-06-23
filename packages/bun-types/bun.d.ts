@@ -2589,6 +2589,39 @@ declare module "bun" {
      * This is a fast path which performs less work than `scan`.
      */
     scanImports(code: Bun.StringOrBuffer): Import[];
+
+    /**
+     * **Experimental.** Parse source code and return its AST as a tree of plain
+     * objects. Each node has a `type` discriminant and a `start` byte offset
+     * into the source, plus node-specific fields (recursively expanded).
+     *
+     * Node kinds not yet mapped surface as `{ type: "Unsupported", node }` so a
+     * traversal never throws. The AST is **JS-level**: Bun's parser erases
+     * TypeScript types, so type annotations, interfaces, and type aliases are
+     * not present.
+     *
+     * @param code The code to parse
+     * @param loader The loader to use (defaults to the transpiler's loader)
+     * @example
+     * ```js
+     * const t = new Bun.Transpiler();
+     * const ast = t.ast("foo.bar(1)");
+     * // ast.body[0].expression.callee.property.name === "bar"
+     * ```
+     */
+    ast(code: Bun.StringOrBuffer, loader?: JavaScriptLoader): Bun.ASTNode;
+  }
+
+  /**
+   * **Experimental.** A node in the AST returned by {@link Transpiler.ast}.
+   * Every node has a `type` discriminant and a `start` byte offset; remaining
+   * fields depend on `type` (e.g. `Identifier` has `name`, `CallExpression`
+   * has `callee` and `arguments`).
+   */
+  interface ASTNode {
+    type: string;
+    start: number;
+    [field: string]: unknown;
   }
 
   type ImportKind =

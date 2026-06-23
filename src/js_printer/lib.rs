@@ -4645,6 +4645,9 @@ pub mod __gated_printer {
                 // Vec is not Copy — re-slice instead of move.
                 ts_decorators: bun_alloc::AstAlloc::vec(),
                 ts_metadata: Default::default(),
+                initializer_start: item_in.initializer_start,
+                initializer_end: item_in.initializer_end,
+                member_start: item_in.member_start,
             };
             if !IS_JSON {
                 if item.kind == G::PropertyKind::Spread {

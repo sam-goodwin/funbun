@@ -139,6 +139,32 @@ declare function $peekPromiseStatus(promise: Promise<any>): number;
  */
 declare function $peekPromiseSettledValue<V>(promise: Promise<V>): V | undefined;
 /**
+ * Resolves a single identifier against a function's lexical scope chain.
+ * Returns `{ found, value }` — used by the closure serializer to capture
+ * variables referenced only by a class field initializer (names the bytecode
+ * free-variable scan can't see, but which still live in the defining scope).
+ */
+declare function $resolveClosureBinding(fn: Function, name: string): { found: boolean; value: unknown };
+/**
+ * Snapshots a WeakMap / WeakSet's live entries into a flat array: a WeakMap
+ * yields `[k, v, k, v, ...]`, a WeakSet `[k, k, ...]`. Used by the closure
+ * serializer to reconstruct them as a snapshot.
+ */
+declare function $weakCollectionSnapshot(value: object): unknown[];
+/**
+ * Snapshots a FinalizationRegistry's callback + live registrations into
+ * `{ callback, flat: [target, heldValue, unregisterToken, ...] }` (token is
+ * `undefined` when none). Used by the closure serializer to reconstruct it.
+ */
+declare function $finalizationRegistrySnapshot(value: object): { callback: Function; flat: unknown[] } | null;
+/**
+ * Spoof-proof type check for the closure serializer. Returns a human-readable label
+ * ("Generator", "Map Iterator", ...) for objects holding suspended execution state that
+ * cannot be expressed as source, or `undefined` for everything else. Uses the actual JSC
+ * cell type rather than `Symbol.toStringTag` (which userland can forge).
+ */
+declare function $bunClosureUnserializableTag(value: object): string | undefined;
+/**
  * Marks a promise as handled so it doesn't fire the unhandled-rejection
  * tracker. Equivalent to JSC's `JSPromise::markAsHandled()`.
  */
@@ -820,3 +846,5 @@ declare type $ReadableStreamBYOBReader = ReadableStreamBYOBReader;
 declare type $ReadableStreamDefaultReader = ReadableStreamDefaultReader;
 declare type $ReadableStreamDefaultController = ReadableStreamDefaultController;
 declare type $ReadableStreamDirectController = ReadableStreamDirectController;
+/** Generator introspection for the closure serializer: `{ state, this, name, body, fn }` for a JSGenerator, else undefined. */
+declare function $bunGeneratorState(value: object): { state: number; this: unknown; name: string; body: string; fn: Function } | undefined;

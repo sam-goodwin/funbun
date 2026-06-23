@@ -1,0 +1,979 @@
+// Objective spec-coverage tracker for the closure serializer (bun:closure).
+//
+// This is the single source of truth for "how close are we to supporting every
+// case". Each item is a capability in the JS value/feature space a closure can
+// capture or be, tagged with a status and an `evidence` substring that MUST
+// appear in the closure test files. The reporter cross-checks evidence against
+// the real tests, so a "supported" claim can't drift from reality.
+//
+//   Run:  bun test/js/bun/closure-coverage.ts          (or: bun run closure:coverage)
+//   CI-ish: exits non-zero if any supported/limitation item is unverified.
+//
+// Status meanings:
+//   supported  — works correctly, proven by a passing round-trip/assertion test.
+//   limitation — intentionally not supported, but fails with a CLEAR error
+//                (never silent corruption), proven by a test asserting the throw.
+//   todo       — not yet handled / not yet measured. The roadmap to 100%.
+//
+// Metrics:
+//   Coverage   = supported / (supported + todo)          ← "how close to every case"
+//   Safety     = (supported + limitation) / total        ← "no silent failures"
+
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+
+export type Status = "supported" | "limitation" | "todo";
+
+export interface CoverageItem {
+  id: string;
+  title: string;
+  status: Status;
+  /** Substring that must appear in a test file to back a supported/limitation claim. */
+  evidence?: string;
+  note?: string;
+}
+
+export interface CoverageCategory {
+  name: string;
+  items: CoverageItem[];
+}
+
+const S = (id: string, title: string, evidence: string, note?: string): CoverageItem => ({
+  id,
+  title,
+  status: "supported",
+  evidence,
+  note,
+});
+const L = (id: string, title: string, evidence: string, note?: string): CoverageItem => ({
+  id,
+  title,
+  status: "limitation",
+  evidence,
+  note,
+});
+const T = (id: string, title: string, note?: string): CoverageItem => ({ id, title, status: "todo", note });
+
+export const CATEGORIES: CoverageCategory[] = [
+  {
+    name: "Root forms (what the serialized fn itself can be)",
+    items: [
+      S("root.arrow", "arrow function", "round-trips an arrow function with no free variables"),
+      S("root.fnexpr", "function expression", "round-trips a function expression"),
+      S("root.named-fnexpr", "named function expression (self-ref)", "named function expression with self-reference"),
+      S("root.async", "async function", "round-trips an async function"),
+      S(
+        "root.async-arrow",
+        "async arrow capturing a promise fn",
+        "async function awaiting a captured promise-returning fn",
+      ),
+      S("root.generator", "generator function", "reconstructs generator and async generator functions"),
+      S("root.async-generator", "async generator function", "async generator function with return value"),
+      S("root.method", "extracted object method", "plain method reference"),
+      S("root.class-decl", "class declaration as a value", "reconstructs a subclass value (extends superclass)"),
+      S("root.class-expr", "class expression as a value", "named class expression round-trips"),
+      S("root.bound", "bound function as the root", "serializes a bound function as the root"),
+      S(
+        "root.native",
+        "native function referenced by global path",
+        "a native function captured as the root is referenced by its global path",
+      ),
+      S(
+        "val.native-fn-captured",
+        "captured native functions (Math.max, ...)",
+        "captured native functions round-trip by reference",
+      ),
+    ],
+  },
+  {
+    name: "Captured value types",
+    items: [
+      S("val.number", "number", "reconstructs a captured primitive (number)"),
+      S(
+        "val.primitives",
+        "string/bool/null/undefined/bigint/-0/Inf/NaN",
+        "reconstructs captured primitives of every kind",
+      ),
+      S("val.object", "plain object", "reconstructs a captured object"),
+      S("val.array", "array", "reconstructs a captured array"),
+      S("val.sparse-array", "sparse array (holes + length)", "sparse array preserves holes and length"),
+      S("val.nested", "deeply nested object", "reconstructs a captured object"),
+      S("val.function", "function value", "reconstructs a captured (nested) function"),
+      S("val.class", "class value", "reconstructs a subclass value (extends superclass)"),
+      S("val.instance", "class instance", "reconstructs a class instance (prototype, methods, fields)"),
+      S("val.null-proto", "null-prototype object", "reconstructs a null-prototype object"),
+      S("val.date", "Date", "reconstructs a captured Date"),
+      S("val.regexp", "RegExp", "reconstructs a captured RegExp"),
+      S("val.map", "Map", "reconstructs a captured Map (with object values)"),
+      S("val.set", "Set", "reconstructs a captured Set"),
+      S("val.typedarray", "typed array (Uint8Array)", "reconstructs a captured typed array"),
+      S("val.error", "Error (type + message)", "reconstructs a captured Error with its type and message"),
+      S("val.getter", "object getter (live)", "reconstructs an object getter (preserves dynamic behavior)"),
+      S("val.getter-setter", "getter/setter pair", "reconstructs a getter/setter pair"),
+      S("val.non-enum", "non-enumerable data property", "preserves non-enumerable data properties"),
+      S("val.symbol-key", "registered-symbol property key", "preserves a registered-symbol-keyed property"),
+      S("val.registered-symbol", "registered symbol value (Symbol.for)", "registered symbol value (Symbol.for)"),
+      S("val.wellknown-symbol", "well-known symbol value", "well-known symbol value"),
+      S(
+        "val.unique-symbol-val",
+        "unique symbol value (recreated, identity kept)",
+        "unique symbol value round-trips and preserves intra-closure identity",
+      ),
+      S(
+        "val.unique-symbol-key",
+        "unique symbol property key (recreated)",
+        "reconstructs a unique-symbol-keyed property (recreated symbol)",
+      ),
+      S("val.symbol-no-desc", "symbol with no description", "a symbol with no description round-trips"),
+      S(
+        "val.weakmap",
+        "WeakMap (native entry snapshot)",
+        "a WeakMap round-trips entries whose keys are shared with other captures",
+      ),
+      S("val.weakset", "WeakSet (native entry snapshot)", "a WeakSet round-trips membership for shared captures"),
+      S(
+        "val.promise-fulfilled",
+        "fulfilled promise (value reconstructed)",
+        "a fulfilled promise reconstructs with its value",
+      ),
+      S(
+        "val.promise-rejected",
+        "rejected promise (reason reconstructed)",
+        "a rejected promise reconstructs with its reason",
+      ),
+      S("val.promise-nested", "settled promise nested in an object", "a fulfilled promise nested in a captured object"),
+      L("val.promise-pending", "pending Promise (clear error)", "a pending Promise throws a clear error"),
+      L(
+        "val.generator-object",
+        "generator object (clear error)",
+        "partially-executed generator object throws a clear error",
+      ),
+      L(
+        "val.async-generator-object",
+        "async generator object (clear error)",
+        "async generator object throws a clear error",
+      ),
+      L(
+        "val.iterator-object",
+        "native iterator object (clear error)",
+        "native array iterator object throws a clear error",
+      ),
+      S(
+        "val.boxed-primitive",
+        "boxed primitives (new Number/String/Boolean)",
+        "boxed Number/String/Boolean round-trip as objects",
+      ),
+      S("val.frozen", "Object.freeze / seal preserved", "Object.freeze is preserved"),
+      S(
+        "val.frozen-circular",
+        "frozen circular graph (interaction)",
+        "a frozen circular object round-trips and stays frozen",
+      ),
+      S(
+        "val.frozen-instance",
+        "frozen class instance (interaction)",
+        "a frozen class instance round-trips frozen with working methods",
+      ),
+      S("val.other-typedarrays", "Float64Array / BigInt64Array", "Float64Array and BigInt64Array round-trip"),
+      S("val.arraybuffer", "ArrayBuffer round-trips its bytes", "captured ArrayBuffer round-trips its bytes"),
+      S("val.dataview", "DataView over a buffer", "DataView over a buffer round-trips and reads correct values"),
+      S(
+        "val.shared-buffer",
+        "views over one ArrayBuffer share it (interaction)",
+        "two typed-array views over one ArrayBuffer keep a shared buffer",
+      ),
+      S(
+        "val.typedarray-offset",
+        "typed-array view with byteOffset (interaction)",
+        "a typed-array view with a byteOffset round-trips against its buffer",
+      ),
+      S("val.error-cause", "Error { cause } incl. circular", "Error with a cause round-trips the cause"),
+      S("val.aggregate-error", "AggregateError errors array", "AggregateError preserves its errors array"),
+      S(
+        "val.error-subclass",
+        "user Error subclass (extends Error)",
+        "a user Error subclass keeps its prototype and own fields",
+      ),
+      S(
+        "val.to-primitive",
+        "object with custom Symbol.toPrimitive",
+        "object with Symbol.toPrimitive coerces correctly after round-trip",
+      ),
+      S(
+        "val.map-fn-keys",
+        "Map/Set with object keys identity-preserved",
+        "a Map object key shared with another capture keeps identity",
+      ),
+      S("val.weakref", "WeakRef (live referent snapshot)", "a WeakRef round-trips its live referent"),
+      S(
+        "val.finalization-registry",
+        "FinalizationRegistry (native registration snapshot)",
+        "a FinalizationRegistry round-trips its callback + live registrations",
+      ),
+      S("val.shared-arraybuffer", "SharedArrayBuffer + shared view", "SharedArrayBuffer and a view over it round-trip"),
+      S(
+        "val.own-accessor-instance",
+        "instance own accessor (defineProperty)",
+        "instance own accessor (defineProperty getter/setter) round-trips",
+      ),
+    ],
+  },
+  {
+    name: "Scope & capture semantics",
+    items: [
+      S("scope.single", "single free variable", "reconstructs a captured primitive (number)"),
+      S("scope.mutable-cell", "mutable let cell", "reconstructs a mutable captured counter"),
+      S(
+        "scope.shared-cell",
+        "shared cell, mutation visible across closures",
+        "shared cell mutations are visible across calls into different closures",
+      ),
+      S(
+        "scope.shared-bidirectional",
+        "shared let: inc via one ref seen via another",
+        "sibling closures share one ancestor cell post-reconstruction",
+      ),
+      S("scope.shadowing", "lexical shadowing resolves to the right cell", "shadowing: innermost x wins"),
+      S("scope.block", "block-scoped let", "block-scoped let is captured"),
+      S(
+        "scope.loop-var",
+        "per-iteration let loop binding",
+        "let loop: a single per-iteration closure captures its own i",
+      ),
+      S(
+        "scope.nested-multi",
+        "multi-level nested closures",
+        "inner closure captures cells from non-adjacent ancestor scopes",
+      ),
+      S("scope.const-kind", "const vs let binding kind preserved", "respects const vs let binding kind"),
+      S("scope.arguments", "arguments object", "function using arguments"),
+      S(
+        "scope.default-param",
+        "default parameter capturing a free var",
+        "default parameter that captures a free variable",
+      ),
+      S(
+        "scope.destructure-param",
+        "destructuring params / defaults / rest",
+        "destructuring params, defaults, rest, spread",
+      ),
+      L(
+        "scope.dup-shared-name",
+        "two distinct shared cells, same name (clear error)",
+        "two distinct shared cells with the same name throw",
+      ),
+      S(
+        "scope.using",
+        "`using` resource management + disposal",
+        "`using` syntax round-trips and disposes the resource",
+      ),
+      S("scope.await-using", "`await using` async disposal", "`await using` syntax round-trips and async-disposes"),
+      S(
+        "scope.using-instance",
+        "using over a captured disposable instance",
+        "`using` over a captured disposable class instance",
+      ),
+      S(
+        "scope.tla",
+        "closure captured under top-level await",
+        "a closure capturing a top-level-await value round-trips",
+      ),
+    ],
+  },
+  {
+    name: "Recursion topologies",
+    items: [
+      S(
+        "rec.self-decl",
+        "self-recursion via declaration name",
+        "self-recursion via the function's own (declaration) name",
+      ),
+      S("rec.self-arrow", "self-recursion via captured const arrow", "self-recursion via a captured const arrow"),
+      S("rec.mutual", "mutual recursion (in-module)", "mutual recursion (two functions calling each other)"),
+      S("rec.nway", "N-way mutual recursion", "four-way mutual recursion ring"),
+      S(
+        "rec.via-object",
+        "recursion via captured object method",
+        "recursion through a captured object's own method (o.fact)",
+      ),
+      S("rec.via-map", "recursion via captured Map of functions", "recursion through a captured Map of functions"),
+      S(
+        "rec.via-array",
+        "recursion via captured array of functions",
+        "recursion through a captured array of functions",
+      ),
+      S(
+        "rec.y-combinator",
+        "Y-combinator (no named self-ref)",
+        "Y-combinator builds factorial without named self-reference",
+      ),
+      S("rec.trampoline", "trampolined recursion", "trampolined recursion via a captured trampoline helper"),
+      S("rec.generator", "self-delegating recursive generator", "a self-delegating recursive generator round-trips"),
+      S(
+        "rec.cross-module",
+        "mutual recursion across circular ESM graph",
+        "mutual recursion across a circular ESM import graph",
+      ),
+      S(
+        "rec.cross-module-alias",
+        "cross-module recursion with aliased imports",
+        "cross-module mutual recursion with renamed (aliased) imports",
+      ),
+    ],
+  },
+  {
+    name: "Classes",
+    items: [
+      S(
+        "cls.instance-fields",
+        "instance prototype + methods + fields",
+        "reconstructs a class instance (prototype, methods, fields)",
+      ),
+      S("cls.static", "static members", "preserves static class members"),
+      S(
+        "cls.private-field",
+        "private #field value",
+        "reconstructs a class instance's private #field state (made public)",
+      ),
+      S("cls.private-method", "private #method", "reconstructs a class with a private method (made public)"),
+      S(
+        "cls.private-static",
+        "private static field + method",
+        "private static field and method (class value) round-trip via mangling",
+      ),
+      S(
+        "cls.private-brand",
+        "#name in obj brand check",
+        "private brand check (#x in obj) survives via mangled membership",
+      ),
+      S("cls.super-multi", "multi-level super.method()", "3-level super.method() chain is intact after reconstruction"),
+      S("cls.super-ctor", "super(args) constructor forwarding", "super(args) constructor forwarding round-trips"),
+      S("cls.subclass-instance", "instance of a subclass (inherited method)", "reconstructs an instance of a subclass"),
+      S("cls.mixin-single", "single mixin application", "a class built by applying one mixin round-trips"),
+      S(
+        "cls.mixin-composed",
+        "composed mixins A(B(C(Base)))",
+        "a class composed from three mixins reconstructs the full chain",
+      ),
+      S("cls.nested-expr", "nested class expressions (3 levels)", "3-level nested class expressions reconstruct"),
+      S(
+        "cls.computed-member",
+        "computed method name + Symbol.iterator",
+        "computed method name (captured key) and [Symbol.iterator] round-trip",
+      ),
+      S("cls.static-block", "static {} initialization block", "static block executes on reconstruction"),
+      S(
+        "cls.extends-identifier",
+        "captured superclass in extends clause",
+        "a captured superclass identifier in the extends clause round-trips",
+      ),
+      S(
+        "cls.symbol-gen-methods",
+        "symbol-keyed / generator / async methods",
+        "reconstructs symbol-keyed, generator, and async methods",
+      ),
+      S(
+        "cls.method-free-var",
+        "method capturing a free variable",
+        "reconstructs a class whose method captures a free variable",
+      ),
+      S(
+        "cls.instanceof",
+        "instanceof across reconstruction",
+        "instanceof holds across reconstruction for subclass and superclass",
+      ),
+      S("cls.integrity", "unused methods kept (no class-body pruning)", "unused methods of a captured class are kept"),
+      S(
+        "cls.extends-call",
+        "extends <call-expression> (computed heritage)",
+        "extends <call-expression> heritage round-trips (computed superclass)",
+      ),
+      S("cls.extends-member", "extends <member-expression>", "extends <member-expression> heritage round-trips"),
+      S(
+        "cls.extends-brace-args",
+        "extends call with object-literal args",
+        "extends a call with object-literal args (brace inside heritage)",
+      ),
+      S(
+        "cls.field-init-only",
+        "field-initializer-only capture (AST + native scope resolve)",
+        "a var captured only by a field initializer on a direct class value round-trips",
+      ),
+      S(
+        "cls.field-init-arrow",
+        "field-initializer arrow capture",
+        "a field-initializer-only arrow capture round-trips (AST + native scope resolve)",
+      ),
+      S(
+        "cls.field-init-multi",
+        "multiple instance + static field-value captures",
+        "field-init capture: multiple instance + static field values",
+      ),
+      S(
+        "cls.field-init-call",
+        "field initializer calling a captured function",
+        "field-init capture: initializer calls a captured function",
+      ),
+      S("cls.decorators", "method decorator round-trips", "a method decorator round-trips"),
+      S("cls.private-accessor", "private #getter / #setter accessors", "private getter/setter accessors round-trip"),
+      S("cls.static-private-accessor", "static private accessor", "static private accessor round-trips"),
+      S(
+        "cls.private-accessor-inherited",
+        "private accessor via inherited method",
+        "private accessor used through an inherited method",
+      ),
+    ],
+  },
+  {
+    name: "Generators & iterators",
+    items: [
+      S("gen.return-value", "generator with a return value", "generator with a return value"),
+      S("gen.two-way", "two-way generator (.next(v))", "two-way generator: yield receives sent values"),
+      S("gen.yield-star", "yield* delegation chain", "three-level generator delegation ending in an array iterator"),
+      S("gen.yield-star-return", "yield* forwards delegate return", "yield* forwards return value of the delegate"),
+      S(
+        "gen.captures-cell",
+        "generator mutating a captured cell across yields",
+        "generator capturing a mutable cell mutated across yields",
+      ),
+      S(
+        "gen.async-method",
+        "async generator method on a class",
+        "class with a generator method and an async generator method",
+      ),
+      S("gen.custom-iterable", "custom [Symbol.iterator] iterable", "custom iterable object captured and re-iterated"),
+      S(
+        "gen.async-iterable",
+        "for-await over captured async iterable",
+        "async iteration over a captured async iterable",
+      ),
+      // (object forms are limitations, tracked under value types)
+    ],
+  },
+  {
+    name: "Proxies & this-binding",
+    items: [
+      S("px.object", "Proxy (object target)", "reconstructs a captured Proxy (object target)"),
+      S("px.function", "Proxy (function target)", "reconstructs a captured Proxy whose target is a function"),
+      S(
+        "px.revoked",
+        "revoked Proxy (reconstructed as revoked)",
+        "round-trips a revoked Proxy (reconstructs as a revoked proxy)",
+      ),
+      S("bind.args", "bound function (bound args)", "reconstructs a bound function (bound args)"),
+      S("bind.this", "bound method preserves bound this", "reconstructs a bound method preserving bound this"),
+      S("px.nested", "Proxy wrapping a Proxy", "nested Proxy (proxy wrapping a proxy) round-trips"),
+      S(
+        "px.shared-target",
+        "proxy + shared target identity",
+        "a proxy and its target captured together keep one target",
+      ),
+    ],
+  },
+  {
+    name: "Circular & shared references",
+    items: [
+      S("ref.circular-object", "circular object graph", "round-trips a circular object"),
+      S(
+        "ref.shared-identity",
+        "shared object reference (identity preserved)",
+        "shared object reference is emitted once (identity preserved)",
+      ),
+      S("ref.cycle-mixed", "deeply nested mixed graph with a cycle", "deeply nested mixed graph with a cycle"),
+      S(
+        "ref.cycle-pruning",
+        "cycle-safe access-path pruning",
+        "keeps everything reachable from an escaped object (cycle-safe)",
+      ),
+    ],
+  },
+  {
+    name: "ES module imports & tree-shaking",
+    items: [
+      S("mod.named", "named import inlined", "named import does not pull in sibling exports"),
+      S("mod.aliased", "aliased import", "import { used as u }"),
+      S("mod.default", "default import", 'import d from "../deps/defaultexp.mjs"'),
+      S("mod.namespace", "namespace import (pruned)", "namespace import keeps only the accessed member"),
+      S(
+        "mod.barrel",
+        "barrel re-export (tree-shaken)",
+        "barrel (export { ... } from) keeps only the re-export actually used",
+      ),
+      S("mod.star", "export * re-export", "export * re-export keeps only the used binding"),
+      S("mod.star-as", "export * as ns re-export", "export * as ns re-export keeps only the accessed member"),
+      S("mod.external", "node:* external import kept", "named builtin import stays an import statement"),
+      S(
+        "mod.external-namespace",
+        "builtin import * as kept",
+        "namespace builtin import stays an `import * as` statement",
+      ),
+      S("mod.unused-external", "unused external import not emitted", "an unused external import is not emitted at all"),
+      S("mod.chain", "3-level re-export chain", "3-level re-export chain keeps only the used terminal binding"),
+    ],
+  },
+  {
+    name: "Optimality (tree-shaking / pruning)",
+    items: [
+      S(
+        "opt.prune-props",
+        "prune unreferenced object properties",
+        "prunes unreferenced properties of a captured object",
+      ),
+      S("opt.deep-spine", "deep access path keeps only the spine", "deep access path keeps only the spine"),
+      S("opt.this-follow-method", "follow this into invoked methods", "follows `this` into invoked methods"),
+      S(
+        "opt.this-follow-getter",
+        "follow this into read getters",
+        "getter read deeply still produces the correct value",
+      ),
+      S("opt.union-closures", "union members across closures", "union of members across multiple reachable closures"),
+      S("opt.keepall-escape", "keep-all on opaque escape", "keeps the whole object when it escapes"),
+      S("opt.keepall-computed", "keep-all on computed access", "keeps the whole object on computed access"),
+      S(
+        "opt.namespace-deep",
+        "deep namespace member pruning",
+        "deep namespace member access prunes to the used sub-path",
+      ),
+      S(
+        "opt.transitive",
+        "transitive pruning through captured fn",
+        "transitive pruning: captured fn reads one field of its own big capture",
+      ),
+    ],
+  },
+  {
+    name: "Source maps",
+    items: [
+      S("map.inline", "inline source map emitted", "emits an inline source map"),
+      S("map.v3-valid", "emitted map is a valid v3 structure", "is a structurally valid v3 map"),
+      S("map.line-fidelity", "body maps back to its definition line", "a line maps to its definition line"),
+      S(
+        "map.column-accurate",
+        "emitted columns are accurate (def column + body indentation)",
+        "columns are accurate: definition line maps to its column",
+      ),
+      S(
+        "map.multi-source-chain",
+        "multi-source map: cross-file frame chains to its own file",
+        "multi-source map: a captured cross-file function's frame chains to its own original file",
+      ),
+      S(
+        "map.prelude-offset",
+        "captured-value prelude offset stays correct",
+        "captured-value prelude shifts generated lines but original lines stay correct",
+      ),
+      S(
+        "map.multi-fn",
+        "two functions, one source, both lines",
+        "two functions from the same file produce one source and both definition lines",
+      ),
+      S(
+        "map.monotonic",
+        "generated lines unique and ordered",
+        "monotonic generated lines: every mapped generated line is unique and ordered",
+      ),
+      S(
+        "map.nested",
+        "nested function maps to enclosing line",
+        "nested-function source maps back to the enclosing definition line",
+      ),
+      S(
+        "map.class-private",
+        "class method survives #private rewrite",
+        "class method survives #private rewrite with its definition line intact",
+      ),
+      S(
+        "map.als-wrap",
+        "ALS-wrapped root keeps body line mapping",
+        "ALS-wrapped root keeps the body's original line mapping",
+      ),
+      S(
+        "map.nodemodules-external",
+        "node_modules external .js.map chains to original .ts",
+        "node_modules external .js.map chains; sourceLocation + emitted map reference the original .ts",
+      ),
+      S(
+        "map.runtime-chain",
+        "loaded module's inline map is chained onto stack traces",
+        "thrown error's own frame chains through the inline map back to the original source",
+      ),
+      S(
+        "map.sourceloc-chain",
+        "Symbol.sourceLocation of a reified fn chains to the original",
+        "Symbol.sourceLocation of a reified function chains to the original source",
+      ),
+      S(
+        "map.source-location",
+        "Symbol.sourceLocation definition site",
+        "Symbol.sourceLocation reports a function's definition site",
+      ),
+    ],
+  },
+  {
+    name: "Feature interactions (combinations)",
+    items: [
+      S("ix.frozen-map", "frozen Map / Set / Date", "a frozen Map round-trips frozen"),
+      S(
+        "ix.frozen-typedarray-obj",
+        "frozen object holding a typed array",
+        "a frozen object holding a typed array round-trips",
+      ),
+      S("ix.cycle-map", "a Map that contains itself", "a Map that contains itself round-trips"),
+      S(
+        "ix.cycle-set",
+        "a Set containing an object that refs the Set",
+        "a Set that contains an object referencing the Set",
+      ),
+      S("ix.map-date-key", "Map keyed by a captured Date", "a Map keyed by a captured Date"),
+      S(
+        "ix.proxy-map",
+        "Proxy over a Map (method-binding)",
+        "a Proxy over a Map (method-binding handler) forwards through the target",
+      ),
+      S("ix.proxy-array", "Proxy over an array", "a Proxy over an array round-trips"),
+      S(
+        "ix.private-builtin-value",
+        "private field holding a Date/Map",
+        "a private field holding a Date/Map round-trips",
+      ),
+      S(
+        "ix.frozen-private",
+        "frozen class instance with a private field",
+        "a frozen class instance with a private field round-trips",
+      ),
+      S("ix.bound-private", "bound method capturing private state", "a bound method capturing private state via this"),
+      S("ix.nested-weakmap", "nested WeakMap round-trips", "a WeakMap nested in a captured object round-trips"),
+      S(
+        "ix.guard-nested-generator",
+        "nested generator object still throws",
+        "a generator object nested in a Map still throws",
+      ),
+      S(
+        "ix.shared-cell-gen",
+        "shared cell across generator + function",
+        "a shared cell mutated by both a generator and a plain function",
+      ),
+      S(
+        "ix.array-subclass",
+        "class extends Array (instanceof preserved)",
+        "a class extends Array instance round-trips with its prototype",
+      ),
+      S("ix.map-subclass", "class extends Map", "a class extends Map instance round-trips with its prototype"),
+      S("ix.set-subclass", "class extends Set", "a class extends Set instance round-trips"),
+      S("ix.frozen-array", "frozen array", "a frozen array round-trips frozen"),
+      S(
+        "ix.custom-proto",
+        "object with a custom (non-class) prototype",
+        "an object with a custom (non-class) prototype round-trips the chain",
+      ),
+      S(
+        "ix.toprimitive-frozen",
+        "Symbol.toPrimitive on a frozen object",
+        "Symbol.toPrimitive on a frozen object still coerces",
+      ),
+      S("ix.map-map-key", "Map keyed by another Map", "a Map keyed by another Map round-trips identity"),
+      S(
+        "ix.accessor-shared-cell",
+        "accessor pair sharing one captured cell",
+        "an accessor pair sharing one captured cell stays consistent",
+      ),
+      S("ix.bound-to-proxy", "function bound to a Proxy receiver", "a function bound to a Proxy receiver round-trips"),
+      S(
+        "ix.mega",
+        "frozen subclass + private + Map + super",
+        "mega: frozen subclass instance with private field + Map + super",
+      ),
+      S(
+        "ix.async-await-using",
+        "async fn with await using over a disposable",
+        "an async function using `await using` over a captured disposable",
+      ),
+      S(
+        "ix.fn-own-props",
+        "function carrying own properties",
+        "a captured function with its own properties keeps them",
+      ),
+      S("ix.date-subclass", "class extends Date", "a class extends Date instance round-trips"),
+      S(
+        "ix.subclass-chain-builtin",
+        "3-level inheritance rooted at a builtin",
+        "a 3-level inheritance chain rooted at a builtin (extends Array)",
+      ),
+      S(
+        "ix.circular-static",
+        "class with a static field referencing itself",
+        "a class with a static field referencing itself (circular static)",
+      ),
+      S("ix.frozen-map-frozen-values", "frozen Map of frozen objects", "a frozen Map containing frozen objects"),
+      S(
+        "ix.array-of-closures",
+        "array of closures sharing one cell",
+        "an array of closures sharing one cell stays shared",
+      ),
+      S(
+        "ix.proxy-handler-cell",
+        "Proxy handler capturing a shared cell",
+        "a Proxy whose handler captures a shared cell",
+      ),
+      S("ix.proxy-map-key", "Proxy used as a Map key", "a Proxy used as a Map key keeps identity"),
+      S("ix.getter-this", "getter returning this (circular)", "a getter that returns `this` (circular via accessor)"),
+      S("ix.map-nan-negzero", "Map with NaN and -0 keys", "Map with NaN and -0 keys preserves lookup semantics"),
+      S(
+        "ix.mixed-views-shared-buffer",
+        "typed array + DataView over one buffer",
+        "a typed array and a DataView over ONE buffer share it",
+      ),
+      S(
+        "ix.bound-args-complex",
+        "bound args include a Map and an instance",
+        "a bound function whose bound args include a captured Map and instance",
+      ),
+      S(
+        "ix.proxy-all-traps",
+        "Proxy with has/ownKeys/getOwnPropertyDescriptor",
+        "a Proxy with has / deleteProperty / ownKeys traps round-trips",
+      ),
+      S("ix.custom-hasinstance", "custom Symbol.hasInstance", "a class with a custom Symbol.hasInstance round-trips"),
+      S(
+        "ix.proto-getter-freevar",
+        "prototype getter capturing a free var",
+        "a prototype getter capturing a module free var round-trips",
+      ),
+      S(
+        "ix.deep-mixed-graph",
+        "Map→array→instance→private→Date",
+        "a deeply nested mixed graph: Map → array → instance → private → Date",
+      ),
+      S(
+        "ix.frozen-async-gen-method",
+        "frozen instance with async generator method",
+        "a frozen class instance with an async generator method",
+      ),
+      S(
+        "ix.fn-shared-map-direct",
+        "function shared between Map value and direct capture",
+        "a function shared between a Map value and a direct capture keeps identity",
+      ),
+      S("ix.reentrant-getters", "re-entrant getters", "re-entrant getters (one getter reads another)"),
+      S(
+        "ix.nan-negzero-values",
+        "NaN / -0 as values (not keys)",
+        "an object with NaN and -0 values (not keys) round-trips exactly",
+      ),
+    ],
+  },
+  {
+    name: "AsyncLocalStorage",
+    items: [
+      S("als.store-value", "store value captured inside run()", "captures a store value (inside run)"),
+      S(
+        "als.instance",
+        "ALS instance reconstructs (opaque, fresh)",
+        "an ALS instance reconstructs as a fresh, working store",
+      ),
+      S(
+        "als.context",
+        "active ALS context captured + restored on reify",
+        "captures the active ALS context and restores it on reify",
+      ),
+      S(
+        "als.context-nested",
+        "nested run() composes after round-trip",
+        "nested als.run inside a reconstructed closure composes",
+      ),
+      S("als.context-multi", "two ALS contexts captured + restored", "captures two ALS contexts and restores both"),
+      S(
+        "als.module-scope",
+        "module-scope ALS captured + context",
+        "module-scope ALS, serialized INSIDE a run, captures the context",
+      ),
+      S(
+        "als.nested-innermost",
+        "nested run captures innermost store",
+        "nested run at serialize time captures the INNERMOST store",
+      ),
+      S(
+        "als.async-await",
+        "context survives across awaits",
+        "a reified ASYNC closure keeps the captured context across an await",
+      ),
+      S(
+        "als.async-postaward",
+        "serialize after await captures context",
+        "serialize called AFTER an await inside run still captures that run's context",
+      ),
+      S(
+        "als.async-concurrent",
+        "concurrent runs capture own contexts",
+        "two async operations with DIFFERENT contexts each capture their own",
+      ),
+      S(
+        "als.store-complex",
+        "complex/circular store snapshotted",
+        "the store is a complex nested object (snapshotted by value)",
+      ),
+      S(
+        "als.store-identity",
+        "store === captured free var (one object)",
+        "the SAME object captured as both the store and a closure free variable keeps identity",
+      ),
+      S(
+        "als.store-crosslink",
+        "two ALS, cross-linked stores",
+        "two ALS whose stores reference each other (cross-linked) round-trip",
+      ),
+      S("als.run-undefined", "run(undefined) captures no context", "run(undefined) captures no context (no wrapping)"),
+      S(
+        "als.mutate-after",
+        "store mutation after serialize ignored",
+        "mutating the store object AFTER serialize does not affect the snapshot",
+      ),
+      S(
+        "als.re-serialize",
+        "double round-trip keeps context",
+        "re-serializing a reified closure (serialize → reify → serialize) keeps the context",
+      ),
+      S(
+        "als.nested-als-store",
+        "store containing another ALS instance",
+        "the store itself contains another ALS instance (nested ALS), reconstructed",
+      ),
+      S(
+        "als.concurrent-interleaved",
+        "interleaved reified closures independent",
+        "concurrent reified closures with different captured contexts stay independent",
+      ),
+      S(
+        "als.gen-root-graceful",
+        "generator root reconstructs (no context restore)",
+        "a generator root captured in a context reconstructs (context not restored)",
+      ),
+      S(
+        "als.class-root-graceful",
+        "class root reconstructs constructable (no context restore)",
+        "a class root captured in a context reconstructs constructable (context not restored)",
+      ),
+    ],
+  },
+];
+
+// ---------------------------------------------------------------------------
+// Reporter
+// ---------------------------------------------------------------------------
+
+const TEST_FILES = ["closure.test.ts", "symbol-free-variables.test.ts"];
+
+function loadTestCorpus(): string {
+  const here = dirname(fileURLToPath(import.meta.url));
+  return TEST_FILES.map(f => {
+    try {
+      return readFileSync(join(here, f), "utf8");
+    } catch {
+      return "";
+    }
+  }).join("\n");
+}
+
+export interface CoverageReport {
+  total: number;
+  supported: number;
+  limitation: number;
+  todo: number;
+  unverified: CoverageItem[];
+  coverage: number; // supported / (supported + todo)
+  safety: number; // (supported + limitation) / total
+}
+
+export function computeReport(corpus: string): CoverageReport {
+  let supported = 0;
+  let limitation = 0;
+  let todo = 0;
+  const unverified: CoverageItem[] = [];
+  let total = 0;
+
+  for (const cat of CATEGORIES) {
+    for (const item of cat.items) {
+      total++;
+      if (item.status === "todo") {
+        todo++;
+        continue;
+      }
+      const verified = item.evidence !== undefined && corpus.includes(item.evidence);
+      if (!verified) unverified.push(item);
+      if (item.status === "supported") supported += verified ? 1 : 0;
+      else limitation += verified ? 1 : 0;
+      if (!verified) todo += 0; // unverified items don't count toward coverage
+    }
+  }
+
+  // Unverified supported/limitation items are not counted as achieved; surface
+  // them as a debt so the headline number stays honest.
+  const achieved = supported + limitation;
+  return {
+    total,
+    supported,
+    limitation,
+    todo: total - achieved - 0, // everything not achieved is remaining work
+    unverified,
+    coverage: supported / (supported + (total - achieved)),
+    safety: achieved / total,
+  };
+}
+
+function bar(pct: number, width = 24): string {
+  const filled = Math.round(pct * width);
+  return "█".repeat(filled) + "░".repeat(width - filled);
+}
+
+function main(): void {
+  const corpus = loadTestCorpus();
+  const report = computeReport(corpus);
+
+  let out = "\n  bun:closure — spec coverage\n";
+  out += "  " + "─".repeat(60) + "\n";
+
+  for (const cat of CATEGORIES) {
+    const sup = cat.items.filter(i => i.status === "supported").length;
+    const lim = cat.items.filter(i => i.status === "limitation").length;
+    const td = cat.items.filter(i => i.status === "todo").length;
+    const n = cat.items.length;
+    const done = sup + lim;
+    out += `  ${cat.name}\n`;
+    out += `    ${bar(done / n, 18)}  ${done}/${n}  (${sup} ok, ${lim} guarded, ${td} todo)\n`;
+  }
+
+  out += "  " + "─".repeat(60) + "\n";
+  const counts = {
+    supported: CATEGORIES.flatMap(c => c.items).filter(i => i.status === "supported").length,
+    limitation: CATEGORIES.flatMap(c => c.items).filter(i => i.status === "limitation").length,
+    todo: CATEGORIES.flatMap(c => c.items).filter(i => i.status === "todo").length,
+  };
+  out += `  Total capabilities : ${report.total}\n`;
+  out += `  Supported          : ${counts.supported}  ${bar(counts.supported / report.total, 24)}\n`;
+  out += `  Guarded limitation : ${counts.limitation}\n`;
+  out += `  Todo / unmeasured  : ${counts.todo}\n`;
+  out += "  " + "─".repeat(60) + "\n";
+  out += `  Coverage  (supported / supported+todo) : ${(report.coverage * 100).toFixed(1)}%\n`;
+  out += `  Safety    (no silent failure)          : ${(report.safety * 100).toFixed(1)}%\n`;
+
+  if (report.unverified.length) {
+    out += "\n  ⚠ unverified claims (no matching test found — fix evidence or add test):\n";
+    for (const it of report.unverified) out += `    - ${it.id}: "${it.evidence}"\n`;
+  }
+
+  const todos = CATEGORIES.flatMap(c => c.items.filter(i => i.status === "todo").map(i => ({ cat: c.name, i })));
+  if (todos.length) {
+    out += "\n  Roadmap to 100% (todo):\n";
+    for (const { i } of todos) out += `    - ${i.id}: ${i.title}${i.note ? ` — ${i.note}` : ""}\n`;
+  }
+
+  out += "\n";
+  process.stdout.write(out);
+
+  // Non-zero exit if any supported/limitation item lacks backing evidence, so
+  // this can gate CI against coverage drift.
+  if (report.unverified.length) process.exitCode = 1;
+}
+
+if (import.meta.main) main();

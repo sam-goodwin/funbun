@@ -25,6 +25,19 @@ pub struct SavedSourceMap {
     pub find_cache: FindCache,
     pub last_path_hash: u64,
     pub last_ism: Option<InternalSourceMap>,
+
+    /// A loaded module's OWN source map (decoded from its `//# sourceMappingURL=`
+    /// pragma), keyed by `hash(source path)`. Bun's generated map for that module
+    /// maps generated -> the loaded file; this map continues loaded file ->
+    /// original source, so `resolve_mapping` chains the two. Guarded by `mutex`.
+    pub input_maps: std::collections::HashMap<u64, Arc<ParsedSourceMap>>,
+
+    /// Resolved on-disk path of a loaded module's EXTERNAL `.map`
+    /// (`//# sourceMappingURL=foo.js.map`), keyed by `hash(source path)`. The
+    /// file is read + decoded lazily on the first `resolve_mapping` that needs
+    /// it (i.e. only when a stack frame in that module is symbolicated), then
+    /// promoted into `input_maps`. Avoids an eager disk read per loaded module.
+    pub pending_external_maps: std::collections::HashMap<u64, Box<[u8]>>,
 }
 
 impl Default for SavedSourceMap {
@@ -35,6 +48,8 @@ impl Default for SavedSourceMap {
             find_cache: FindCache::default(),
             last_path_hash: 0,
             last_ism: None,
+            input_maps: std::collections::HashMap::new(),
+            pending_external_maps: std::collections::HashMap::new(),
         }
     }
 }
@@ -48,6 +63,8 @@ impl SavedSourceMap {
             find_cache: FindCache::default(),
             last_path_hash: 0,
             last_ism: None,
+            input_maps: std::collections::HashMap::new(),
+            pending_external_maps: std::collections::HashMap::new(),
         });
 
         // SAFETY: `map` is a valid pointer to the sibling HashTable on VirtualMachine.
@@ -440,6 +457,92 @@ impl SavedSourceMap {
         Some(Value::from(Some(raw)))
     }
 
+    /// Decode a loaded module's own `//# sourceMappingURL=` pragma and remember
+    /// it so `resolve_mapping` can chain it onto Bun's generated map. Inline
+    /// `data:` URLs are decoded eagerly (the data is already in hand); an
+    /// external `.map` reference is resolved to a path and read lazily on the
+    /// first resolve that needs it. Decode failures are silently dropped — a bad
+    /// input map must not break stack traces, the generated map still resolves.
+    pub fn put_input_map_from_url(&mut self, path: &[u8], url: &[u8]) {
+        if url.starts_with(b"data:") {
+            let arena = bun_alloc::Arena::new();
+            let parsed = match SourceMap::parse_url(
+                &arena,
+                url,
+                SourceMap::ParseUrlResultHint::MappingsOnly,
+            ) {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+            let Some(map) = parsed.map else {
+                return;
+            };
+            let h = hash(path);
+            self.lock();
+            self.input_maps.insert(h, map);
+            self.unlock();
+            return;
+        }
+
+        // External `.map` reference. Skip empty and remote refs; resolve a
+        // relative path against the module's directory. The file is NOT read
+        // here — only on the first `resolve_mapping` that touches this module.
+        if url.is_empty() || url.starts_with(b"http://") || url.starts_with(b"https://") {
+            return;
+        }
+        let resolved: Box<[u8]> = if bun_paths::is_absolute(url) {
+            Box::from(url)
+        } else {
+            let Some(dir) = bun_paths::dirname(path) else {
+                return;
+            };
+            let joined = bun_paths::resolve_path::join::<bun_paths::platform::Auto>(&[dir, url]);
+            Box::from(joined)
+        };
+        let h = hash(path);
+        self.lock();
+        self.pending_external_maps.insert(h, resolved);
+        self.unlock();
+    }
+
+    /// Reads and decodes an external `.map` file. Returns `None` (silently) on
+    /// any I/O or parse failure — a bad/missing map must not break stack traces.
+    fn load_external_map(map_path: &[u8]) -> Option<Arc<ParsedSourceMap>> {
+        let mut buf = bun_paths::path_buffer_pool::get();
+        if map_path.len() + 1 > buf.len() {
+            return None;
+        }
+        buf[..map_path.len()].copy_from_slice(map_path);
+        buf[map_path.len()] = 0;
+        // SAFETY: byte at `len` was just set to NUL; `buf` outlives `zpath`.
+        let zpath = bun_core::ZStr::from_buf(&buf[..], map_path.len());
+        let data = bun_sys::File::read_from(bun_core::Fd::cwd(), zpath).ok()?;
+        let arena = bun_alloc::Arena::new();
+        SourceMap::parse_json(&arena, &data, SourceMap::ParseUrlResultHint::MappingsOnly)
+            .ok()?
+            .map
+    }
+
+    fn get_input_map(&mut self, path: &[u8]) -> Option<Arc<ParsedSourceMap>> {
+        let h = hash(path);
+        self.lock();
+        if let Some(m) = self.input_maps.get(&h).cloned() {
+            self.unlock();
+            return Some(m);
+        }
+        let pending = self.pending_external_maps.remove(&h);
+        self.unlock();
+
+        // First touch of a module with an external `.map`: read + decode it now
+        // (outside the lock), then promote it into `input_maps` so subsequent
+        // frames reuse the parsed map.
+        let map = Self::load_external_map(&pending?)?;
+        self.lock();
+        self.input_maps.insert(h, Arc::clone(&map));
+        self.unlock();
+        Some(map)
+    }
+
     pub fn resolve_mapping(
         &mut self,
         path: &[u8],
@@ -472,6 +575,27 @@ impl SavedSourceMap {
             // on the legitimate INVALID (-1) sentinel.
             None => map.find_mapping(line, column)?,
         };
+
+        // Chain through the loaded module's own source map, if it has one. The
+        // base `mapping` maps generated -> this file; the input map continues
+        // this file -> the original source. Look the base mapping's original
+        // (line, column) up in the input map and return THAT, with the input
+        // map as the source (so `display_source_url_if_needed` names the
+        // original file from its `external_source_names`).
+        if mapping.original.lines.zero_based() >= 0 {
+            if let Some(input_map) = self.get_input_map(path) {
+                if let Some(chained) =
+                    input_map.find_mapping(mapping.original.lines, mapping.original.columns)
+                {
+                    return Some(SourceMap::mapping::Lookup {
+                        mapping: chained,
+                        source_map: Some(input_map),
+                        prefetched_source_code: None,
+                        name: None,
+                    });
+                }
+            }
+        }
 
         Some(SourceMap::mapping::Lookup {
             mapping,

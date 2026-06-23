@@ -40,6 +40,7 @@
 #include "JavaScriptCore/ModuleRegistryEntry.h"
 #include "JavaScriptCore/JSModuleNamespaceObject.h"
 #include "JavaScriptCore/JSModuleNamespaceObjectInlines.h"
+#include "JavaScriptCore/AbstractModuleRecord.h"
 #include "JavaScriptCore/JSModuleRecord.h"
 #include "JavaScriptCore/JSNativeStdFunction.h"
 #include "JavaScriptCore/JSObject.h"
@@ -48,6 +49,10 @@
 #include "JavaScriptCore/JSSourceCode.h"
 #include "JavaScriptCore/JSString.h"
 #include "JavaScriptCore/JSWeakMap.h"
+#include "JavaScriptCore/JSWeakSet.h"
+#include "JavaScriptCore/JSFinalizationRegistry.h"
+#include "JavaScriptCore/WeakMapImpl.h"
+#include "JavaScriptCore/WeakMapImplInlines.h"
 #include "JavaScriptCore/LazyClassStructure.h"
 #include "JavaScriptCore/LazyClassStructureInlines.h"
 #include "JavaScriptCore/ObjectConstructor.h"
@@ -58,6 +63,24 @@
 #include "JavaScriptCore/StackFrame.h"
 #include "JavaScriptCore/StackVisitor.h"
 #include "JavaScriptCore/VM.h"
+#include "JavaScriptCore/JSFunction.h"
+#include "JavaScriptCore/JSBoundFunction.h"
+#include "JavaScriptCore/JSScope.h"
+#include "JavaScriptCore/SymbolTable.h"
+#include "JavaScriptCore/JSSymbolTableObject.h"
+#include "JavaScriptCore/JSLexicalEnvironment.h"
+#include "JavaScriptCore/JSModuleEnvironment.h"
+#include "JavaScriptCore/JSGlobalLexicalEnvironment.h"
+#include "JavaScriptCore/Symbol.h"
+#include "JavaScriptCore/SymbolInlines.h"
+#include "JavaScriptCore/PropertyNameArray.h"
+#include "JavaScriptCore/EnumerationMode.h"
+#include "JavaScriptCore/FunctionExecutable.h"
+#include "JavaScriptCore/SourceProvider.h"
+#include "JavaScriptCore/UnlinkedFunctionExecutable.h"
+#include "JavaScriptCore/UnlinkedFunctionCodeBlock.h"
+#include "JavaScriptCore/UnlinkedCodeBlock.h"
+#include "JavaScriptCore/ParserError.h"
 #include "AddEventListenerOptions.h"
 #include "AsyncContextFrame.h"
 #include "BunClientData.h"
@@ -67,6 +90,8 @@
 #include "BunPlugin.h"
 #include "BunProcess.h"
 #include "BunSecureContextCache.h"
+#include "BunFreeVariableIdTable.h"
+#include "isBuiltinModule.h"
 #include "ProcessIdentifier.h"
 #include "BunWorkerGlobalScope.h"
 #include "CallSite.h"
@@ -174,6 +199,14 @@
 #include "EventLoopTask.h"
 #include "NodeModuleModule.h"
 #include <JavaScriptCore/JSCBytecodeCacheVersion.h>
+#include <JavaScriptCore/JSGenerator.h>
+#include <JavaScriptCore/JSAsyncGenerator.h>
+#include <JavaScriptCore/JSMapIterator.h>
+#include <JavaScriptCore/JSSetIterator.h>
+#include <JavaScriptCore/JSArrayIterator.h>
+#include <JavaScriptCore/JSStringIterator.h>
+#include <JavaScriptCore/JSRegExpStringIterator.h>
+#include <JavaScriptCore/JSIteratorHelper.h>
 #include "JSPerformanceServerTiming.h"
 #include "JSPerformanceResourceTiming.h"
 #include "JSPerformanceTiming.h"
@@ -999,6 +1032,13 @@ GlobalObject::GlobalObject(JSC::VM& vm, JSC::Structure* structure, WebCore::Scri
     // m_scriptExecutionContext = globalEventScope.m_context;
     mockModule = Bun::JSMockModule::create(this);
     globalEventScope->m_context = m_scriptExecutionContext;
+}
+
+Bun::FreeVariableIdTable& GlobalObject::freeVariableIdTable()
+{
+    if (!m_freeVariableIdTable)
+        m_freeVariableIdTable = makeUnique<Bun::FreeVariableIdTable>();
+    return *m_freeVariableIdTable;
 }
 
 GlobalObject::~GlobalObject()
@@ -2907,6 +2947,680 @@ JSValue GlobalObject_getGlobalThis(VM& vm, JSObject* globalObject)
     return uncheckedDowncast<Zig::GlobalObject>(globalObject)->globalThis();
 }
 
+// ===================== Symbol.freeVariables (experimental) =====================
+// Returns the variables a closure captures as an array of descriptors:
+//   [{ name: string, id: number, scopeId: number, value: any, kind: "const" | "let" }]
+//
+// "Captured" means *transitively referenced*: a variable is included if the
+// function — or any closure nested within it, at any depth — names it. We gather
+// the identifiers appearing in the function's unlinked code (recursing through
+// nested functions), then resolve each against the function's live scope chain.
+// Names that resolve to a true global, or that are not present as a slot in the
+// chain below the global object (module imports resolve to the exporting
+// module's environment, not this one), are ambient and excluded.
+//
+// The identifier set is the function's identifier table rather than only its
+// scope-access operands (the per-opcode structs aren't available in this build's
+// headers). The scope-chain resolution filters it down to real captured cells,
+// so unrelated module bindings and sibling captures are excluded. The remaining
+// imprecision is over-inclusion: a name used solely as a property access (e.g.
+// `obj.x`) that happens to collide with a captured variable named `x` will be
+// reported. That is the safe direction for serialization.
+//
+// `id` identifies the variable *cell* — (environment instance, scope offset).
+// Two closures over the same variable share the environment instance, so they
+// observe the same id. `scopeId` is the environment instance's id alone, so
+// cells of the same scope can be grouped. Both come from a GC-aware per-global
+// table.
+//
+// `kind` is "const" for read-only bindings, "let" otherwise (`var`/parameters
+// are not distinguished from `let`). `const` bindings folded to a compile-time
+// constant never get a cell and so do not appear.
+
+static constexpr unsigned freeVariablesMaxRecursionDepth = 64;
+
+// Collect, in first-seen order, the identifiers appearing in `unlinkedExecutable`
+// or any function nested within it.
+static void collectReferencedIdentifiers(JSC::VM& vm, JSC::UnlinkedFunctionExecutable* unlinkedExecutable, const JSC::SourceCode& source, WTF::HashSet<RefPtr<WTF::UniquedStringImpl>>& seen, WTF::Vector<RefPtr<WTF::UniquedStringImpl>>& ordered, unsigned depth)
+{
+    if (depth > freeVariablesMaxRecursionDepth)
+        return;
+
+    JSC::ParserError parserError;
+    JSC::UnlinkedFunctionCodeBlock* codeBlock = unlinkedExecutable->unlinkedCodeBlockFor(vm, source, JSC::CodeSpecializationKind::CodeForCall, {}, parserError, unlinkedExecutable->parseMode());
+    if (!codeBlock)
+        return;
+
+    size_t identifierCount = codeBlock->numberOfIdentifiers();
+    for (size_t i = 0; i < identifierCount; ++i) {
+        const JSC::Identifier& identifier = codeBlock->identifier(i);
+        WTF::UniquedStringImpl* uid = identifier.impl();
+        if (!uid || identifier.isSymbol() || uid->length() == 0)
+            continue;
+        // The identifier table can hold entries that are not variable names —
+        // notably numeric keys (e.g. `obj[4]`, array-index property accesses)
+        // interned as identifiers. A JS binding name never starts with a digit,
+        // so these can never be a captured free variable; skip them rather than
+        // resolve a phantom slot and emit an invalid `let 4 = ...`.
+        char16_t firstChar = uid->is8Bit() ? uid->span8()[0] : uid->span16()[0];
+        if (WTF::isASCIIDigit(firstChar))
+            continue;
+        if (seen.add(RefPtr { uid }).isNewEntry)
+            ordered.append(uid);
+    }
+
+    for (size_t i = 0; i < codeBlock->numberOfFunctionDecls(); ++i) {
+        auto* nested = codeBlock->functionDecl(i);
+        collectReferencedIdentifiers(vm, nested, nested->linkedSourceCode(source), seen, ordered, depth + 1);
+    }
+    for (size_t i = 0; i < codeBlock->numberOfFunctionExprs(); ++i) {
+        auto* nested = codeBlock->functionExpr(i);
+        collectReferencedIdentifiers(vm, nested, nested->linkedSourceCode(source), seen, ordered, depth + 1);
+    }
+}
+
+static JSC::JSValue readEnvironmentVariable(JSC::JSCell* environment, JSC::ScopeOffset offset)
+{
+    if (auto* env = dynamicDowncast<JSC::JSLexicalEnvironment>(environment)) {
+        if (!env->isValidScopeOffset(offset))
+            return {};
+        return env->variableAt(offset).get();
+    }
+    if (auto* env = dynamicDowncast<JSC::JSModuleEnvironment>(environment)) {
+        if (!env->isValidScopeOffset(offset))
+            return {};
+        return env->variableAt(offset).get();
+    }
+    return {};
+}
+
+// Resolves a single identifier against a function's lexical scope chain and
+// returns { found, value }. Used by the closure serializer to capture variables
+// referenced only by a class field initializer — names the bytecode free-var
+// scan can't see (the initializer is a separate executable), but which the AST
+// surfaces and which still live in the class's defining scope.
+JSC_DEFINE_HOST_FUNCTION(functionResolveClosureBinding, (JSC::JSGlobalObject * globalObject, JSC::CallFrame* callFrame))
+{
+    JSC::VM& vm = JSC::getVM(globalObject);
+    auto scope = DECLARE_THROW_SCOPE(vm);
+
+    JSC::JSObject* result = JSC::constructEmptyObject(globalObject);
+    result->putDirect(vm, JSC::Identifier::fromString(vm, "found"_s), JSC::jsBoolean(false), 0);
+    result->putDirect(vm, JSC::Identifier::fromString(vm, "value"_s), JSC::jsUndefined(), 0);
+
+    auto* function = dynamicDowncast<JSC::JSFunction>(callFrame->argument(0));
+    if (!function)
+        return JSC::JSValue::encode(result);
+    JSC::Identifier nameId = JSC::Identifier::fromString(vm, callFrame->argument(1).toWTFString(globalObject));
+    RETURN_IF_EXCEPTION(scope, {});
+    WTF::UniquedStringImpl* nameImpl = nameId.impl();
+    if (!nameImpl)
+        return JSC::JSValue::encode(result);
+
+    // An arrow function's captured lexical `this` lives in the scope under the keyword
+    // identifier "this", but a keyword can't be matched by the pointer-based symbol-table
+    // find below (its interned impl differs). Match it by string instead: the nearest scope
+    // entry literally named "this" that holds a scoped value is the captured receiver.
+    if (nameId.string() == "this"_s) {
+        for (JSC::JSScope* current = function->scope(); current; current = current->next()) {
+            if (current->inherits<JSC::JSGlobalObject>() || current->inherits<JSC::JSGlobalLexicalEnvironment>())
+                break;
+            auto* sto = dynamicDowncast<JSC::JSSymbolTableObject>(current);
+            if (!sto)
+                continue;
+            JSC::SymbolTable* st = sto->symbolTable();
+            JSC::ScopeOffset thisOffset;
+            bool hasThis = false;
+            {
+                JSC::ConcurrentJSLocker locker(st->m_lock);
+                for (auto it = st->begin(locker); it != st->end(locker); ++it) {
+                    if (it->value.varOffset().isScope() && String(it->key.get()) == "this"_s) {
+                        thisOffset = it->value.scopeOffset();
+                        hasThis = true;
+                        break;
+                    }
+                }
+            }
+            if (hasThis) {
+                JSC::JSValue value = readEnvironmentVariable(current, thisOffset);
+                if (value && !value.isEmpty()) {
+                    result->putDirect(vm, JSC::Identifier::fromString(vm, "found"_s), JSC::jsBoolean(true), 0);
+                    result->putDirect(vm, JSC::Identifier::fromString(vm, "value"_s), value, 0);
+                    return JSC::JSValue::encode(result);
+                }
+            }
+        }
+        return JSC::JSValue::encode(result);
+    }
+
+    for (JSC::JSScope* current = function->scope(); current; current = current->next()) {
+        if (current->inherits<JSC::JSGlobalObject>() || current->inherits<JSC::JSGlobalLexicalEnvironment>())
+            break;
+        auto* symbolTableObject = dynamicDowncast<JSC::JSSymbolTableObject>(current);
+        if (!symbolTableObject)
+            continue;
+        JSC::SymbolTable* symbolTable = symbolTableObject->symbolTable();
+        JSC::ConcurrentJSLocker locker(symbolTable->m_lock);
+        auto iter = symbolTable->find(locker, nameImpl);
+        if (iter == symbolTable->end(locker))
+            continue; // not in this scope — keep walking outward
+        const JSC::SymbolTableEntry& entry = iter->value;
+        if (!entry.isNull() && entry.varOffset().isScope()) {
+            JSC::JSValue value = readEnvironmentVariable(current, entry.scopeOffset());
+            if (value && !value.isEmpty()) {
+                result->putDirect(vm, JSC::Identifier::fromString(vm, "found"_s), JSC::jsBoolean(true), 0);
+                result->putDirect(vm, JSC::Identifier::fromString(vm, "value"_s), value, 0);
+            }
+        }
+        break; // nearest declaring scope wins (shadowing)
+    }
+    return JSC::JSValue::encode(result);
+}
+
+// Snapshots a WeakMap / WeakSet's live entries (which aren't JS-enumerable) into
+// a flat array: a WeakMap yields [k, v, k, v, ...], a WeakSet [k, k, ...]. Used
+// by the closure serializer to reconstruct them as a snapshot.
+JSC_DEFINE_HOST_FUNCTION(functionWeakCollectionSnapshot, (JSC::JSGlobalObject * globalObject, JSC::CallFrame* callFrame))
+{
+    JSC::VM& vm = JSC::getVM(globalObject);
+    auto scope = DECLARE_THROW_SCOPE(vm);
+
+    JSC::JSValue arg = callFrame->argument(0);
+    JSC::MarkedArgumentBuffer snapshot;
+    if (auto* weakMap = dynamicDowncast<JSC::JSWeakMap>(arg))
+        weakMap->takeSnapshot(snapshot);
+    else if (auto* weakSet = dynamicDowncast<JSC::JSWeakSet>(arg))
+        weakSet->takeSnapshot(snapshot);
+
+    JSC::JSArray* result = JSC::constructEmptyArray(globalObject, nullptr, snapshot.size());
+    RETURN_IF_EXCEPTION(scope, {});
+    for (unsigned i = 0; i < snapshot.size(); ++i) {
+        result->putDirectIndex(globalObject, i, snapshot.at(i));
+        RETURN_IF_EXCEPTION(scope, {});
+    }
+    return JSC::JSValue::encode(result);
+}
+
+// Snapshots a FinalizationRegistry's callback + live registrations into
+// { callback, flat: [target, heldValue, unregisterToken, ...] } (token is
+// undefined when none). Used by the closure serializer to reconstruct it.
+JSC_DEFINE_HOST_FUNCTION(functionFinalizationRegistrySnapshot, (JSC::JSGlobalObject * globalObject, JSC::CallFrame* callFrame))
+{
+    JSC::VM& vm = JSC::getVM(globalObject);
+    auto scope = DECLARE_THROW_SCOPE(vm);
+
+    auto* registry = dynamicDowncast<JSC::JSFinalizationRegistry>(callFrame->argument(0));
+    if (!registry)
+        return JSC::JSValue::encode(JSC::jsNull());
+
+    // Root targets/held values/tokens while we build the JS arrays (targets are
+    // only weakly held by the registry).
+    JSC::MarkedArgumentBuffer rooted;
+    {
+        WTF::Locker locker { registry->cellLock() };
+        auto registrations = registry->liveRegistrations(locker);
+        for (const auto& reg : registrations) {
+            rooted.append(reg.target);
+            rooted.append(reg.heldValue);
+            rooted.append(reg.unregisterToken ? JSC::JSValue(reg.unregisterToken) : JSC::jsUndefined());
+        }
+    }
+
+    JSC::JSArray* flat = JSC::constructEmptyArray(globalObject, nullptr, rooted.size());
+    RETURN_IF_EXCEPTION(scope, {});
+    for (unsigned i = 0; i < rooted.size(); ++i) {
+        flat->putDirectIndex(globalObject, i, rooted.at(i));
+        RETURN_IF_EXCEPTION(scope, {});
+    }
+    JSC::JSObject* result = JSC::constructEmptyObject(globalObject);
+    result->putDirect(vm, JSC::Identifier::fromString(vm, "callback"_s), registry->callback(), 0);
+    result->putDirect(vm, JSC::Identifier::fromString(vm, "flat"_s), flat, 0);
+    return JSC::JSValue::encode(result);
+}
+
+// Spoof-proof type check for the closure serializer: returns a human-readable label
+// ("Generator", "Map Iterator", ...) for objects holding suspended execution state that
+// cannot be expressed as source, or undefined for everything else. Uses the actual JSC
+// cell type (jsDynamicCast) rather than Symbol.toStringTag, which userland can forge.
+JSC_DEFINE_HOST_FUNCTION(functionBunClosureUnserializableTag, (JSC::JSGlobalObject * globalObject, JSC::CallFrame* callFrame))
+{
+    JSC::VM& vm = JSC::getVM(globalObject);
+    JSC::JSValue arg = callFrame->argument(0);
+    if (!arg.isCell())
+        return JSC::JSValue::encode(JSC::jsUndefined());
+
+    const char* label = nullptr;
+    if (dynamicDowncast<JSC::JSGenerator>(arg))
+        label = "Generator";
+    else if (dynamicDowncast<JSC::JSAsyncGenerator>(arg))
+        label = "AsyncGenerator";
+    else if (dynamicDowncast<JSC::JSMapIterator>(arg))
+        label = "Map Iterator";
+    else if (dynamicDowncast<JSC::JSSetIterator>(arg))
+        label = "Set Iterator";
+    else if (dynamicDowncast<JSC::JSArrayIterator>(arg))
+        label = "Array Iterator";
+    else if (dynamicDowncast<JSC::JSStringIterator>(arg))
+        label = "String Iterator";
+    else if (dynamicDowncast<JSC::JSRegExpStringIterator>(arg))
+        label = "RegExp String Iterator";
+    else if (dynamicDowncast<JSC::JSIteratorHelper>(arg))
+        label = "Iterator Helper";
+
+    if (!label)
+        return JSC::JSValue::encode(JSC::jsUndefined());
+    return JSC::JSValue::encode(JSC::jsString(vm, String::fromLatin1(label)));
+}
+
+// Generator introspection for the closure serializer's Tier-A support: returns
+// `{ state, this, name, body, fn }` for a JSGenerator (undefined for anything else, incl.
+// AsyncGenerator — those keep the existing reject path). `state` is JSC's resume index (0 = not
+// started, >0 = paused at yield #N, -1 = completed, -2 = executing). `body` is the generator body
+// source `{...}` (read WITHOUT calling the generator-body function, which uses a generator-only
+// calling convention). `fn` is that body function — exposed only so the JS side can read its
+// `Symbol.freeVariables` (the generator's captured vars AND its params, by value).
+JSC_DEFINE_HOST_FUNCTION(functionBunGeneratorState, (JSC::JSGlobalObject * globalObject, JSC::CallFrame* callFrame))
+{
+    JSC::VM& vm = JSC::getVM(globalObject);
+    JSC::JSValue arg = callFrame->argument(0);
+    auto* generator = arg.isCell() ? dynamicDowncast<JSC::JSGenerator>(arg) : nullptr;
+    if (!generator)
+        return JSC::JSValue::encode(JSC::jsUndefined());
+
+    JSC::JSObject* result = JSC::constructEmptyObject(globalObject);
+    result->putDirect(vm, JSC::Identifier::fromString(vm, "state"_s), JSC::jsNumber(generator->state()), 0);
+    result->putDirect(vm, JSC::Identifier::fromString(vm, "this"_s), generator->thisValue(), 0);
+    result->putDirect(vm, JSC::Identifier::fromString(vm, "fn"_s), generator->next(), 0);
+    if (auto* nextFn = dynamicDowncast<JSC::JSFunction>(generator->next())) {
+        if (auto* exec = nextFn->jsExecutable()) {
+            result->putDirect(vm, JSC::Identifier::fromString(vm, "body"_s), JSC::jsString(vm, exec->source().view().toString()), 0);
+            result->putDirect(vm, JSC::Identifier::fromString(vm, "name"_s), JSC::jsString(vm, exec->ecmaName().string()), 0);
+        }
+    }
+    return JSC::JSValue::encode(result);
+}
+
+JSC_DEFINE_CUSTOM_GETTER(functionFreeVariablesGetter, (JSC::JSGlobalObject * globalObject, JSC::EncodedJSValue thisValue, JSC::PropertyName))
+{
+    JSC::VM& vm = JSC::getVM(globalObject);
+    auto scope = DECLARE_THROW_SCOPE(vm);
+
+    JSC::JSArray* result = JSC::constructEmptyArray(globalObject, nullptr);
+    RETURN_IF_EXCEPTION(scope, {});
+
+    JSC::JSFunction* function = dynamicDowncast<JSC::JSFunction>(JSC::JSValue::decode(thisValue));
+    if (!function || function->isHostFunction())
+        return JSC::JSValue::encode(result);
+
+    JSC::FunctionExecutable* executable = function->jsExecutable();
+    if (!executable)
+        return JSC::JSValue::encode(result);
+
+    // 1. Statically collect the identifiers this closure transitively references
+    //    from enclosing scopes.
+    WTF::HashSet<RefPtr<WTF::UniquedStringImpl>> seen;
+    WTF::Vector<RefPtr<WTF::UniquedStringImpl>> referenced;
+    collectReferencedIdentifiers(vm, executable->unlinkedExecutable(), executable->source(), seen, referenced, 0);
+
+    // 2. Resolve each against the live scope chain and emit a descriptor for the
+    //    ones that land in a captured (non-global) environment.
+    Bun::FreeVariableIdTable& idTable = defaultGlobalObject(globalObject)->freeVariableIdTable();
+    unsigned nextIndex = 0;
+    for (const auto& nameImpl : referenced) {
+        JSC::JSCell* foundEnvironment = nullptr;
+        JSC::ScopeOffset offset;
+        bool isReadOnly = false;
+
+        // Import metadata, populated only when the name resolves to a
+        // named/default ES-module import rather than a local captured binding.
+        bool isImport = false;
+        bool importExternal = true;
+        WTF::String importSpecifier;
+        WTF::String importExportedName;
+        WTF::String importKind;
+        // Set when a named import resolves to a re-exported namespace
+        // (`export * as ns`): its value is the target module's namespace object,
+        // captured directly (there is no scope slot to read from).
+        JSC::JSValue importNamespaceValue;
+
+        for (JSC::JSScope* current = function->scope(); current; current = current->next()) {
+            // Reaching module/global scope means the name is ambient (a global or
+            // import) — stop without emitting.
+            if (current->inherits<JSC::JSGlobalObject>() || current->inherits<JSC::JSGlobalLexicalEnvironment>())
+                break;
+            auto* symbolTableObject = dynamicDowncast<JSC::JSSymbolTableObject>(current);
+            if (!symbolTableObject)
+                continue;
+
+            // First, look for the name as a local scope slot of `current`.
+            {
+                JSC::SymbolTable* symbolTable = symbolTableObject->symbolTable();
+                bool foundHere = false;
+                {
+                    JSC::ConcurrentJSLocker locker(symbolTable->m_lock);
+                    auto iter = symbolTable->find(locker, nameImpl.get());
+                    if (iter != symbolTable->end(locker)) {
+                        const JSC::SymbolTableEntry& entry = iter->value;
+                        // The nearest scope that declares the name wins (shadowing). If it
+                        // isn't a readable scope slot, the name is still shadowed here.
+                        if (!entry.isNull() && entry.varOffset().isScope()) {
+                            offset = entry.scopeOffset();
+                            isReadOnly = entry.isReadOnly();
+                            foundEnvironment = current;
+                        }
+                        foundHere = true;
+                    }
+                }
+                if (foundHere) {
+                    // A namespace import (`import * as ns`) is captured as a local
+                    // slot. If its source is external (node:* / builtin / non-JS),
+                    // it can't be value-walked (members are native) — re-emit it as
+                    // an `import * as` statement. User-module namespaces are left to
+                    // be inlined + member-pruned by the JS side.
+                    if (foundEnvironment) {
+                        if (auto* nsModuleEnv = dynamicDowncast<JSC::JSModuleEnvironment>(current)) {
+                            if (JSC::AbstractModuleRecord* nsRecord = nsModuleEnv->moduleRecord()) {
+                                auto nsEntry = nsRecord->tryGetImportEntry(nameImpl.get());
+                                if (nsEntry && nsEntry->type == JSC::AbstractModuleRecord::ImportEntryType::Namespace) {
+                                    JSC::AbstractModuleRecord* nsSrc = nsRecord->hostResolveImportedModule(globalObject, nsEntry->moduleRequest);
+                                    RETURN_IF_EXCEPTION(scope, {});
+                                    bool nsExternal = true;
+                                    if (nsSrc) {
+                                        auto* jsmod = dynamicDowncast<JSC::JSModuleRecord>(nsSrc);
+                                        nsExternal = !jsmod || Bun::isBuiltinModule(nsSrc->moduleKey().string());
+                                    }
+                                    if (nsExternal) {
+                                        isImport = true;
+                                        importKind = "namespace"_s;
+                                        importSpecifier = nsEntry->moduleRequest.string();
+                                        importExportedName = "*"_s;
+                                        importExternal = true;
+                                        // Re-emit the import; don't read the value.
+                                        foundEnvironment = nullptr;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Found locally (or shadowed) — stop walking.
+                    break;
+                }
+            }
+
+            // Not a local slot. If `current` is a module environment, the name
+            // may be a named/default import binding — resolve it against the
+            // exporting module and capture its value + import metadata.
+            auto* moduleEnv = dynamicDowncast<JSC::JSModuleEnvironment>(current);
+            if (!moduleEnv)
+                continue;
+
+            JSC::AbstractModuleRecord* recordA = moduleEnv->moduleRecord();
+            if (!recordA)
+                break;
+
+            std::optional<JSC::AbstractModuleRecord::ImportEntry> importEntry = recordA->tryGetImportEntry(nameImpl.get());
+            if (!importEntry) {
+                // Not an import declared by this module — keep walking outward.
+                continue;
+            }
+
+            // Namespace imports (`import * as ns`) are already captured as a
+            // local scope slot above; never double-handle them here.
+            if (importEntry->type == JSC::AbstractModuleRecord::ImportEntryType::Namespace)
+                break;
+
+            importSpecifier = importEntry->moduleRequest.string();
+            if (importEntry->importName == vm.propertyNames->defaultKeyword) {
+                importKind = "default"_s;
+                importExportedName = "default"_s;
+            } else {
+                importKind = "named"_s;
+                importExportedName = importEntry->importName.string();
+            }
+            isImport = true;
+
+            // Resolve the binding through any re-export / star chains to the
+            // terminal module + local name. For an already-evaluated module (the
+            // closure is running) this is a pure lookup and does not throw.
+            JSC::AbstractModuleRecord::Resolution res = recordA->resolveImport(globalObject, JSC::Identifier::fromUid(vm, nameImpl.get()));
+            if (res.type == JSC::AbstractModuleRecord::Resolution::Type::Resolved && res.moduleRecord) {
+                if (res.localName.impl() == vm.propertyNames->starNamespacePrivateName.impl()) {
+                    // Re-exported namespace (`export * as ns from "..."`): the
+                    // binding's value is the target module's namespace object.
+                    // Capture it directly so the JS side inlines + prunes its
+                    // referenced members, like a direct `import * as ns`.
+                    importNamespaceValue = res.moduleRecord->getModuleNamespace(globalObject, false);
+                    RETURN_IF_EXCEPTION(scope, {});
+                } else if (JSC::JSModuleEnvironment* mEnv = res.moduleRecord->moduleEnvironmentMayBeNull()) {
+                    JSC::SymbolTable* mTable = mEnv->symbolTable();
+                    JSC::ConcurrentJSLocker mLocker(mTable->m_lock);
+                    auto mIter = mTable->find(mLocker, res.localName.impl());
+                    if (mIter != mTable->end(mLocker)) {
+                        const JSC::SymbolTableEntry& mEntry = mIter->value;
+                        if (!mEntry.isNull() && mEntry.varOffset().isScope()) {
+                            offset = mEntry.scopeOffset();
+                            isReadOnly = mEntry.isReadOnly();
+                            // The value (and its cell identity) lives in M's env.
+                            foundEnvironment = mEnv;
+                        }
+                    }
+                }
+            }
+
+            // Classify the import source as external (re-emit the import
+            // statement) vs inlinable (a user JS file we can serialize from).
+            importExternal = true;
+            JSC::AbstractModuleRecord* srcRecord = recordA->hostResolveImportedModule(globalObject, importEntry->moduleRequest);
+            if (srcRecord) {
+                auto* jsmod = dynamicDowncast<JSC::JSModuleRecord>(srcRecord);
+                importExternal = !jsmod || Bun::isBuiltinModule(srcRecord->moduleKey().string());
+            }
+
+            // Import resolved — stop walking. M's lock (if taken) was released
+            // above. A's lock was already released before this point.
+            break;
+        }
+
+        if (!foundEnvironment && !isImport)
+            continue;
+
+        JSC::JSValue value;
+        if (foundEnvironment) {
+            value = readEnvironmentVariable(foundEnvironment, offset);
+            // Empty means the binding is in its temporal dead zone / not yet
+            // initialized — skip rather than expose the JSC empty sentinel.
+            if (!value || value.isEmpty())
+                value = {};
+        } else if (importNamespaceValue) {
+            // Re-exported namespace value captured directly; inline it (the
+            // target module is a real JS file we can serialize from).
+            value = importNamespaceValue;
+            importExternal = false;
+        }
+
+        // For non-import free vars (and inlinable imports) a missing/empty value
+        // means there is nothing to capture — skip. External imports still emit
+        // a descriptor (with value: undefined) so the JS side can re-emit the
+        // import statement.
+        if (!value || value.isEmpty()) {
+            if (!(isImport && importExternal))
+                continue;
+        }
+
+        double cellId = 0;
+        double scopeIdNumber = 0;
+        if (foundEnvironment) {
+            uint64_t scopeId = idTable.idForEnvironment(foundEnvironment);
+            // Pack (scopeId, offset) into one stable, JS-safe-integer cell id.
+            // Scope offsets are small; 20 bits is far more than any real function.
+            ASSERT(offset.offset() < (1u << 20));
+            cellId = static_cast<double>(scopeId) * (1u << 20) + offset.offset();
+            scopeIdNumber = static_cast<double>(scopeId);
+        }
+
+        JSC::JSObject* descriptor = JSC::constructEmptyObject(globalObject);
+        descriptor->putDirect(vm, JSC::Identifier::fromString(vm, "name"_s), JSC::jsString(vm, WTF::String { static_cast<WTF::StringImpl*>(nameImpl.get()) }), 0);
+        descriptor->putDirect(vm, JSC::Identifier::fromString(vm, "id"_s), JSC::jsNumber(cellId), 0);
+        descriptor->putDirect(vm, JSC::Identifier::fromString(vm, "scopeId"_s), JSC::jsNumber(scopeIdNumber), 0);
+        descriptor->putDirect(vm, JSC::Identifier::fromString(vm, "value"_s), (value && !value.isEmpty()) ? value : JSC::jsUndefined(), 0);
+        descriptor->putDirect(vm, JSC::Identifier::fromString(vm, "kind"_s), JSC::jsString(vm, String(isReadOnly ? "const"_s : "let"_s)), 0);
+
+        if (isImport) {
+            JSC::JSObject* importInfo = JSC::constructEmptyObject(globalObject);
+            importInfo->putDirect(vm, JSC::Identifier::fromString(vm, "source"_s), JSC::jsString(vm, importSpecifier), 0);
+            importInfo->putDirect(vm, JSC::Identifier::fromString(vm, "importedName"_s), JSC::jsString(vm, importExportedName), 0);
+            importInfo->putDirect(vm, JSC::Identifier::fromString(vm, "kind"_s), JSC::jsString(vm, importKind), 0);
+            importInfo->putDirect(vm, JSC::Identifier::fromString(vm, "external"_s), JSC::jsBoolean(importExternal), 0);
+            descriptor->putDirect(vm, JSC::Identifier::fromString(vm, "import"_s), importInfo, 0);
+        }
+
+        result->putDirectIndex(globalObject, nextIndex++, descriptor);
+        RETURN_IF_EXCEPTION(scope, {});
+    }
+
+    RELEASE_AND_RETURN(scope, JSC::JSValue::encode(result));
+}
+
+// ===================== Symbol.boundFunction (experimental) =====================
+// For a bound function (the result of Function.prototype.bind), returns a plain
+// object { target, boundThis, boundArgs } exposing its internals so a serializer
+// can reconstruct `target.bind(boundThis, ...boundArgs)`. Returns undefined for
+// any function that is not a bound function. Bound functions otherwise stringify
+// as "[native code]", hiding what they wrap.
+JSC_DEFINE_CUSTOM_GETTER(functionBoundDetailsGetter, (JSC::JSGlobalObject * globalObject, JSC::EncodedJSValue thisValue, JSC::PropertyName))
+{
+    JSC::VM& vm = JSC::getVM(globalObject);
+    auto scope = DECLARE_THROW_SCOPE(vm);
+
+    JSC::JSBoundFunction* bound = dynamicDowncast<JSC::JSBoundFunction>(JSC::JSValue::decode(thisValue));
+    if (!bound)
+        return JSC::JSValue::encode(JSC::jsUndefined());
+
+    JSC::JSArray* boundArgs = bound->boundArgsCopy(globalObject);
+    RETURN_IF_EXCEPTION(scope, {});
+
+    JSC::JSObject* result = JSC::constructEmptyObject(globalObject);
+    result->putDirect(vm, JSC::Identifier::fromString(vm, "target"_s), bound->targetFunction(), 0);
+    result->putDirect(vm, JSC::Identifier::fromString(vm, "boundThis"_s), bound->boundThis(), 0);
+    result->putDirect(vm, JSC::Identifier::fromString(vm, "boundArgs"_s),
+        boundArgs ? JSC::JSValue(boundArgs) : JSC::JSValue(JSC::constructEmptyArray(globalObject, nullptr)), 0);
+    RETURN_IF_EXCEPTION(scope, {});
+
+    return JSC::JSValue::encode(result);
+}
+
+// ===================== Symbol.sourceLocation (experimental) =====================
+// Returns { url, line, column } for where a JavaScript function was defined
+// (1-based line/column), or undefined for native functions. Line/column are
+// remapped through the module's source map so they point at the ORIGINAL source
+// (e.g. the .ts), matching how stack traces are reported, rather than the
+// transpiled output JSC actually executes.
+extern "C" bool Bun__resolveSourceMapPosition(void* bunVM, const BunString* path, int lineZeroBased, int columnZeroBased, int* outLineZeroBased, int* outColumnZeroBased, BunString* outSourceUrl);
+
+JSC_DEFINE_CUSTOM_GETTER(functionSourceLocationGetter, (JSC::JSGlobalObject * globalObject, JSC::EncodedJSValue thisValue, JSC::PropertyName))
+{
+    JSC::VM& vm = JSC::getVM(globalObject);
+
+    JSC::JSFunction* function = dynamicDowncast<JSC::JSFunction>(JSC::JSValue::decode(thisValue));
+    if (!function || function->isHostFunction())
+        return JSC::JSValue::encode(JSC::jsUndefined());
+
+    JSC::FunctionExecutable* executable = function->jsExecutable();
+    if (!executable)
+        return JSC::JSValue::encode(JSC::jsUndefined());
+
+    const JSC::SourceCode& source = executable->source();
+    JSC::SourceProvider* provider = source.provider();
+    WTF::String url = provider ? provider->sourceURL() : WTF::String();
+
+    // Generated position (1-based, in the transpiled output). `lastLine` is the definition's
+    // final line — a serializer uses it to bound a source map when `toString()` reprints the
+    // source onto more lines than the original spans.
+    int line = executable->firstLine();
+    int column = executable->startColumn();
+    int endLine = executable->lastLine();
+
+    // Remap to the original source through the module's source map when present. Both the
+    // start and end lines are remapped with the SAME (generated-file) url, BEFORE `url` is
+    // reassigned to any map-named original source.
+    if (!url.isEmpty()) {
+        BunString pathStr = Bun::toString(url);
+        int mappedLine = 0;
+        int mappedColumn = 0;
+        // Receives an owned remapped filename when the map (e.g. a chained input
+        // map) names a different source than the loaded file; empty otherwise.
+        BunString mappedUrl = BunStringEmpty;
+        if (Bun__resolveSourceMapPosition(defaultGlobalObject(globalObject)->bunVM(), &pathStr, line - 1, column - 1, &mappedLine, &mappedColumn, &mappedUrl)) {
+            line = mappedLine + 1;
+            column = mappedColumn + 1;
+            int mappedEndLine = 0;
+            int mappedEndColumn = 0;
+            BunString endUrl = BunStringEmpty;
+            if (Bun__resolveSourceMapPosition(defaultGlobalObject(globalObject)->bunVM(), &pathStr, endLine - 1, 0, &mappedEndLine, &mappedEndColumn, &endUrl)) {
+                endLine = mappedEndLine + 1;
+                if (endUrl.tag != BunStringTag::Empty && endUrl.tag != BunStringTag::Dead) {
+                    endUrl.deref();
+                }
+            }
+            if (mappedUrl.tag != BunStringTag::Empty && mappedUrl.tag != BunStringTag::Dead) {
+                url = mappedUrl.toWTFString();
+                mappedUrl.deref();
+            }
+        }
+    }
+
+    JSC::JSObject* result = JSC::constructEmptyObject(globalObject);
+    result->putDirect(vm, JSC::Identifier::fromString(vm, "url"_s), JSC::jsString(vm, url), 0);
+    result->putDirect(vm, JSC::Identifier::fromString(vm, "line"_s), JSC::jsNumber(line), 0);
+    result->putDirect(vm, JSC::Identifier::fromString(vm, "column"_s), JSC::jsNumber(column), 0);
+    result->putDirect(vm, JSC::Identifier::fromString(vm, "endLine"_s), JSC::jsNumber(endLine), 0);
+    return JSC::JSValue::encode(result);
+}
+
+// ===================== Symbol.privateFields (experimental) =====================
+// Returns an object's own private (`#name`) instance fields as an array of
+// { name: "#name", value }. Private fields are otherwise unreadable via
+// reflection; a serializer uses this to snapshot a class instance's private
+// state. Returns an empty array for objects without private fields.
+JSC_DEFINE_CUSTOM_GETTER(objectPrivateFieldsGetter, (JSC::JSGlobalObject * globalObject, JSC::EncodedJSValue thisValue, JSC::PropertyName))
+{
+    JSC::VM& vm = JSC::getVM(globalObject);
+    auto scope = DECLARE_THROW_SCOPE(vm);
+
+    JSC::JSArray* result = JSC::constructEmptyArray(globalObject, nullptr);
+    RETURN_IF_EXCEPTION(scope, {});
+
+    JSC::JSObject* object = JSC::JSValue::decode(thisValue).getObject();
+    if (!object)
+        return JSC::JSValue::encode(result);
+
+    JSC::PropertyNameArrayBuilder propertyNames(vm, JSC::PropertyNameMode::Symbols, JSC::PrivateSymbolMode::Include);
+    object->methodTable()->getOwnPropertyNames(object, globalObject, propertyNames, JSC::DontEnumPropertiesMode::Include);
+    RETURN_IF_EXCEPTION(scope, {});
+
+    unsigned index = 0;
+    for (const auto& identifier : propertyNames) {
+        WTF::UniquedStringImpl* uid = identifier.impl();
+        if (!uid || !uid->isSymbol() || !static_cast<WTF::SymbolImpl*>(uid)->isPrivate())
+            continue;
+        // Only own data fields (private methods/accessors are recreated from the
+        // class source, not snapshotted as instance state). A private accessor's slot
+        // holds a GetterSetter — skip it (putDirect would otherwise assert/misbehave).
+        JSC::JSValue value = object->getDirect(vm, identifier);
+        if (!value || value.isGetterSetter() || value.isCustomGetterSetter())
+            continue;
+
+        JSC::JSObject* entry = JSC::constructEmptyObject(globalObject);
+        // The private symbol's description already includes the leading "#".
+        entry->putDirect(vm, JSC::Identifier::fromString(vm, "name"_s), JSC::jsString(vm, WTF::String { static_cast<WTF::StringImpl*>(uid) }), 0);
+        entry->putDirect(vm, JSC::Identifier::fromString(vm, "value"_s), value, 0);
+        result->putDirectIndex(globalObject, index++, entry);
+        RETURN_IF_EXCEPTION(scope, {});
+    }
+
+    return JSC::JSValue::encode(result);
+}
+
 // This is like `putDirectBuiltinFunction` but for the global static list.
 #define globalBuiltinFunction(vm, globalObject, identifier, function, attributes) JSC::JSGlobalObject::GlobalPropertyInfo(identifier, JSFunction::create(vm, function, globalObject), attributes)
 
@@ -2940,6 +3654,11 @@ void GlobalObject::addBuiltinGlobals(JSC::VM& vm)
         GlobalPropertyInfo(builtinNames.peekPromiseStatusPrivateName(), JSFunction::create(vm, this, 1, String(), jsBunPeekPromiseStatus, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
         GlobalPropertyInfo(builtinNames.peekPromiseSettledValuePrivateName(), JSFunction::create(vm, this, 1, String(), jsBunPeekPromiseSettledValue, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
         GlobalPropertyInfo(builtinNames.pokePromiseAsHandledPrivateName(), JSFunction::create(vm, this, 1, String(), jsBunPokePromiseAsHandled, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
+        GlobalPropertyInfo(builtinNames.resolveClosureBindingPrivateName(), JSFunction::create(vm, this, 2, String(), functionResolveClosureBinding, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
+        GlobalPropertyInfo(builtinNames.weakCollectionSnapshotPrivateName(), JSFunction::create(vm, this, 1, String(), functionWeakCollectionSnapshot, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
+        GlobalPropertyInfo(builtinNames.finalizationRegistrySnapshotPrivateName(), JSFunction::create(vm, this, 1, String(), functionFinalizationRegistrySnapshot, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
+        GlobalPropertyInfo(builtinNames.bunClosureUnserializableTagPrivateName(), JSFunction::create(vm, this, 1, String(), functionBunClosureUnserializableTag, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
+        GlobalPropertyInfo(builtinNames.bunGeneratorStatePrivateName(), JSFunction::create(vm, this, 1, String(), functionBunGeneratorState, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
         GlobalPropertyInfo(builtinNames.getInternalWritableStreamPrivateName(), JSFunction::create(vm, this, 1, String(), getInternalWritableStream, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
         GlobalPropertyInfo(builtinNames.createWritableStreamFromInternalPrivateName(), JSFunction::create(vm, this, 1, String(), createWritableStreamFromInternal, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
         GlobalPropertyInfo(builtinNames.fulfillModuleSyncPrivateName(), JSFunction::create(vm, this, 1, String(), functionFulfillModuleSync, ImplementationVisibility::Public), PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly),
@@ -3049,6 +3768,82 @@ void GlobalObject::addBuiltinGlobals(JSC::VM& vm)
     consoleObject->putDirectCustomAccessor(vm, Identifier::fromString(vm, "Console"_s), CustomGetterSetter::create(vm, getConsoleConstructor, nullptr), PropertyAttribute::CustomValue | 0);
     consoleObject->putDirectCustomAccessor(vm, Identifier::fromString(vm, "_stdout"_s), CustomGetterSetter::create(vm, getConsoleStdout, nullptr), PropertyAttribute::DontEnum | PropertyAttribute::CustomValue | 0);
     consoleObject->putDirectCustomAccessor(vm, Identifier::fromString(vm, "_stderr"_s), CustomGetterSetter::create(vm, getConsoleStderr, nullptr), PropertyAttribute::DontEnum | PropertyAttribute::CustomValue | 0);
+
+    // ----- Symbol.freeVariables (experimental) -----
+    // Exposes a closure's captured (free) variables as `fn[Symbol.freeVariables]`,
+    // returning a plain object mapping variable name -> current value. The symbol
+    // and the Function.prototype accessor are keyed by the same registered symbol
+    // so `fn[Symbol.freeVariables]` resolves to the accessor below.
+    {
+        const auto freeVariablesKey = "Symbol.freeVariables"_s;
+        this->functionPrototype()->putDirectCustomAccessor(vm,
+            JSC::Identifier::fromUid(vm.symbolRegistry().symbolForKey(freeVariablesKey)),
+            JSC::CustomGetterSetter::create(vm, functionFreeVariablesGetter, nullptr),
+            PropertyAttribute::DontEnum | PropertyAttribute::ReadOnly | PropertyAttribute::CustomAccessor | 0);
+
+        JSC::JSValue symbolConstructorValue = this->get(this, JSC::Identifier::fromString(vm, "Symbol"_s));
+        RETURN_IF_EXCEPTION(scope, );
+        if (JSC::JSObject* symbolConstructor = symbolConstructorValue.getObject()) {
+            symbolConstructor->putDirect(vm, JSC::Identifier::fromString(vm, "freeVariables"_s),
+                JSC::Symbol::create(vm, vm.symbolRegistry().symbolForKey(freeVariablesKey)),
+                PropertyAttribute::DontEnum | PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly | 0);
+        }
+    }
+
+    // ----- Symbol.boundFunction (experimental) -----
+    // Exposes a bound function's internals as `fn[Symbol.boundFunction]`.
+    {
+        const auto boundFunctionKey = "Symbol.boundFunction"_s;
+        this->functionPrototype()->putDirectCustomAccessor(vm,
+            JSC::Identifier::fromUid(vm.symbolRegistry().symbolForKey(boundFunctionKey)),
+            JSC::CustomGetterSetter::create(vm, functionBoundDetailsGetter, nullptr),
+            PropertyAttribute::DontEnum | PropertyAttribute::ReadOnly | PropertyAttribute::CustomAccessor | 0);
+
+        JSC::JSValue symbolConstructorValue = this->get(this, JSC::Identifier::fromString(vm, "Symbol"_s));
+        RETURN_IF_EXCEPTION(scope, );
+        if (JSC::JSObject* symbolConstructor = symbolConstructorValue.getObject()) {
+            symbolConstructor->putDirect(vm, JSC::Identifier::fromString(vm, "boundFunction"_s),
+                JSC::Symbol::create(vm, vm.symbolRegistry().symbolForKey(boundFunctionKey)),
+                PropertyAttribute::DontEnum | PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly | 0);
+        }
+    }
+
+    // ----- Symbol.sourceLocation (experimental) -----
+    // Exposes a function's definition site as `fn[Symbol.sourceLocation]`.
+    {
+        const auto sourceLocationKey = "Symbol.sourceLocation"_s;
+        this->functionPrototype()->putDirectCustomAccessor(vm,
+            JSC::Identifier::fromUid(vm.symbolRegistry().symbolForKey(sourceLocationKey)),
+            JSC::CustomGetterSetter::create(vm, functionSourceLocationGetter, nullptr),
+            PropertyAttribute::DontEnum | PropertyAttribute::ReadOnly | PropertyAttribute::CustomAccessor | 0);
+
+        JSC::JSValue symbolConstructorValue = this->get(this, JSC::Identifier::fromString(vm, "Symbol"_s));
+        RETURN_IF_EXCEPTION(scope, );
+        if (JSC::JSObject* symbolConstructor = symbolConstructorValue.getObject()) {
+            symbolConstructor->putDirect(vm, JSC::Identifier::fromString(vm, "sourceLocation"_s),
+                JSC::Symbol::create(vm, vm.symbolRegistry().symbolForKey(sourceLocationKey)),
+                PropertyAttribute::DontEnum | PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly | 0);
+        }
+    }
+
+    // ----- Symbol.privateFields (experimental) -----
+    // Exposes an object's own private (`#name`) instance fields as
+    // `obj[Symbol.privateFields]`. Accessor lives on Object.prototype.
+    {
+        const auto privateFieldsKey = "Symbol.privateFields"_s;
+        this->objectPrototype()->putDirectCustomAccessor(vm,
+            JSC::Identifier::fromUid(vm.symbolRegistry().symbolForKey(privateFieldsKey)),
+            JSC::CustomGetterSetter::create(vm, objectPrivateFieldsGetter, nullptr),
+            PropertyAttribute::DontEnum | PropertyAttribute::ReadOnly | PropertyAttribute::CustomAccessor | 0);
+
+        JSC::JSValue symbolConstructorValue = this->get(this, JSC::Identifier::fromString(vm, "Symbol"_s));
+        RETURN_IF_EXCEPTION(scope, );
+        if (JSC::JSObject* symbolConstructor = symbolConstructorValue.getObject()) {
+            symbolConstructor->putDirect(vm, JSC::Identifier::fromString(vm, "privateFields"_s),
+                JSC::Symbol::create(vm, vm.symbolRegistry().symbolForKey(privateFieldsKey)),
+                PropertyAttribute::DontEnum | PropertyAttribute::DontDelete | PropertyAttribute::ReadOnly | 0);
+        }
+    }
 }
 
 // ===================== start conditional builtin globals =====================

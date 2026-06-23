@@ -2694,6 +2694,17 @@ fn transpile_source_code_inner(
                             list: core::mem::take(&mut entry.sourcemap).into_vec(),
                         },
                     );
+                    // A cache hit skips the print path that chains the module's
+                    // own input map. The raw source still carries the
+                    // //# sourceMappingURL= comment, so scan it here (bounded to
+                    // the file tail) to keep input-map chaining working on hits.
+                    if let Some(url) =
+                        bun_sourcemap::find_source_mapping_url_in_tail(&source.contents)
+                    {
+                        // SAFETY: per fn contract — `jsc_vm` is the live per-thread VM.
+                        unsafe { &mut (*jsc_vm).source_mappings }
+                            .put_input_map_from_url(path.text, url.slice());
+                    }
                     // Rebuild the cached ESM record for the
                     // isolation source-provider cache (same shape as
                     // `RuntimeTranspilerStore`).
@@ -2859,6 +2870,11 @@ fn transpile_source_code_inner(
 
                 let is_commonjs_module = parse_result.ast.has_commonjs_export_names
                     || parse_result.ast.exports_kind == bun_ast::ExportsKind::Cjs;
+                // The loaded module's own `//# sourceMappingURL=` pragma, if any.
+                // `Span` is `Copy`; grab it before the print block consumes
+                // `parse_result`, then chain it after the base map is stored.
+                let input_source_map_url: Option<bun_ast::Span> =
+                    parse_result.ast.source_mapping_url;
                 // Collect the ESM record while printing, for the isolation
                 // source-provider cache (same shape as `RuntimeTranspilerStore`).
                 // SAFETY: per fn contract — `jsc_vm` is the live per-thread VM.
@@ -2953,6 +2969,22 @@ fn transpile_source_code_inner(
                         }
                     }
                     print_result?;
+                }
+
+                // Chain the loaded module's own source map (M4): the base
+                // generated map was just stored (put_mappings ran during print);
+                // decode this module's `//# sourceMappingURL=` and remember it so
+                // stack frames / Symbol.sourceLocation resolve through to the
+                // original source rather than stopping at the loaded file.
+                if let Some(span) = input_source_map_url {
+                    // SAFETY: per fn contract — `jsc_vm` is the live per-thread
+                    // VM; `span.text` points into the still-live parse arena and
+                    // is copied into owned allocations by the decode.
+                    unsafe {
+                        (*jsc_vm)
+                            .source_mappings
+                            .put_input_map_from_url(path.text, span.text.slice());
+                    }
                 }
 
                 if is_main {

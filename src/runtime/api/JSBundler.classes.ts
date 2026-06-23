@@ -19,6 +19,10 @@ export default [
         fn: "scan",
         length: 2,
       },
+      ast: {
+        fn: "ast",
+        length: 1,
+      },
       transform: {
         fn: "transform",
         length: 2,

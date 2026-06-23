@@ -897,14 +897,22 @@ pub fn parse_url(
                         let Some(comma) = after.iter().position(|&b| b == b',') else {
                             break 'try_data_url;
                         };
-                        if &after[..comma] != b"base64" {
-                            break 'try_data_url;
+                        // The header is one or more `;`-separated media params,
+                        // e.g. `base64` or `charset=utf-8;base64` (what tsc /
+                        // esbuild / webpack emit). `base64` may appear in any
+                        // segment; if absent the payload is raw (URL-encoded)
+                        // text, matching the no-param `data:application/json,`
+                        // arm below.
+                        let header = &after[..comma];
+                        let data = &after[comma + 1..];
+                        let is_base64 = header.split(|&b| b == b';').any(|seg| seg == b"base64");
+                        if !is_base64 {
+                            break 'json_bytes data;
                         }
-                        let base64_data = &after[comma + 1..];
 
-                        let len = bun_base64::decode_len(base64_data);
+                        let len = bun_base64::decode_len(data);
                         let bytes = arena.alloc_slice_fill_default::<u8>(len);
-                        let decoded = bun_base64::decode(bytes, base64_data);
+                        let decoded = bun_base64::decode(bytes, data);
                         if !decoded.is_successful() {
                             return Err(bun_core::err!("InvalidBase64"));
                         }
@@ -966,15 +974,10 @@ pub fn parse_json(
         return Err(bun_core::err!("InvalidSourceMap"));
     }
 
-    let sources_content = match json
-        .get(b"sourcesContent")
-        .ok_or_else(|| bun_core::err!("InvalidSourceMap"))?
-        .data
-        .as_e_array()
-    {
-        Some(arr) => arr,
-        None => return Err(bun_core::err!("InvalidSourceMap")),
-    };
+    // `sourcesContent` is OPTIONAL per the source map v3 spec; absent (or not an
+    // array) means no inline source contents are available. tsc, the closure
+    // serializer, and many other tools routinely omit it.
+    let sources_content = json.get(b"sourcesContent").and_then(|v| v.data.as_e_array());
 
     let sources_paths = match json
         .get(b"sources")
@@ -986,15 +989,19 @@ pub fn parse_json(
         None => return Err(bun_core::err!("InvalidSourceMap")),
     };
 
-    if sources_content.items.len_u32() != sources_paths.items.len_u32() {
-        return Err(bun_core::err!("InvalidSourceMap"));
+    // When present, `sourcesContent` must align 1:1 with `sources`; when absent
+    // there is simply no inline content to validate.
+    if let Some(sc) = sources_content {
+        if sc.items.len_u32() != sources_paths.items.len_u32() {
+            return Err(bun_core::err!("InvalidSourceMap"));
+        }
     }
 
     let source_only = matches!(hint, ParseUrlResultHint::SourceOnly(_));
 
     // `Vec<Box<[u8]>>` drops automatically on error.
     let source_paths_slice: Option<Vec<Box<[u8]>>> = if !source_only {
-        let mut v: Vec<Box<[u8]>> = Vec::with_capacity(sources_content.items.len_u32() as usize);
+        let mut v: Vec<Box<[u8]>> = Vec::with_capacity(sources_paths.items.len_u32() as usize);
         for item in sources_paths.items.slice() {
             let Some(s) = item.data.as_e_string() else {
                 return Err(bun_core::err!("InvalidSourceMap"));
@@ -1090,9 +1097,11 @@ pub fn parse_json(
     let content_slice: Option<Box<[u8]>> = match source_index {
         Some(idx)
             if !matches!(hint, ParseUrlResultHint::MappingsOnly)
-                && (idx as usize) < sources_content.items.len_u32() as usize =>
+                && sources_content
+                    .is_some_and(|sc| (idx as usize) < sc.items.len_u32() as usize) =>
         'content: {
-            let item = &sources_content.items.slice()[idx as usize];
+            let sc = sources_content.unwrap();
+            let item = &sc.items.slice()[idx as usize];
             let Some(estr) = item.data.as_e_string() else {
                 break 'content None;
             };
@@ -1185,8 +1194,21 @@ pub fn append_source_map_chunk<'a>(
     Ok(())
 }
 
+/// Like [`find_source_mapping_url_u8`] but only scans the file's tail. The
+/// `//# sourceMappingURL=` comment is conventionally the last line, so this
+/// bounds the cost when re-scanning a large cached module that has no map (the
+/// common case) instead of walking the whole buffer. An inline `data:` map whose
+/// URL is longer than the window won't be found — acceptable on the cache-hit
+/// path, where the cache-miss parse path already captured it via the lexer.
+pub fn find_source_mapping_url_in_tail(source: &[u8]) -> Option<bun_core::zig_string::Slice> {
+    // Generous enough for realistic inline maps; external-map refs are tiny.
+    const MAX_TAIL: usize = 64 * 1024;
+    let start = source.len().saturating_sub(MAX_TAIL);
+    find_source_mapping_url_u8(&source[start..])
+}
+
 /// Always returns UTF-8.
-fn find_source_mapping_url_u8(source: &[u8]) -> Option<bun_core::zig_string::Slice> {
+pub fn find_source_mapping_url_u8(source: &[u8]) -> Option<bun_core::zig_string::Slice> {
     const NEEDLE: &[u8] = b"\n//# sourceMappingURL=";
     let found = bun_core::strings::last_index_of(source, NEEDLE)?;
     let start = found + NEEDLE.len();

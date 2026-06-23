@@ -2392,6 +2392,7 @@ impl Data {
                         Some(e) => Some(e.deep_clone_no_detach(bump)?),
                         None => None,
                     },
+                    extends_loc: el.extends_loc,
                     body_loc: el.body_loc,
                     close_brace_loc: el.close_brace_loc,
                     properties,

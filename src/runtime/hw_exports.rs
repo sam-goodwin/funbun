@@ -87,6 +87,66 @@ pub fn remap_stack_frame_positions(
     unsafe { vm.remap_stack_frame_positions(frames, frames_count) };
 }
 
+/// `Bun__resolveSourceMapPosition(vm, path, line, column, out_line, out_column) -> bool`
+/// Maps a generated `(line, column)` for the module at `path` to its original
+/// source position via the module's registered source map (the same mechanism
+/// stack-trace remapping uses). All line/column values are **zero-based**.
+/// Returns `false` (leaving the out-params untouched) when no mapping exists.
+///
+/// # Safety
+/// `path`/`out_line`/`out_column` must be valid C++ stack locals.
+// HOST_EXPORT(Bun__resolveSourceMapPosition, c)
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn resolve_source_map_position(
+    vm: &mut VirtualMachine,
+    path: *const bun_core::String,
+    line_zero_based: i32,
+    column_zero_based: i32,
+    out_line: *mut i32,
+    out_column: *mut i32,
+    out_source_url: *mut bun_core::String,
+) -> bool {
+    // SAFETY: `path` is a valid C++ stack local (see ZigGlobalObject.cpp).
+    let path_utf8 = unsafe { (*path).to_utf8() };
+    let p = path_utf8.slice();
+    if p.is_empty() {
+        return false;
+    }
+    match vm.resolve_source_mapping(
+        p,
+        bun_core::Ordinal(line_zero_based),
+        bun_core::Ordinal(column_zero_based),
+        bun_sourcemap::SourceContentHandling::NoSourceContents,
+    ) {
+        Some(lookup) => {
+            let ol = lookup.mapping.original.lines.0;
+            let oc = lookup.mapping.original.columns.0;
+            if ol < 0 {
+                return false;
+            }
+            // SAFETY: `out_line`/`out_column` are valid C++ stack out-params.
+            unsafe {
+                *out_line = ol;
+                *out_column = oc;
+            }
+            // Remap the source FILENAME too when the map names a different source
+            // (e.g. a chained input map points the loaded file at its original).
+            // Hand C++ an OWNED clone (it derefs); `display_source_url_if_needed`
+            // returns `None` for same-file transpile maps, leaving the url as-is.
+            if !out_source_url.is_null() {
+                if let Some(name) = lookup.display_source_url_if_needed(p) {
+                    let owned = bun_core::String::clone_utf8(name.to_utf8().slice());
+                    name.deref();
+                    // SAFETY: `out_source_url` is a valid C++ stack out-param.
+                    unsafe { *out_source_url = owned };
+                }
+            }
+            true
+        }
+        None => false,
+    }
+}
+
 /// `export fn Bun__VirtualMachine__setOverrideModuleRunMain(vm, is_patched)`
 // HOST_EXPORT(Bun__VirtualMachine__setOverrideModuleRunMain, c)
 pub fn set_override_module_run_main(vm: &mut VirtualMachine, is_patched: bool) {

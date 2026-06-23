@@ -1047,6 +1047,145 @@ interface ErrorConstructor {
   stackTraceLimit: number;
 }
 
+/**
+ * **Experimental.** A descriptor of a single variable a closure captures, as
+ * returned by `fn[Symbol.freeVariables]`.
+ */
+interface FreeVariableDescriptor {
+  /** The variable's name. */
+  name: string;
+  /**
+   * A stable id for the underlying variable *cell*. Two closures that close
+   * over the same variable observe the same id — so a serializer can represent
+   * a shared mutable binding once and have both closures reference it.
+   */
+  id: number;
+  /**
+   * A stable id for the *scope* (environment instance) the variable lives in.
+   * Cells from the same scope share a `scopeId`, so they can be grouped to
+   * reconstruct a shared environment.
+   */
+  scopeId: number;
+  /** The variable's current value. */
+  value: any;
+  /**
+   * `"const"` for read-only bindings, `"let"` otherwise. `var` and parameters
+   * are not distinguished from `let` after compilation.
+   */
+  kind: "const" | "let";
+  /**
+   * Present when the variable is an ES-module import. `value` holds the imported
+   * value. A serializer can inline that value, or — when `external` is `true`
+   * (`node:*` / builtin / native bindings, which have no serializable source) —
+   * re-emit an `import` statement instead.
+   */
+  import?: {
+    /** The module specifier as written, e.g. `"./util.ts"` or `"node:fs"`. */
+    source: string;
+    /** The exported name in the source module (`"default"` for default imports). */
+    importedName: string;
+    kind: "named" | "default" | "namespace";
+    /** Whether the source module is external/native (can't be inlined). */
+    external: boolean;
+  };
+}
+
+interface SymbolConstructor {
+  /**
+   * **Experimental.** A well-known symbol used to read the free variables a
+   * closure captures.
+   *
+   * Accessing `fn[Symbol.freeVariables]` returns an array of
+   * {@link FreeVariableDescriptor} objects describing the variables `fn` — or
+   * any closure nested within it — captures from an enclosing scope:
+   *
+   * - Variables the closure transitively references (function-local or
+   *   module-level) are included; unrelated bindings in the same scope are not.
+   * - True globals (e.g. `console`) and module imports are ambient and excluded.
+   * - `const` bindings whose initializer is a compile-time constant are folded
+   *   into the function's code and therefore do not appear.
+   *
+   * Native (non-JavaScript) functions return an empty array.
+   *
+   * @experimental This is a Bun-specific primitive and may change.
+   *
+   * @example
+   * ```ts
+   * let count = 0;
+   * const increment = () => { count += 1 };
+   * increment();
+   * increment[Symbol.freeVariables];
+   * // [{ name: "count", id: 1048576, scopeId: 1, value: 1, kind: "let" }]
+   * ```
+   */
+  readonly freeVariables: unique symbol;
+
+  /**
+   * **Experimental.** A well-known symbol exposing a bound function's internals.
+   *
+   * `fn[Symbol.boundFunction]` returns `{ target, boundThis, boundArgs }` for a
+   * function created with `Function.prototype.bind`, or `undefined` for any
+   * other function.
+   *
+   * @experimental
+   */
+  readonly boundFunction: unique symbol;
+
+  /**
+   * **Experimental.** A well-known symbol exposing a function's definition site.
+   *
+   * `fn[Symbol.sourceLocation]` returns `{ url, line, column }` (1-based) for
+   * where a JavaScript function was defined, or `undefined` for native
+   * functions.
+   *
+   * @experimental
+   */
+  readonly sourceLocation: unique symbol;
+}
+
+/** **Experimental.** A bound function's internals — see {@link SymbolConstructor.boundFunction}. */
+interface BoundFunctionDetails {
+  target: Function;
+  boundThis: unknown;
+  boundArgs: unknown[];
+}
+
+/** **Experimental.** A function's definition site — see {@link SymbolConstructor.sourceLocation}. */
+interface FunctionSourceLocation {
+  url: string;
+  line: number;
+  column: number;
+}
+
+interface Function {
+  /**
+   * **Experimental.** The free variables this closure captures, as an array of
+   * {@link FreeVariableDescriptor} objects.
+   *
+   * @experimental
+   * @see {@link SymbolConstructor.freeVariables}
+   */
+  readonly [Symbol.freeVariables]: FreeVariableDescriptor[];
+
+  /**
+   * **Experimental.** This bound function's internals, or `undefined` if it is
+   * not a bound function.
+   *
+   * @experimental
+   * @see {@link SymbolConstructor.boundFunction}
+   */
+  readonly [Symbol.boundFunction]: BoundFunctionDetails | undefined;
+
+  /**
+   * **Experimental.** This function's definition site, or `undefined` for native
+   * functions.
+   *
+   * @experimental
+   * @see {@link SymbolConstructor.sourceLocation}
+   */
+  readonly [Symbol.sourceLocation]: FunctionSourceLocation | undefined;
+}
+
 interface ArrayBufferConstructor {
   new (byteLength: number, options: { maxByteLength?: number }): ArrayBuffer;
 }

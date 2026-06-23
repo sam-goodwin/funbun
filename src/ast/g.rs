@@ -59,6 +59,9 @@ pub struct Class {
     pub ts_decorators: ExprNodeList,
     pub class_name: Option<LocRef>,
     pub extends: Option<ExprNodeIndex>,
+    // Start of the heritage clause (the first token after `extends`, before any wrapping parens).
+    // EMPTY when there's no `extends`.
+    pub extends_loc: crate::Loc,
     pub body_loc: crate::Loc,
     pub close_brace_loc: crate::Loc,
     pub properties: StoreSlice<Property>,
@@ -73,6 +76,7 @@ impl Default for Class {
             ts_decorators: bun_alloc::AstAlloc::vec(),
             class_name: None,
             extends: None,
+            extends_loc: crate::Loc::EMPTY,
             body_loc: crate::Loc::EMPTY,
             close_brace_loc: crate::Loc::EMPTY,
             properties: StoreSlice::EMPTY,
@@ -129,6 +133,9 @@ pub struct Comment {
 pub struct ClassStaticBlock {
     pub stmts: Vec<Stmt, bun_alloc::AstAlloc>,
     pub loc: crate::Loc,
+    // Position of the block's closing `}`. Lets a source-rewriting consumer empty the block
+    // (`static { ... }` → `static {}`) by AST position rather than brace-matching by hand.
+    pub close_loc: crate::Loc,
 }
 
 impl Default for ClassStaticBlock {
@@ -136,6 +143,7 @@ impl Default for ClassStaticBlock {
         Self {
             stmts: bun_alloc::AstAlloc::vec(),
             loc: crate::Loc::default(),
+            close_loc: crate::Loc::default(),
         }
     }
 }
@@ -165,6 +173,21 @@ pub struct Property {
     pub value: Option<ExprNodeIndex>,
 
     pub ts_metadata: TypeScript::Metadata,
+
+    // Source span of a class-field initializer (the text after `=`, up to its terminator):
+    // `initializer_start` is just past the `=`, `initializer_end` is the terminating `;`/`}`.
+    // EMPTY when there's no initializer. A consumer that rewrites class source (the closure
+    // serializer) uses these to neutralize an initializer's eager side effects without a
+    // hand-rolled scanner — the `initializer` Expr's own loc starts INSIDE any grouping parens.
+    pub initializer_start: crate::Loc,
+    pub initializer_end: crate::Loc,
+
+    // The class member's true start position — the first token of the member, BEFORE any
+    // leading modifiers (`static`/`get`/`set`/`async`/`*`) or decorators, which precede the key.
+    // EMPTY for non-class-member properties (object-literal properties / patterns). Lets a
+    // consumer that rewrites class source (the closure serializer's method pruning) delete a whole
+    // member by AST offset — `[member[i].start, member[i+1].start)` — without a hand-rolled scanner.
+    pub member_start: crate::Loc,
 }
 
 pub type PropertyList = Vec<Property, bun_alloc::AstAlloc>;
@@ -180,6 +203,9 @@ impl Default for Property {
             key: None,
             value: None,
             ts_metadata: TypeScript::Metadata::MNone,
+            initializer_start: crate::Loc::EMPTY,
+            initializer_end: crate::Loc::EMPTY,
+            member_start: crate::Loc::EMPTY,
         }
     }
 }
@@ -210,6 +236,7 @@ impl Property {
         if let Some(csb_ref) = self.class_static_block_ref() {
             let new_block: &mut ClassStaticBlock = bump.alloc(ClassStaticBlock {
                 loc: csb_ref.loc,
+                close_loc: csb_ref.close_loc,
                 stmts: bun_alloc::AstAlloc::vec_from_slice(csb_ref.stmts.slice()),
             });
             class_static_block = Some(crate::StoreRef::from_bump(new_block));
@@ -235,6 +262,9 @@ impl Property {
                 None => None,
             },
             ts_metadata: self.ts_metadata.clone(),
+            initializer_start: self.initializer_start,
+            initializer_end: self.initializer_end,
+            member_start: self.member_start,
         })
     }
 }
