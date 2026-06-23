@@ -1295,8 +1295,9 @@ function computeGenuineClasses(root: unknown, sharedIdsArg?: Set<number>): Genui
   // non-hostable escaped `#x` closure. (Same-name private collisions across the chain are
   // allowed — keys are namespaced by class id.)
   const candidate = new SetCtor<Function>();
+  const chainMemo = new MapCtor<Function, ChainSuffix>();
   for (const f of funcs) {
-    const chain = genuineChain(f, structOf, funcs, allMethods);
+    const chain = genuineChain(f, structOf, funcs, allMethods, chainMemo);
     if (chain) for (const c of chain) candidate.add(c);
   }
 
@@ -1394,29 +1395,72 @@ function computeGenuineMethods(
 // member is a parseable user class with ≥1 private field somewhere and no per-class
 // disqualifier; else null. Same-name private fields across the chain are fine — each class
 // writes its own genuine slot, namespaced by class id in the patch keys.
+// The genuine-chain SUFFIX result for a class: the leaf-first chain of user classes from this
+// class up to a terminal (Object / Function.prototype / a reconstructable builtin base), whether
+// any member declares a private field, and whether the suffix is `valid` (no member is a
+// non-reconstructable native base or per-class-disqualified). Memoized per class so an inheritance
+// chain — where each class's suffix is the next class's suffix plus itself — is resolved in O(depth)
+// TOTAL instead of re-walking the full suffix for every class (which made `class extends` chains
+// super-linear in depth).
+type ChainSuffix = { classes: Function[]; hasField: boolean; valid: boolean };
+function chainSuffix(
+  C: Function,
+  structOf: (C: Function) => ClassStructure | null,
+  funcs: Set<Function>,
+  allMethods: Set<Function>,
+  memo: Map<Function, ChainSuffix>,
+): ChainSuffix {
+  // Collect the unvisited prefix of the chain (leaf-first) until a memoized suffix, a terminal,
+  // or a disqualifier. Then fold the result downward and fill the memo for each visited class.
+  // Iterative (no recursion) so a very deep chain doesn't overflow the JS stack.
+  const pending: Array<{ C: Function; s: ClassStructure }> = [];
+  let cur: any = C;
+  let tail: ChainSuffix = { classes: [], hasField: false, valid: true };
+  while (true) {
+    if (typeof cur !== "function" || cur === Function.prototype) break; // terminal: valid, empty
+    const seen = memo.get(cur);
+    if (seen !== undefined) {
+      tail = seen;
+      break;
+    }
+    const s = structOf(cur);
+    if (s === null) {
+      // A builtin base we can reconstruct (its no-arg `super()` yields a valid empty instance and
+      // its content is restorable) ends the chain genuinely; any other native base rejects.
+      tail = { classes: [], hasField: false, valid: RECONSTRUCTABLE_BUILTIN_BASES.has(cur) };
+      break;
+    }
+    if (perClassDisqualified(cur, s.fields, funcs, allMethods)) {
+      tail = { classes: [], hasField: false, valid: false };
+      break;
+    }
+    pending.push({ C: cur, s });
+    cur = ObjectGetPrototypeOf(cur);
+  }
+  // Fold downward: each class prepends itself onto the suffix above it.
+  for (let i = pending.length - 1; i >= 0; i--) {
+    const { C: pc, s } = pending[i];
+    tail = tail.valid
+      ? { classes: [pc, ...tail.classes], hasField: tail.hasField || s.fields.length > 0, valid: true }
+      : { classes: [], hasField: false, valid: false };
+    memo.set(pc, tail);
+  }
+  return tail;
+}
+
+// Walk `C` and its superclass chain up to Object. Returns the chain (leaf-first) if every
+// member is a parseable user class with ≥1 private field somewhere and no per-class
+// disqualifier; else null. Same-name private fields across the chain are fine — each class
+// writes its own genuine slot, namespaced by class id in the patch keys.
 function genuineChain(
   C: Function,
   structOf: (C: Function) => ClassStructure | null,
   funcs: Set<Function>,
   allMethods: Set<Function>,
+  memo: Map<Function, ChainSuffix>,
 ): Function[] | null {
-  const chain: Function[] = [];
-  let hasField = false;
-  let cur: any = C;
-  while (typeof cur === "function" && cur !== Function.prototype) {
-    const s = structOf(cur);
-    if (s === null) {
-      // A builtin base we can reconstruct (its no-arg `super()` yields a valid empty instance
-      // and its content is restorable) ends the chain genuinely; any other native base rejects.
-      if (RECONSTRUCTABLE_BUILTIN_BASES.has(cur)) break;
-      return null;
-    }
-    if (s.fields.length > 0) hasField = true;
-    if (perClassDisqualified(cur, s.fields, funcs, allMethods)) return null;
-    chain.push(cur);
-    cur = ObjectGetPrototypeOf(cur);
-  }
-  return hasField ? chain : null;
+  const r = chainSuffix(C, structOf, funcs, allMethods, memo);
+  return r.valid && r.hasField ? r.classes : null;
 }
 
 // A stable per-genuine-class id, assigned on first use, for namespacing patch keys.
@@ -1465,6 +1509,12 @@ function classOwnMethods(C: Function): Set<Function> {
 // private — an escaped ordinary function whose `this` won't carry the genuine slot — can't
 // be served by genuine reconstruction. `allMethods` is every reachable class's methods.
 function perClassDisqualified(C: Function, fields: string[], funcs: Set<Function>, allMethods: Set<Function>): boolean {
+  // A class declaring no private fields can't be disqualified by a closure reading its (nonexistent)
+  // privates — `fields.some(...)` below is vacuously false. Short-circuit BEFORE the O(funcs) scan:
+  // a deep `class extends` chain has many fieldless members, and walking every reachable function
+  // (with a `toString()` each) for each of them is the dominant cost (it makes genuineChain O(funcs)
+  // per chain member, so serialization super-linear in chain depth).
+  if (fields.length === 0) return false;
   for (const g of funcs) {
     if (g === C || allMethods.has(g) || hostableEscapedArrow(g)) continue;
     let src: string;
@@ -2889,6 +2939,73 @@ function hasSlot(value: object, probe: Function): boolean {
   }
 }
 
+// The `.prototype` objects of every built-in `emitBuiltin` tests via `instanceof` (plus the
+// typed-array / DataView prototypes its `ArrayBufferIsView` branch covers). An object can only
+// match one of those `instanceof` checks if one of these prototypes is in its chain. Captured at
+// load (tamper-proof); built-ins absent in this realm are simply not added.
+const BUILTIN_PROTOTYPES: Set<object> = (() => {
+  const set = new SetCtor<object>();
+  const add = (p: unknown): void => {
+    if (p !== null && typeof p === "object") set.add(p as object);
+  };
+  add(DateCtor.prototype);
+  add(RegExpCtor.prototype);
+  add(MapCtor.prototype);
+  add(SetCtor.prototype);
+  add(NumberCtor.prototype);
+  add(StringCtor.prototype);
+  add(BooleanCtor.prototype);
+  add(WeakRefCtor.prototype);
+  add(WeakMapCtor.prototype);
+  add(WeakSetCtor.prototype);
+  add(ArrayBufferCtor.prototype);
+  if (SharedArrayBufferCtor !== undefined) add(SharedArrayBufferCtor.prototype);
+  if (typeof FinalizationRegistry !== "undefined") add(FinalizationRegistry.prototype);
+  if (typeof DataView !== "undefined") add(DataView.prototype);
+  // `%TypedArray%.prototype` — the shared base of every typed-array kind (Uint8Array, Float64Array,
+  // …). A typed array's chain is `instance → Uint8Array.prototype → %TypedArray%.prototype → …`, so
+  // this one entry covers them all (ArrayBufferIsView's targets).
+  add(ObjectGetPrototypeOf(Uint8ArrayCtor.prototype));
+  return set;
+})();
+
+// True iff one of the `BUILTIN_PROTOTYPES` lies in `value`'s prototype chain — i.e. `value` could
+// match one of `emitBuiltin`'s `instanceof` / `ArrayBufferIsView` checks. Memoized per prototype
+// object: the answer for an object depends only on its prototype chain, and every object sharing a
+// prototype shares the answer. Without the memo, `emitBuiltin` walks the full chain (~14 `instanceof`
+// checks) for EVERY object, so a depth-N `Object.create` / `class extends` chain costs O(N²); the
+// memo amortizes each prototype to O(1) (it recurses on the parent's cached answer), making the
+// whole chain O(N). The cache is keyed on the live prototype object via a WeakMap, so it can never
+// go stale across serialize() calls (a given proto object always yields the same answer) and is
+// reclaimed with its prototypes.
+const builtinChainCache = new WeakMapCtor<object, boolean>();
+function chainHasBuiltinPrototype(value: object): boolean {
+  let proto = ObjectGetPrototypeOf(value);
+  if (proto === null) return false;
+  const cached = builtinChainCache.get(proto);
+  if (cached !== undefined) return cached;
+  // Walk up, collecting prototypes whose answer isn't cached yet, until a cached/known result or
+  // the chain's end. Then fill every visited prototype's answer in one pass (iterative — a deep
+  // chain must not recurse on the JS stack).
+  const pending: object[] = [];
+  let result = false;
+  while (proto !== null) {
+    if (BUILTIN_PROTOTYPES.has(proto)) {
+      result = true;
+      break;
+    }
+    const seen = builtinChainCache.get(proto);
+    if (seen !== undefined) {
+      result = seen;
+      break;
+    }
+    pending.push(proto);
+    proto = ObjectGetPrototypeOf(proto);
+  }
+  for (let i = 0; i < pending.length; i++) builtinChainCache.set(pending[i], result);
+  return result;
+}
+
 // Reconstructs common built-in object types. Appends the construction to
 // ctx.module under `name` and returns the built-in's NATURAL prototype (so the
 // caller can detect and restore a subclass instance); returns null for plain
@@ -2921,6 +3038,11 @@ function emitBuiltin(value: object, name: string, ctx: Context): { proto: object
     }
     return { proto: PromiseCtor.prototype, body: NOOP_BODY };
   }
+  // Fast path: none of the `instanceof` / `ArrayBufferIsView` checks below can match unless a
+  // built-in's `.prototype` is in `value`'s chain. The memoized check is O(1) amortized, so a deep
+  // `Object.create` / `class extends` chain doesn't pay an O(depth) `instanceof` walk per object
+  // (which made serialization O(depth²)). Promise is slot-based ($isPromise, above) and unaffected.
+  if (!chainHasBuiltinPrototype(value)) return null;
   if (value instanceof DateCtor && hasSlot(value, slotProbeDate)) {
     ctx.module.push(`const ${name} = new Date(${(value as Date).getTime()});`);
     return {
@@ -3240,7 +3362,24 @@ interface BoundDetails {
 // chain doesn't overflow the stack.
 function capturedFunctions(fn: Function, ctx: Context): Function[] {
   if (ctx.hostedArrows.has(fn)) return [];
-  if ((fn as any)[Symbol.boundFunction] !== undefined) return [];
+  // A bound function's reconstruction (`target.bind(boundThis, ...boundArgs)`) emits each of
+  // target/boundThis/boundArgs via emitValue. Its plain-function parts are the edges along which
+  // emission would otherwise recurse — a deep chain of `base.bind(prev)` recurses through boundThis
+  // N deep and overflows the stack. Report them as dependency edges so emitFunction's post-order
+  // stack emits each before this bound function, and the bound branch's emitValue(...) resolves to
+  // an already-emitted ref. (Non-function parts — and callable Proxies, which emitFunction can't
+  // dispatch — keep their existing emitValue/emitObject path, which is already iterative.)
+  const bound = (fn as any)[Symbol.boundFunction] as BoundDetails | undefined;
+  if (bound !== undefined) {
+    const deps: Function[] = [];
+    const pushFn = (v: unknown): void => {
+      if (typeof v === "function" && !$isProxyObject(v)) deps.push(v as Function);
+    };
+    pushFn(bound.target);
+    pushFn(bound.boundThis);
+    for (const arg of bound.boundArgs) pushFn(arg);
+    return deps;
+  }
   if (ctx.genuineMethods.has(fn)) return [];
   let source: string;
   try {

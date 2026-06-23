@@ -9267,18 +9267,115 @@ describe("generality: built-ins", () => {
   // A Date carrying a recognizable time, captured through each position; the
   // returned accessor pulls it back out. Value + type asserted everywhere.
   describe.each([
-    ["free var", () => { const d = new Date(111); return () => d; }],
-    ["object property", () => { const d = new Date(111); const o = { d }; return () => o.d; }],
-    ["array element", () => { const d = new Date(111); const a = [0, d]; return () => a[1]; }],
-    ["Map key", () => { const d = new Date(111); const m = new Map([[d, "v"]]); return () => [...m.keys()][0]; }],
-    ["Map value", () => { const d = new Date(111); const m = new Map([["k", d]]); return () => m.get("k"); }],
-    ["Set member", () => { const d = new Date(111); const s = new Set([d]); return () => [...s][0]; }],
-    ["getter return", () => { const d = new Date(111); const o = { get x() { return d; } }; return () => o.x; }],
-    ["deeply nested", () => { const d = new Date(111); const o = { a: { b: { c: [{ d }] } } }; return () => o.a.b.c[0].d; }],
-    ["class static", () => { const d = new Date(111); class C { static d = d; } return () => C.d; }],
-    ["non-enumerable own prop", () => { const d = new Date(111); const o = {}; Object.defineProperty(o, "d", { value: d, enumerable: false }); return () => (o as any).d; }],
-    ["symbol-keyed prop", () => { const d = new Date(111); const S = Symbol.for("k"); const o = { [S]: d }; return () => o[S]; }],
-    ["#private field", () => { const d = new Date(111); class C { #d = d; get() { return this.#d; } } const c = new C(); return () => c.get(); }],
+    [
+      "free var",
+      () => {
+        const d = new Date(111);
+        return () => d;
+      },
+    ],
+    [
+      "object property",
+      () => {
+        const d = new Date(111);
+        const o = { d };
+        return () => o.d;
+      },
+    ],
+    [
+      "array element",
+      () => {
+        const d = new Date(111);
+        const a = [0, d];
+        return () => a[1];
+      },
+    ],
+    [
+      "Map key",
+      () => {
+        const d = new Date(111);
+        const m = new Map([[d, "v"]]);
+        return () => [...m.keys()][0];
+      },
+    ],
+    [
+      "Map value",
+      () => {
+        const d = new Date(111);
+        const m = new Map([["k", d]]);
+        return () => m.get("k");
+      },
+    ],
+    [
+      "Set member",
+      () => {
+        const d = new Date(111);
+        const s = new Set([d]);
+        return () => [...s][0];
+      },
+    ],
+    [
+      "getter return",
+      () => {
+        const d = new Date(111);
+        const o = {
+          get x() {
+            return d;
+          },
+        };
+        return () => o.x;
+      },
+    ],
+    [
+      "deeply nested",
+      () => {
+        const d = new Date(111);
+        const o = { a: { b: { c: [{ d }] } } };
+        return () => o.a.b.c[0].d;
+      },
+    ],
+    [
+      "class static",
+      () => {
+        const d = new Date(111);
+        class C {
+          static d = d;
+        }
+        return () => C.d;
+      },
+    ],
+    [
+      "non-enumerable own prop",
+      () => {
+        const d = new Date(111);
+        const o = {};
+        Object.defineProperty(o, "d", { value: d, enumerable: false });
+        return () => (o as any).d;
+      },
+    ],
+    [
+      "symbol-keyed prop",
+      () => {
+        const d = new Date(111);
+        const S = Symbol.for("k");
+        const o = { [S]: d };
+        return () => o[S];
+      },
+    ],
+    [
+      "#private field",
+      () => {
+        const d = new Date(111);
+        class C {
+          #d = d;
+          get() {
+            return this.#d;
+          }
+        }
+        const c = new C();
+        return () => c.get();
+      },
+    ],
   ])("a Date at position: %s", (_pos, factory) => {
     test("preserves value and type", async () => {
       const accessor = (await roundtrip(factory as any))();
@@ -9290,10 +9387,44 @@ describe("generality: built-ins", () => {
 
   // A Map at a representative set of positions.
   describe.each([
-    ["object property", () => { const m = new Map([["k", 1]]); const o = { m }; return () => o.m; }],
-    ["Map value", () => { const inner = new Map([["k", 1]]); const m = new Map([["x", inner]]); return () => m.get("x"); }],
-    ["Set member", () => { const m = new Map([["k", 1]]); const s = new Set([m]); return () => [...s][0]; }],
-    ["#private field", () => { const m = new Map([["k", 1]]); class C { #m = m; g() { return this.#m; } } const c = new C(); return () => c.g(); }],
+    [
+      "object property",
+      () => {
+        const m = new Map([["k", 1]]);
+        const o = { m };
+        return () => o.m;
+      },
+    ],
+    [
+      "Map value",
+      () => {
+        const inner = new Map([["k", 1]]);
+        const m = new Map([["x", inner]]);
+        return () => m.get("x");
+      },
+    ],
+    [
+      "Set member",
+      () => {
+        const m = new Map([["k", 1]]);
+        const s = new Set([m]);
+        return () => [...s][0];
+      },
+    ],
+    [
+      "#private field",
+      () => {
+        const m = new Map([["k", 1]]);
+        class C {
+          #m = m;
+          g() {
+            return this.#m;
+          }
+        }
+        const c = new C();
+        return () => c.g();
+      },
+    ],
   ])("a Map at position: %s", (_pos, factory) => {
     test("preserves entries and type", async () => {
       const m = (await roundtrip(factory as any))()();
@@ -9456,15 +9587,87 @@ describe("generality: built-ins", () => {
 
   // ── OWN-PROPERTY generality on every builtin kind ────────────────────────────
   test.each([
-    ["Map", () => { const m = new Map([["k", 1]]); (m as any).meta = "hi"; return m; }, (o: any) => expect(o.meta).toBe("hi")],
-    ["Set", () => { const s = new Set([1]); (s as any).tag = "t"; return s; }, (o: any) => expect(o.tag).toBe("t")],
-    ["Date", () => { const d = new Date(1); (d as any).x = "dx"; return d; }, (o: any) => expect(o.x).toBe("dx")],
-    ["RegExp", () => { const r = /a/; (r as any).y = "ry"; return r; }, (o: any) => expect(o.y).toBe("ry")],
-    ["typed array", () => { const a = new Uint8Array([1, 2]); (a as any).label = "L"; return a; }, (o: any) => expect(o.label).toBe("L")],
-    ["ArrayBuffer", () => { const b = new ArrayBuffer(2); (b as any).z = "z"; return b; }, (o: any) => expect(o.z).toBe("z")],
-    ["boxed Number", () => { const x = new Number(3); (x as any).w = "w"; return x; }, (o: any) => expect(o.w).toBe("w")],
-    ["WeakMap", () => { const m = new WeakMap(); (m as any).v = "wmv"; return m; }, (o: any) => expect(o.v).toBe("wmv")],
-    ["Error", () => { const e = new Error("e"); (e as any).code = "C"; return e; }, (o: any) => expect(o.code).toBe("C")],
+    [
+      "Map",
+      () => {
+        const m = new Map([["k", 1]]);
+        (m as any).meta = "hi";
+        return m;
+      },
+      (o: any) => expect(o.meta).toBe("hi"),
+    ],
+    [
+      "Set",
+      () => {
+        const s = new Set([1]);
+        (s as any).tag = "t";
+        return s;
+      },
+      (o: any) => expect(o.tag).toBe("t"),
+    ],
+    [
+      "Date",
+      () => {
+        const d = new Date(1);
+        (d as any).x = "dx";
+        return d;
+      },
+      (o: any) => expect(o.x).toBe("dx"),
+    ],
+    [
+      "RegExp",
+      () => {
+        const r = /a/;
+        (r as any).y = "ry";
+        return r;
+      },
+      (o: any) => expect(o.y).toBe("ry"),
+    ],
+    [
+      "typed array",
+      () => {
+        const a = new Uint8Array([1, 2]);
+        (a as any).label = "L";
+        return a;
+      },
+      (o: any) => expect(o.label).toBe("L"),
+    ],
+    [
+      "ArrayBuffer",
+      () => {
+        const b = new ArrayBuffer(2);
+        (b as any).z = "z";
+        return b;
+      },
+      (o: any) => expect(o.z).toBe("z"),
+    ],
+    [
+      "boxed Number",
+      () => {
+        const x = new Number(3);
+        (x as any).w = "w";
+        return x;
+      },
+      (o: any) => expect(o.w).toBe("w"),
+    ],
+    [
+      "WeakMap",
+      () => {
+        const m = new WeakMap();
+        (m as any).v = "wmv";
+        return m;
+      },
+      (o: any) => expect(o.v).toBe("wmv"),
+    ],
+    [
+      "Error",
+      () => {
+        const e = new Error("e");
+        (e as any).code = "C";
+        return e;
+      },
+      (o: any) => expect(o.code).toBe("C"),
+    ],
   ])("an enumerable own prop survives on a %s", async (_kind, make, assert) => {
     const v = make();
     void v;
@@ -9493,7 +9696,13 @@ describe("generality: built-ins", () => {
 
   test("an accessor own prop on a Date survives as an accessor", async () => {
     const d = new Date(1);
-    Object.defineProperty(d, "acc", { get() { return 99; }, enumerable: true, configurable: true });
+    Object.defineProperty(d, "acc", {
+      get() {
+        return 99;
+      },
+      enumerable: true,
+      configurable: true,
+    });
     void d;
     const out = (await roundtrip(() => d))();
     const desc = Object.getOwnPropertyDescriptor(out, "acc")!;
@@ -9520,7 +9729,10 @@ describe("generality: built-ins", () => {
   });
 
   test("a Map with BOTH entries AND extra own props keeps both", async () => {
-    const m = new Map([["a", 1], ["b", 2]]) as any;
+    const m = new Map([
+      ["a", 1],
+      ["b", 2],
+    ]) as any;
     m.meta = { t: true };
     void m;
     const out = (await roundtrip(() => m))();
@@ -9711,26 +9923,43 @@ describe("generality: built-ins", () => {
   const double = (_k: string, v: unknown) => (typeof v === "number" ? v * 2 : v);
 
   test("a replacer transforms Map values", async () => {
-    const root = ((m: Map<string, number>) => () => m)(new Map([["a", 1], ["b", 2]]));
+    const root = (
+      (m: Map<string, number>) => () =>
+        m
+    )(
+      new Map([
+        ["a", 1],
+        ["b", 2],
+      ]),
+    );
     const out = (await roundtripWith(root, double))();
     expect(out.get("a")).toBe(2);
     expect(out.get("b")).toBe(4);
   });
 
   test("a replacer transforms Set members", async () => {
-    const root = ((s: Set<number>) => () => s)(new Set([1, 2, 3]));
+    const root = (
+      (s: Set<number>) => () =>
+        s
+    )(new Set([1, 2, 3]));
     const out = (await roundtripWith(root, double))();
     expect([...out].sort((a, b) => a - b)).toEqual([2, 4, 6]);
   });
 
   test("a replacer transforms a value at depth (Map in Map)", async () => {
-    const root = ((m: Map<string, Map<string, number>>) => () => m)(new Map([["x", new Map([["y", 5]])]]));
+    const root = (
+      (m: Map<string, Map<string, number>>) => () =>
+        m
+    )(new Map([["x", new Map([["y", 5]])]]));
     const out = (await roundtripWith(root, double))();
     expect(out.get("x")!.get("y")).toBe(10);
   });
 
   test("a replacer transforms an Error's custom field", async () => {
-    const root = ((e: Error) => () => e)(Object.assign(new Error("m"), { count: 3 }));
+    const root = (
+      (e: Error) => () =>
+        e
+    )(Object.assign(new Error("m"), { count: 3 }));
     const out = (await roundtripWith(root, double))();
     expect((out as any).count).toBe(6);
   });
@@ -9738,14 +9967,25 @@ describe("generality: built-ins", () => {
   test("a replacer transforms inside a cyclic Map without breaking the cycle", async () => {
     const m = new Map<string, any>([["n", 4]]);
     m.set("self", m);
-    const root = ((mm: typeof m) => () => mm)(m);
+    const root = (
+      (mm: typeof m) => () =>
+        mm
+    )(m);
     const out = (await roundtripWith(root, double))();
     expect(out.get("n")).toBe(8);
     expect(out.get("self")).toBe(out);
   });
 
   test("a replacer dropping a specific key's value does not corrupt the collection", async () => {
-    const root = ((m: Map<string, number>) => () => m)(new Map([["keep", 1], ["drop", 2]]));
+    const root = (
+      (m: Map<string, number>) => () =>
+        m
+    )(
+      new Map([
+        ["keep", 1],
+        ["drop", 2],
+      ]),
+    );
     // Only the "drop" entry's value is replaced with undefined; every other value
     // (and the Map itself) passes through unchanged.
     const out = (await roundtripWith(root, (k: string, v: unknown) => (k === "drop" ? undefined : v)))();
@@ -9847,9 +10087,30 @@ describe("generality: built-ins", () => {
 
   // ── boxed primitives, WeakRef, AggregateError, settled Promise ───────────────
   test.each([
-    ["Number", () => new Number(42), (o: any) => { expect(o).toBeInstanceOf(Number); expect(o.valueOf()).toBe(42); }],
-    ["String", () => new String("hi"), (o: any) => { expect(o).toBeInstanceOf(String); expect(o.valueOf()).toBe("hi"); }],
-    ["Boolean", () => new Boolean(true), (o: any) => { expect(o).toBeInstanceOf(Boolean); expect(o.valueOf()).toBe(true); }],
+    [
+      "Number",
+      () => new Number(42),
+      (o: any) => {
+        expect(o).toBeInstanceOf(Number);
+        expect(o.valueOf()).toBe(42);
+      },
+    ],
+    [
+      "String",
+      () => new String("hi"),
+      (o: any) => {
+        expect(o).toBeInstanceOf(String);
+        expect(o.valueOf()).toBe("hi");
+      },
+    ],
+    [
+      "Boolean",
+      () => new Boolean(true),
+      (o: any) => {
+        expect(o).toBeInstanceOf(Boolean);
+        expect(o.valueOf()).toBe(true);
+      },
+    ],
   ])("a boxed %s round-trips", async (_kind, make, assert) => {
     const v = make();
     void v;
@@ -9949,13 +10210,93 @@ describe("generality: built-ins", () => {
   }
 
   test.each([
-    ["Date", ((d: Date) => () => d)(new Date(999)), (root: any) => { const d = root(); expect(d).toBeInstanceOf(Date); expect(d.getTime()).toBe(999); }],
-    ["Map", ((m: Map<string, number>) => () => m)(new Map([["a", 1], ["b", 2]])), (root: any) => { const m = root(); expect(m.get("a")).toBe(1); expect(m.get("b")).toBe(2); }],
-    ["Set", ((s: Set<number>) => () => s)(new Set([1, 2, 3])), (root: any) => { const s = root(); expect([...s]).toEqual([1, 2, 3]); }],
-    ["RegExp", ((r: RegExp) => () => r)(/ab+/gi), (root: any) => { const r = root(); expect(r.source).toBe("ab+"); expect(r.flags).toBe("gi"); }],
-    ["Error", ((e: Error) => () => e)(Object.assign(new TypeError("x"), { code: "E" })), (root: any) => { const e = root(); expect(e).toBeInstanceOf(TypeError); expect(e.code).toBe("E"); }],
-    ["typed array", ((a: Int32Array) => () => a)(new Int32Array([5, 6, 7])), (root: any) => { const a = root(); expect([...a]).toEqual([5, 6, 7]); }],
-    ["AggregateError", ((e: AggregateError) => () => e)(new AggregateError([new Error("a")], "agg")), (root: any) => { const e = root(); expect(e.message).toBe("agg"); expect(e.errors.length).toBe(1); }],
+    [
+      "Date",
+      (
+        (d: Date) => () =>
+          d
+      )(new Date(999)),
+      (root: any) => {
+        const d = root();
+        expect(d).toBeInstanceOf(Date);
+        expect(d.getTime()).toBe(999);
+      },
+    ],
+    [
+      "Map",
+      (
+        (m: Map<string, number>) => () =>
+          m
+      )(
+        new Map([
+          ["a", 1],
+          ["b", 2],
+        ]),
+      ),
+      (root: any) => {
+        const m = root();
+        expect(m.get("a")).toBe(1);
+        expect(m.get("b")).toBe(2);
+      },
+    ],
+    [
+      "Set",
+      (
+        (s: Set<number>) => () =>
+          s
+      )(new Set([1, 2, 3])),
+      (root: any) => {
+        const s = root();
+        expect([...s]).toEqual([1, 2, 3]);
+      },
+    ],
+    [
+      "RegExp",
+      (
+        (r: RegExp) => () =>
+          r
+      )(/ab+/gi),
+      (root: any) => {
+        const r = root();
+        expect(r.source).toBe("ab+");
+        expect(r.flags).toBe("gi");
+      },
+    ],
+    [
+      "Error",
+      (
+        (e: Error) => () =>
+          e
+      )(Object.assign(new TypeError("x"), { code: "E" })),
+      (root: any) => {
+        const e = root();
+        expect(e).toBeInstanceOf(TypeError);
+        expect(e.code).toBe("E");
+      },
+    ],
+    [
+      "typed array",
+      (
+        (a: Int32Array) => () =>
+          a
+      )(new Int32Array([5, 6, 7])),
+      (root: any) => {
+        const a = root();
+        expect([...a]).toEqual([5, 6, 7]);
+      },
+    ],
+    [
+      "AggregateError",
+      (
+        (e: AggregateError) => () =>
+          e
+      )(new AggregateError([new Error("a")], "agg")),
+      (root: any) => {
+        const e = root();
+        expect(e.message).toBe("agg");
+        expect(e.errors.length).toBe(1);
+      },
+    ],
   ] as const)("a captured %s round-trips idempotently across 3 rounds", async (_kind, root, assert) => {
     await reserialize3(root as any, assert as any);
   });
@@ -9963,7 +10304,10 @@ describe("generality: built-ins", () => {
   test("a cyclic Map round-trips idempotently across 3 rounds", async () => {
     const m = new Map<string, any>();
     m.set("self", m);
-    const root = ((mm: typeof m) => () => mm)(m);
+    const root = (
+      (mm: typeof m) => () =>
+        mm
+    )(m);
     await reserialize3(root, (r: any) => {
       const out = r();
       expect(out.get("self")).toBe(out);
@@ -9973,7 +10317,10 @@ describe("generality: built-ins", () => {
   test("an aliased Date round-trips idempotently across 3 rounds", async () => {
     const d = new Date(1);
     const o = { a: d, b: d };
-    const root = ((x: typeof o) => () => x)(o);
+    const root = (
+      (x: typeof o) => () =>
+        x
+    )(o);
     await reserialize3(root, (r: any) => {
       const out = r();
       expect(out.a).toBe(out.b);
@@ -10040,7 +10387,10 @@ describe("generality: function & class integrity", () => {
   const kinds: Kind[] = [
     {
       name: "frozen function",
-      make: () => Object.freeze(function f(a: number) { return a; }),
+      make: () =>
+        Object.freeze(function f(a: number) {
+          return a;
+        }),
       assert: v => {
         expect(Object.isFrozen(v)).toBe(true);
         expect(v(5)).toBe(5);
@@ -10049,7 +10399,10 @@ describe("generality: function & class integrity", () => {
     },
     {
       name: "sealed function",
-      make: () => Object.seal(function f(a: number) { return a; }),
+      make: () =>
+        Object.seal(function f(a: number) {
+          return a;
+        }),
       assert: v => {
         expect(Object.isSealed(v)).toBe(true);
         expect(Object.isFrozen(v)).toBe(false);
@@ -10058,7 +10411,10 @@ describe("generality: function & class integrity", () => {
     },
     {
       name: "non-extensible function",
-      make: () => Object.preventExtensions(function f(a: number) { return a; }),
+      make: () =>
+        Object.preventExtensions(function f(a: number) {
+          return a;
+        }),
       assert: v => {
         expect(Object.isExtensible(v)).toBe(false);
         expect(Object.isSealed(v)).toBe(false);
@@ -10084,7 +10440,14 @@ describe("generality: function & class integrity", () => {
     },
     {
       name: "frozen class",
-      make: () => Object.freeze(class C { m() { return 1; } }),
+      make: () =>
+        Object.freeze(
+          class C {
+            m() {
+              return 1;
+            }
+          },
+        ),
       assert: v => {
         expect(Object.isFrozen(v)).toBe(true);
         expect(new v().m()).toBe(1);
@@ -10128,7 +10491,9 @@ describe("generality: function & class integrity", () => {
       // composition: frozen + renamed + overridden length + frozen prototype + own prop
       name: "kitchen sink (frozen + name + length + frozen proto + own prop)",
       make: () => {
-        function K(a: number) { return a; }
+        function K(a: number) {
+          return a;
+        }
         (K as any).tag = "T";
         Object.defineProperty(K, "name", { value: "Renamed", configurable: true });
         Object.defineProperty(K, "length", { value: 9, configurable: true });
@@ -10237,7 +10602,9 @@ describe("generality: name & length matrix", () => {
   test("length override that matches natural arity round-trips", async () => {
     const f = await roundtrip(
       (() => {
-        function x(a: number, b: number) { return a + b; }
+        function x(a: number, b: number) {
+          return a + b;
+        }
         Object.defineProperty(x, "length", { value: 2, configurable: true });
         return x;
       })(),
@@ -10763,25 +11130,21 @@ describe("generality: nesting & recursion", () => {
     expect(g()).toBe(42);
   });
 
-  // The "too deeply nested" residual must be a CLEAN catchable TypeError, never a crash/hang/
-  // leaked RangeError. A bound-function chain (boundThis = previous) is the shape that still rides
-  // the recursive emission path; ~12k overflows here.
-  test("over-deep bound chain throws a clean TypeError, not a crash", () => {
+  // A deep bound-function chain (boundThis = previous) used to be the one shape that still rode the
+  // recursive emission path (~12k overflowed). It is now iterative (capturedFunctions reports a
+  // bound function's target/boundThis/boundArgs as post-order edges), so it serializes like every
+  // other deep graph — see "generality: deep bound-function chains". The serialize() try/catch that
+  // maps a residual stack-overflow RangeError to a clean "too deeply nested" TypeError remains a
+  // defensive backstop for any future pathological shape.
+  test("a deep bound chain serializes iteratively (no overflow)", async () => {
     function base() {
       return 1;
     }
     let cur: any = base.bind({ L: 1 });
     for (let i = 0; i < 15000; i++) cur = base.bind(cur);
     const root = cur;
-    let err: any;
-    try {
-      serialize(() => root);
-    } catch (e) {
-      err = e;
-    }
-    expect(err).toBeInstanceOf(TypeError);
-    expect(err).not.toBeInstanceOf(RangeError);
-    expect(err.message).toContain("too deeply nested");
+    const out = (await roundtrip(() => (root as () => number)()))();
+    expect(out).toBe(1);
   });
 });
 
@@ -10860,7 +11223,11 @@ describe("generality: native global references", () => {
       mapV: new Map([["k", Math]]),
       mapK: new Map([[Math, 1]]),
       set: new Set([Math]),
-      getter: { get g() { return Math; } },
+      getter: {
+        get g() {
+          return Math;
+        },
+      },
       cls: C,
       inst: new C(),
       proto: Object.create(Math),
@@ -10932,19 +11299,37 @@ describe("generality: destructuring captures", () => {
   describe("nesting", () => {
     test("4-level object nesting captures the leaf", async () => {
       const obj = { a: { b: { c: { d: 42 } } } };
-      const { a: { b: { c: { d } } } } = obj;
+      const {
+        a: {
+          b: {
+            c: { d },
+          },
+        },
+      } = obj;
       const out = await roundtrip(() => d);
       expect(out()).toBe(42);
     });
     test("6-level object nesting captures the leaf", async () => {
       const obj = { a: { b: { c: { d: { e: { f: 5 } } } } } };
-      const { a: { b: { c: { d: { e: { f } } } } } } = obj;
+      const {
+        a: {
+          b: {
+            c: {
+              d: {
+                e: { f },
+              },
+            },
+          },
+        },
+      } = obj;
       const out = await roundtrip(() => f);
       expect(out()).toBe(5);
     });
     test("mixed object/array pattern", async () => {
       const obj = { a: [{ b: 7 }] };
-      const { a: [{ b }] } = obj;
+      const {
+        a: [{ b }],
+      } = obj;
       const out = await roundtrip(() => b);
       expect(out()).toBe(7);
     });
@@ -10956,7 +11341,12 @@ describe("generality: destructuring captures", () => {
     });
     test("two bindings at different depths", async () => {
       const obj = { a: { b: 1, q: { c: 2 } } };
-      const { a: { b, q: { c } } } = obj;
+      const {
+        a: {
+          b,
+          q: { c },
+        },
+      } = obj;
       const out = await roundtrip(() => b + c);
       expect(out()).toBe(3);
     });
@@ -11077,7 +11467,8 @@ describe("generality: destructuring captures", () => {
       expect(out()).toBe(8);
     });
     test("computed key from an expression", async () => {
-      const k1 = "a", k2 = "b";
+      const k1 = "a",
+        k2 = "b";
       const o = { ab: 3 };
       const { [k1 + k2]: v } = o;
       const out = await roundtrip(() => v);
@@ -11106,7 +11497,10 @@ describe("generality: destructuring captures", () => {
     });
     test("computed key evaluated once is not re-run on reconstruction", async () => {
       let count = 0;
-      const k = (() => { count++; return "p"; })();
+      const k = (() => {
+        count++;
+        return "p";
+      })();
       const o = { p: 5 };
       const { [k]: v } = o;
       const out = await roundtrip(() => v);
@@ -11177,7 +11571,9 @@ describe("generality: destructuring captures", () => {
     });
     test("nested object rest", async () => {
       const o = { a: { b: 1, c: 2, d: 3 } };
-      const { a: { b, ...rest } } = o;
+      const {
+        a: { b, ...rest },
+      } = o;
       void b;
       const out = await roundtrip(() => rest);
       expect(out()).toEqual({ c: 2, d: 3 });
@@ -11242,7 +11638,10 @@ describe("generality: destructuring captures", () => {
     test("for-of Map entry array pattern", async () => {
       const m = new Map([["k", 10]]);
       let f!: () => number;
-      for (const [k, v] of m) { void k; f = () => v; }
+      for (const [k, v] of m) {
+        void k;
+        f = () => v;
+      }
       const out = await roundtrip(f);
       expect(out()).toBe(10);
     });
@@ -11250,33 +11649,49 @@ describe("generality: destructuring captures", () => {
       const data = [{ y: 10 }];
       let f!: () => number;
       let i = 0;
-      while (i < data.length) { const { y } = data[i]; f = () => y; i++; }
+      while (i < data.length) {
+        const { y } = data[i];
+        f = () => y;
+        i++;
+      }
       const out = await roundtrip(f);
       expect(out()).toBe(10);
     });
     test("catch clause destructure", async () => {
       let f!: () => string;
-      try { throw new Error("boom"); } catch ({ message }) { f = () => message as string; }
+      try {
+        throw new Error("boom");
+      } catch ({ message }) {
+        f = () => message as string;
+      }
       const out = await roundtrip(f);
       expect(out()).toBe("boom");
     });
     test("function parameter object pattern", async () => {
-      function mk({ p }: { p: number }) { return () => p; }
+      function mk({ p }: { p: number }) {
+        return () => p;
+      }
       const out = await roundtrip(mk({ p: 21 }));
       expect(out()).toBe(21);
     });
     test("function parameter array pattern", async () => {
-      function mk([p]: number[]) { return () => p; }
+      function mk([p]: number[]) {
+        return () => p;
+      }
       const out = await roundtrip(mk([22]));
       expect(out()).toBe(22);
     });
     test("function parameter nested pattern", async () => {
-      function mk({ a: { b } }: { a: { b: number } }) { return () => b; }
+      function mk({ a: { b } }: { a: { b: number } }) {
+        return () => b;
+      }
       const out = await roundtrip(mk({ a: { b: 23 } }));
       expect(out()).toBe(23);
     });
     test("function parameter pattern with default", async () => {
-      function mk({ p = 24 }: { p?: number }) { return () => p; }
+      function mk({ p = 24 }: { p?: number }) {
+        return () => p;
+      }
       const out = await roundtrip(mk({}));
       expect(out()).toBe(24);
     });
@@ -11301,7 +11716,9 @@ describe("generality: destructuring captures", () => {
       expect(got.get("k")).toBe(5);
     });
     test("destructured class instance", async () => {
-      class C { x = 7; }
+      class C {
+        x = 7;
+      }
       const o = { c: new C() };
       const { c } = o;
       const out = await roundtrip(() => c.x);
@@ -11335,7 +11752,12 @@ describe("generality: destructuring captures", () => {
     });
     test("destructured getter snapshots the value", async () => {
       let calls = 0;
-      const o = { get a() { calls++; return 50; } };
+      const o = {
+        get a() {
+          calls++;
+          return 50;
+        },
+      };
       const { a } = o;
       const out = await roundtrip(() => a);
       expect(out()).toBe(50);
@@ -11358,7 +11780,8 @@ describe("generality: destructuring captures", () => {
       }
     });
     test("inner destructure shadows outer", async () => {
-      const o1 = { a: 1 }, o2 = { a: 2 };
+      const o1 = { a: 1 },
+        o2 = { a: 2 };
       const { a } = o1;
       void a;
       {
@@ -11370,19 +11793,31 @@ describe("generality: destructuring captures", () => {
     test("shadow across a function boundary", async () => {
       const a = 1;
       void a;
-      function outer() { const o = { a: 2 }; const { a } = o; return () => a; }
+      function outer() {
+        const o = { a: 2 };
+        const { a } = o;
+        return () => a;
+      }
       const out = await roundtrip(outer());
       expect(out()).toBe(2);
     });
     test("body-local destructure shadows a captured outer name", async () => {
       const a = 5;
       void a;
-      const out = await roundtrip(() => { const o = { a: 99 }; const { a } = o; return a; });
+      const out = await roundtrip(() => {
+        const o = { a: 99 };
+        const { a } = o;
+        return a;
+      });
       expect(out()).toBe(99);
     });
     test("nested arrow captures a deeply-destructured binding", async () => {
       const o = { a: { b: { c: 13 } } };
-      const { a: { b: { c } } } = o;
+      const {
+        a: {
+          b: { c },
+        },
+      } = o;
       const out = await roundtrip(() => () => c);
       const inner = out();
       expect(inner()).toBe(13);
@@ -11400,7 +11835,8 @@ describe("generality: destructuring captures", () => {
     });
     test("second declarator default cross-references the first", async () => {
       const o1 = { a: 3 };
-      const { a } = o1, { b = a * 10 } = {} as { b?: number };
+      const { a } = o1,
+        { b = a * 10 } = {} as { b?: number };
       const out = await roundtrip(() => b);
       expect(out()).toBe(30);
     });
@@ -11409,28 +11845,45 @@ describe("generality: destructuring captures", () => {
   describe("destructuring inside the serialized body", () => {
     test("body destructures a captured object", async () => {
       const capObj = { a: 33 };
-      const out = await roundtrip(() => { const { a } = capObj; return a; });
+      const out = await roundtrip(() => {
+        const { a } = capObj;
+        return a;
+      });
       expect(out()).toBe(33);
     });
     test("body array destructure with a hole", async () => {
       const capArr = [1, 2, 3];
-      const out = await roundtrip(() => { const [, x] = capArr; return x; });
+      const out = await roundtrip(() => {
+        const [, x] = capArr;
+        return x;
+      });
       expect(out()).toBe(2);
     });
     test("body destructure default references another capture", async () => {
       const capObj: { z?: number } = {};
       const fallback = 77;
-      const out = await roundtrip(() => { const { z = fallback } = capObj; return z; });
+      const out = await roundtrip(() => {
+        const { z = fallback } = capObj;
+        return z;
+      });
       expect(out()).toBe(77);
     });
     test("body destructure computed key from a capture", async () => {
       const capObj = { dynk: 5 };
       const key = "dynk";
-      const out = await roundtrip(() => { const { [key]: v } = capObj; return v; });
+      const out = await roundtrip(() => {
+        const { [key]: v } = capObj;
+        return v;
+      });
       expect(out()).toBe(5);
     });
     test("destructure inside a parameter default expression", async () => {
-      const f = (x = (() => { const { q } = { q: 4 }; return q; })()) => x;
+      const f = (
+        x = (() => {
+          const { q } = { q: 4 };
+          return q;
+        })(),
+      ) => x;
       const out = await roundtrip(f);
       expect(out()).toBe(4);
     });
@@ -11524,11 +11977,41 @@ describe("generality: destructuring parameters", () => {
     class Cap {
       v = 5;
     }
-    expect((await roundtrip(function ({ x = obj }: any = {}) { return x.z; }))()).toBe(99);
-    expect((await roundtrip(function ({ x = cap }: any = {}) { return x(); }))()).toBe(100);
-    expect((await roundtrip(function ({ x = cap() }: any = {}) { return x; }))()).toBe(100);
-    expect((await roundtrip(function ({ x = map }: any = {}) { return x.get("k"); }))()).toBe(1);
-    expect((await roundtrip(function ({ x = Cap }: any = {}) { return new x().v; }))()).toBe(5);
+    expect(
+      (
+        await roundtrip(function ({ x = obj }: any = {}) {
+          return x.z;
+        })
+      )(),
+    ).toBe(99);
+    expect(
+      (
+        await roundtrip(function ({ x = cap }: any = {}) {
+          return x();
+        })
+      )(),
+    ).toBe(100);
+    expect(
+      (
+        await roundtrip(function ({ x = cap() }: any = {}) {
+          return x;
+        })
+      )(),
+    ).toBe(100);
+    expect(
+      (
+        await roundtrip(function ({ x = map }: any = {}) {
+          return x.get("k");
+        })
+      )(),
+    ).toBe(1);
+    expect(
+      (
+        await roundtrip(function ({ x = Cap }: any = {}) {
+          return new x().v;
+        })
+      )(),
+    ).toBe(5);
 
     const c2 = 42;
     const f3 = await roundtrip(function ({ a: { b = c2 } = {} }: any) {
@@ -11565,17 +12048,66 @@ describe("generality: destructuring parameters", () => {
   });
 
   test("deep nesting, holes, rest, renaming, whole-param defaults", async () => {
-    expect((await roundtrip(function ({ a: { b: { c } } }: any) { return c; }))({ a: { b: { c: 7 } } })).toBe(7);
-    expect((await roundtrip(function ([[{ x }]]: any) { return x; }))([[{ x: 9 }]])).toBe(9);
-    expect((await roundtrip(function ([, x]: any) { return x; }))([10, 20])).toBe(20);
-    expect((await roundtrip(function ([a, , c]: any) { return [a, c]; }))([1, 2, 3])).toEqual([1, 3]);
-    expect((await roundtrip(function ([a, ...rest]: any) { return [a, rest]; }))([1, 2, 3])).toEqual([1, [2, 3]]);
-    expect((await roundtrip(function ({ a, ...rest }: any) { return [a, rest]; }))({ a: 1, b: 2, c: 3 })).toEqual([
-      1,
-      { b: 2, c: 3 },
-    ]);
-    expect((await roundtrip(function ({ a: b = 5 }: any) { return b; }))({})).toBe(5);
-    expect((await roundtrip(function ({ a: b, c: d = 7 }: any) { return [b, d]; }))({ a: 1 })).toEqual([1, 7]);
+    expect(
+      (
+        await roundtrip(function ({
+          a: {
+            b: { c },
+          },
+        }: any) {
+          return c;
+        })
+      )({ a: { b: { c: 7 } } }),
+    ).toBe(7);
+    expect(
+      (
+        await roundtrip(function ([[{ x }]]: any) {
+          return x;
+        })
+      )([[{ x: 9 }]]),
+    ).toBe(9);
+    expect(
+      (
+        await roundtrip(function ([, x]: any) {
+          return x;
+        })
+      )([10, 20]),
+    ).toBe(20);
+    expect(
+      (
+        await roundtrip(function ([a, , c]: any) {
+          return [a, c];
+        })
+      )([1, 2, 3]),
+    ).toEqual([1, 3]);
+    expect(
+      (
+        await roundtrip(function ([a, ...rest]: any) {
+          return [a, rest];
+        })
+      )([1, 2, 3]),
+    ).toEqual([1, [2, 3]]);
+    expect(
+      (
+        await roundtrip(function ({ a, ...rest }: any) {
+          return [a, rest];
+        })
+      )({ a: 1, b: 2, c: 3 }),
+    ).toEqual([1, { b: 2, c: 3 }]);
+    expect(
+      (
+        await roundtrip(function ({ a: b = 5 }: any) {
+          return b;
+        })
+      )({}),
+    ).toBe(5);
+    expect(
+      (
+        await roundtrip(function ({ a: b, c: d = 7 }: any) {
+          return [b, d];
+        })
+      )({ a: 1 }),
+    ).toEqual([1, 7]);
 
     const f1 = await roundtrip(function ({ a, b }: any = { a: 1, b: 2 }) {
       return a + b;
@@ -11593,13 +12125,29 @@ describe("generality: destructuring parameters", () => {
 
   test("computed keys (captured string / Symbol.for / well-known) in param patterns", async () => {
     const key = "dyn";
-    expect((await roundtrip(function ({ [key]: v }: any) { return v; }))({ dyn: 55 })).toBe(55);
+    expect(
+      (
+        await roundtrip(function ({ [key]: v }: any) {
+          return v;
+        })
+      )({ dyn: 55 }),
+    ).toBe(55);
 
     const reg = Symbol.for("generality-param-sym");
-    expect((await roundtrip(function ({ [reg]: v }: any) { return v; }))({ [reg]: 9 })).toBe(9);
+    expect(
+      (
+        await roundtrip(function ({ [reg]: v }: any) {
+          return v;
+        })
+      )({ [reg]: 9 }),
+    ).toBe(9);
 
     expect(
-      (await roundtrip(function ({ [Symbol.iterator]: v }: any) { return typeof v; }))({ [Symbol.iterator]: () => {} }),
+      (
+        await roundtrip(function ({ [Symbol.iterator]: v }: any) {
+          return typeof v;
+        })
+      )({ [Symbol.iterator]: () => {} }),
     ).toBe("function");
   });
 
@@ -11655,5 +12203,47 @@ describe("generality: destructuring parameters", () => {
     const twice = await roundtrip(once);
     expect(twice({ a: 1 })).toBe(6);
     expect(twice.length).toBe(1);
+  });
+});
+
+describe("generality: deep bound-function chains", () => {
+  // A chain of bound functions whose boundThis is the previous bound function used to ride the
+  // RECURSIVE emission path (emitFunctionContent's bound branch → emitValue(boundThis) → ...),
+  // overflowing at ~9k deep (debug+ASAN) / ~12k (release) as the catchable "too deeply nested"
+  // TypeError. emitFunction's post-order stack now emits each link first, so a bound chain
+  // serializes like every other deep graph. Depth 20000 is well past the old overflow threshold.
+  test("deep boundThis chain round-trips and calls correctly", async () => {
+    function base() {
+      return 42;
+    }
+    let f: Function = base.bind({});
+    for (let i = 0; i < 20000; i++) f = base.bind(f);
+    const r = (await roundtrip(() => (f as () => number)()))();
+    expect(r).toBe(42);
+  });
+
+  test("deep bound-ARG chain round-trips and calls correctly", async () => {
+    function id(x: number) {
+      return x;
+    }
+    function pick(first: Function) {
+      return first();
+    }
+    let f: Function = id.bind(null, 7);
+    for (let i = 0; i < 20000; i++) f = pick.bind(null, f);
+    const r = (await roundtrip(() => (f as () => number)()))();
+    expect(r).toBe(7);
+  });
+
+  test("identity dedup: same bound function captured twice yields one binding", async () => {
+    function base(this: any, a: number) {
+      return a + (this?.n ?? 0);
+    }
+    const bound = base.bind({ n: 100 }, 5);
+    void bound;
+    const code = serialize(() => [(bound as any)(), (bound as any)()]);
+    expect(code.split(".bind(").length - 1).toBe(1);
+    const fn = await roundtrip(() => [(bound as any)(), (bound as any)()]);
+    expect(fn()).toEqual([105, 105]);
   });
 });
