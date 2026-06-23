@@ -181,6 +181,13 @@ pub struct Property {
     // hand-rolled scanner — the `initializer` Expr's own loc starts INSIDE any grouping parens.
     pub initializer_start: crate::Loc,
     pub initializer_end: crate::Loc,
+
+    // The class member's true start position — the first token of the member, BEFORE any
+    // leading modifiers (`static`/`get`/`set`/`async`/`*`) or decorators, which precede the key.
+    // EMPTY for non-class-member properties (object-literal properties / patterns). Lets a
+    // consumer that rewrites class source (the closure serializer's method pruning) delete a whole
+    // member by AST offset — `[member[i].start, member[i+1].start)` — without a hand-rolled scanner.
+    pub member_start: crate::Loc,
 }
 
 pub type PropertyList = Vec<Property, bun_alloc::AstAlloc>;
@@ -198,6 +205,7 @@ impl Default for Property {
             ts_metadata: TypeScript::Metadata::MNone,
             initializer_start: crate::Loc::EMPTY,
             initializer_end: crate::Loc::EMPTY,
+            member_start: crate::Loc::EMPTY,
         }
     }
 }
@@ -256,6 +264,7 @@ impl Property {
             ts_metadata: self.ts_metadata.clone(),
             initializer_start: self.initializer_start,
             initializer_end: self.initializer_end,
+            member_start: self.member_start,
         })
     }
 }

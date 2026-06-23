@@ -1998,7 +1998,10 @@ impl<'a> AstJsConverter<'a> {
         } else {
             "PropertyDefinition"
         };
-        let node = self.node(ty, 0)?;
+        // `start` is the member's true start (before leading `static`/`get`/`async`/`*`/decorators)
+        // so a source-rewriting consumer (the closure serializer's method pruning) can delete a
+        // whole member by the span `[member[i].start, member[i+1].start)`.
+        let node = self.node(ty, p.member_start.start)?;
         if let Some(key) = p.key {
             let k = self.expr(&key)?;
             node.put(self.global, "key", k);

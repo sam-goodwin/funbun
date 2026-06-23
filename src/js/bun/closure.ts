@@ -137,6 +137,20 @@ interface Context {
   // keys actually referenced by the closure (access-path pruning), or "all" /
   // absent to serialize every key. See computeKeepSets.
   keepSets: Map<object, Set<string> | "all">;
+  // Per class prototype reached via instances: the union, across all those instances,
+  // of the member keys the closure can actually reach (transitively through `this` /
+  // `super` / getters), or "all" if any such instance is kept wholesale. Drives
+  // pruning of unreachable prototype methods from an emitted class. See computeKeepSets.
+  methodKeep: Map<object, Set<PropertyKey> | "all">;
+  // Functions / objects captured as first-class VALUES (a free variable, property
+  // value, array/Map/Set element, …) rather than reached merely as the prototype-owner
+  // of an instance or a structural `extends` superclass. A class in here is NEVER
+  // method-pruned: a direct capture can construct fresh instances or call any method.
+  capturedAsValue: Set<object>;
+  // Per class fn: the prototype member keys pruneClassMethods removed from its source. The
+  // prototype's own-property emit must ALSO skip these, or it would re-add the live method it
+  // sees on the prototype (defeating the prune).
+  prunedMethods: Map<Function, Set<PropertyKey>>;
   // Unique (non-registered, non-well-known) symbols -> hoisted variable name, so
   // the same captured symbol reconstructs to one symbol (identity preserved
   // within the serialized closure).
@@ -310,6 +324,7 @@ function serializeImpl(fn: Function, replacer?: Replacer): string {
     if (m !== null) counterStart = Math.max(counterStart, Number(m[1]) + 1);
   }
   const genuinePlan = computeGenuineClasses(fn, sharedIds);
+  const keep = computeKeepSets(fn);
   const ctx: Context = {
     module: [],
     refs: new MapCtor(),
@@ -318,7 +333,9 @@ function serializeImpl(fn: Function, replacer?: Replacer): string {
     imports: new SetCtor(),
     replacer: typeof replacer === "function" ? replacer : undefined,
     sourceBlocks: [],
-    keepSets: computeKeepSets(fn),
+    keepSets: keep.keepSets,
+    methodKeep: keep.methodKeep,
+    capturedAsValue: keep.capturedAsValue,
     symbols: new MapCtor(),
     alsContexts: [],
     genuineClasses: genuinePlan.genuine,
@@ -332,6 +349,7 @@ function serializeImpl(fn: Function, replacer?: Replacer): string {
     bodyQueue: [],
     emittedFns: new SetCtor(),
     inProgressFns: new SetCtor(),
+    prunedMethods: new MapCtor(),
   };
 
   // Emit shared cells at module scope (deduped by id) before any function that
@@ -1080,6 +1098,81 @@ function classStructure(source: string): ClassStructure | null {
   return { fields, isDerived: node.superClass != null, node, offset };
 }
 
+// The string member key of a class member node, or undefined if it can't be statically pruned by
+// key: a computed key (`[expr]() {}`), a `#private` key (mangled separately, genuine path), or a
+// non-string key. A constructor is never prunable (its source must stay valid). Undefined means
+// "keep" — pruning only removes members it can positively identify as unreachable.
+function prunableMemberKey(m: any): string | undefined {
+  if (m?.type !== "MethodDefinition") return undefined; // fields/static-blocks left intact
+  if (m.static === true || m.computed === true) return undefined;
+  if (m.key?.type === "PrivateIdentifier") return undefined;
+  const key = m.key?.value;
+  if (typeof key !== "string" || key === "constructor") return undefined;
+  return key;
+}
+
+// Shrink a captured class to the prototype methods/accessors the closure can actually reach,
+// deleting the rest from its source and routing each KEPT method through the replacer (so a
+// consumer observes exactly the reachable methods — see computeKeepSets / Context.methodKeep).
+// Returns the (possibly pruned) source, or `source` unchanged when pruning doesn't apply:
+//   - not a class, or its prototype isn't an object;
+//   - the class (or its prototype) is captured as a first-class value — it could construct fresh
+//     instances or have any method called, so every method must survive;
+//   - no instance reached it, or an instance was kept wholesale ("all") — keep every method.
+// Members are removed by blanking `[member[i].start, member[i+1].start)` (the last runs to the
+// class body's `}`) with the same number of newlines, so kept members stay byte-for-byte intact on
+// their original lines (source maps unaffected). `super`-using methods are kept INLINE here — never
+// extracted — so their `[[HomeObject]]` survives.
+function pruneClassMethods(fn: Function, source: string, cs: ClassStructure, ctx: Context): string {
+  const proto = (fn as { prototype?: object }).prototype;
+  if (typeof proto !== "object" || proto === null) return source;
+  if (ctx.capturedAsValue.has(fn) || ctx.capturedAsValue.has(proto)) return source;
+  const keep = ctx.methodKeep.get(proto);
+  if (keep === undefined || keep === "all") return source;
+
+  const members = cs.node.body?.body;
+  if (!$isJSArray(members) || members.length === 0) return source;
+  const closeBrace = typeof cs.node.body?.closeBrace === "number" ? cs.node.body.closeBrace - cs.offset : -1;
+  if (closeBrace < 0) return source;
+
+  const starts: number[] = [];
+  for (const m of members) starts.push(typeof m.start === "number" ? m.start - cs.offset : -1);
+
+  const cuts: Array<{ start: number; end: number }> = [];
+  const pruned = new SetCtor<PropertyKey>();
+  for (let i = 0; i < members.length; i++) {
+    const key = prunableMemberKey(members[i]);
+    if (key === undefined) continue; // constructor / field / computed / #private / static → keep
+    if (keep.has(key)) {
+      // Reachable — route the live method/accessor function through the replacer for observation.
+      const d = ObjectGetOwnPropertyDescriptor(proto, key);
+      const methodFn = d?.value ?? d?.get ?? d?.set;
+      if (typeof methodFn === "function") transform(proto, key, methodFn, ctx);
+      continue;
+    }
+    const a = starts[i];
+    const b = i + 1 < starts.length ? starts[i + 1] : closeBrace;
+    if (a >= 0 && b > a && b <= source.length) {
+      cuts.push({ start: a, end: b });
+      pruned.add(key);
+    }
+  }
+  if (cuts.length === 0) return source;
+  // Record removed keys so the prototype's own-property emit skips them (it still sees the live
+  // method on the prototype object and would otherwise re-add it, defeating the prune).
+  ctx.prunedMethods.set(fn, pruned);
+
+  // Apply right-to-left so earlier cuts don't invalidate later offsets; replace each removed span
+  // with its newline count to preserve the line structure of the surviving members.
+  cuts.sort((x, y) => y.start - x.start);
+  let out = source;
+  for (const c of cuts) {
+    const newlines = out.slice(c.start, c.end).split("\n").length - 1;
+    out = out.slice(0, c.start) + "\n".repeat(newlines) + out.slice(c.end);
+  }
+  return out;
+}
+
 // Rewrite a genuine-private class's source for two-phase reification:
 //   - a guarded reify branch at the top of the constructor body skips the original body
 //     (and calls super() for a derived class) so the factory builds a BARE instance:
@@ -1589,6 +1682,9 @@ function analyzeAccess(fnNode: any, rootNames: Set<string>): Map<string, AccessN
     if (!node || typeof node !== "object") return null;
     if (node.type === "Identifier") return rootNames.has(node.name) ? get(node.name) : null;
     if (node.type === "ThisExpression") return rootNames.has("this") ? get("this") : null;
+    // `super.m()` inside a method resolves to a prototype member reached with the SAME receiver,
+    // so for reachability it behaves like `this.m` — fold it into the `this` access node.
+    if (node.type === "Super") return rootNames.has("this") ? get("this") : null;
     if (node.type === "MemberExpression") {
       const base = accessOf(node.object);
       if (base === null) return null;
@@ -1688,8 +1784,14 @@ function lookupDescriptor(obj: object, key: string): PropertyDescriptor | undefi
 // Build the per-value keep-sets: for each captured object, the set of own string
 // keys to serialize (or "all"). Walks every reachable function, analyzes its
 // access paths, and follows `this` into invoked methods so their reads are kept.
-function computeKeepSets(root: Function): Map<object, Set<string> | "all"> {
+interface KeepSetResult {
+  keepSets: Map<object, Set<string> | "all">;
+  methodKeep: Map<object, Set<PropertyKey> | "all">;
+  capturedAsValue: Set<object>;
+}
+function computeKeepSets(root: Function): KeepSetResult {
   const keepSets = new MapCtor<object, Set<string> | "all">();
+  const capturedAsValue = new SetCtor<object>();
   const seenFns = new SetCtor<Function>();
   const seenObjs = new SetCtor<object>();
   const followed = new MapCtor<object, Set<string>>(); // receiver → methods already this-followed
@@ -1770,13 +1872,22 @@ function computeKeepSets(root: Function): Map<object, Set<string> | "all"> {
     done.add(method);
 
     if (keepSets.get(obj) === "all") return;
-    const d = lookupDescriptor(obj, method);
-    if (d === undefined || !("value" in d)) {
+    const top = lookupDescriptor(obj, method);
+    if (top === undefined || !("value" in top)) {
       // accessor-valued or missing method: can't safely inspect → keep all.
       keepAll(obj);
       return;
     }
-    thisFollowFn(obj, d.value);
+    // Follow EVERY same-named method up the prototype chain, not just the most-derived override:
+    // a `super.method()` inside that override resolves to an ANCESTOR's method, whose own body may
+    // read further `this.X` / call `this.other()` that must be kept too. (thisFollowFn dedups per
+    // receiver+fn and ignores non-function values, so this is cheap and safe.)
+    let o: object | null = obj;
+    while (o !== null) {
+      const d = ObjectGetOwnPropertyDescriptor(o, method);
+      if (d !== undefined && "value" in d) thisFollowFn(obj, d.value);
+      o = ObjectGetPrototypeOf(o);
+    }
   }
 
   // Fold a function's `this.X` reads into `obj`'s keep-set, given that it runs
@@ -1813,10 +1924,17 @@ function computeKeepSets(root: Function): Map<object, Set<string> | "all"> {
   // overflow. Order-independent: keep-sets only accumulate (union, with keepAll overriding).
   // `apply`/this-follow recurse only over the shallow static access tree, never the graph.
   const stack: unknown[] = [];
-  function enqueueFns(value: unknown): void {
+  // `asValue` marks a genuine first-class capture (free var, property value, array/Map/Set
+  // element, bound internals) — as opposed to a structural reference (an instance's
+  // prototype-owner, a class's `extends` superclass). Only first-class captures keep a class
+  // from being method-pruned; the structural references are exactly what pruning rewrites.
+  function enqueueFns(value: unknown, asValue = true): void {
     if (value === null) return;
     const t = typeof value;
-    if (t === "function" || t === "object") stack.push(value);
+    if (t === "function" || t === "object") {
+      if (asValue) capturedAsValue.add(value as object);
+      stack.push(value);
+    }
   }
   function processValueFns(value: unknown): void {
     if (isAsyncLocalStorage(value as object)) return; // reconstructed wholesale; opaque
@@ -1857,7 +1975,9 @@ function computeKeepSets(root: Function): Map<object, Set<string> | "all"> {
     const proto = ObjectGetPrototypeOf(obj);
     if (proto !== null && proto !== Object.prototype) {
       const ctor = (proto as any).constructor;
-      enqueueFns(typeof ctor === "function" && ctor.prototype === proto ? ctor : proto);
+      // Structural: the instance's class is referenced only to host its prototype, not captured
+      // as a value — so it stays method-prunable (asValue = false).
+      enqueueFns(typeof ctor === "function" && ctor.prototype === proto ? ctor : proto, false);
     }
     forEachMapSetEntry(obj, enqueueFns);
   }
@@ -1881,18 +2001,55 @@ function computeKeepSets(root: Function): Map<object, Set<string> | "all"> {
       enqueueFns(v.value);
     }
     const superclass = ObjectGetPrototypeOf(fn);
-    if (typeof superclass === "function" && superclass !== Function.prototype) enqueueFns(superclass);
+    // Structural `extends` reference, not a value capture — keep the superclass prunable.
+    if (typeof superclass === "function" && superclass !== Function.prototype) enqueueFns(superclass, false);
   }
 
+  const empty: KeepSetResult = {
+    keepSets: new MapCtor(),
+    methodKeep: new MapCtor(),
+    capturedAsValue: new SetCtor(),
+  };
   try {
     enqueueFns(root);
     while (stack.length > 0) processValueFns(stack.pop());
   } catch {
     // Any analysis failure must not break serialization: fall back to emitting
     // everything (the pre-pruning behaviour) by discarding partial keep-sets.
-    return new MapCtor();
+    return empty;
   }
-  return keepSets;
+
+  // Aggregate per-instance keep-sets up each instance's prototype CHAIN into a per-prototype
+  // reachable-member set: a class's prototype is shared by every instance, so the methods to keep
+  // are the UNION across them (and a class deeper in the chain unions in every subclass instance
+  // that can reach through it). "all" (a wholesale-kept instance) wins. Used by pruneClassMethods.
+  const methodKeep = new MapCtor<object, Set<PropertyKey> | "all">();
+  try {
+    for (const [obj, ks] of keepSets) {
+      // A Proxy isn't a prunable class instance, and a revoked one throws on any reflection
+      // (incl. getPrototypeOf) — skip it rather than walk its "chain".
+      if (obj === null || typeof obj !== "object" || $isProxyObject(obj)) continue;
+      let proto = ObjectGetPrototypeOf(obj);
+      while (proto !== null && proto !== Object.prototype) {
+        const existing = methodKeep.get(proto);
+        if (ks === "all" || existing === "all") {
+          methodKeep.set(proto, "all");
+        } else {
+          let s = existing as Set<PropertyKey> | undefined;
+          if (s === undefined) {
+            s = new SetCtor<PropertyKey>();
+            methodKeep.set(proto, s);
+          }
+          for (const k of ks) s.add(k);
+        }
+        proto = ObjectGetPrototypeOf(proto);
+      }
+    }
+  } catch {
+    // Any reflection failure on an exotic object just disables pruning (safe: keep every method).
+    return { keepSets, methodKeep: new MapCtor(), capturedAsValue };
+  }
+  return { keepSets, methodKeep, capturedAsValue };
 }
 
 // Returns the set of functions that can reach themselves through the capture graph (self-loops
@@ -2017,11 +2174,18 @@ function reconstructFunctionExpr(fn: Function, ctx: Context, sourceOverride?: st
     genuinePrivate = { fields: gpInfo.fields };
     ctx.needsReifySlot = true;
   } else {
+    // A captured class instance flows through `Object.create(Class.prototype)`, so the class can
+    // be shrunk to only the prototype methods the closure can actually reach — pruning the rest
+    // and routing the kept ones through the replacer (observation). Done FIRST, on the original
+    // source, so the downstream rewrites operate on the already-pruned class. No-op for a
+    // non-class, a class captured as a value, or one reached wholesale (keep-all).
+    const ms0 = classStructure(original);
+    const pruned = ms0 !== null ? pruneClassMethods(fn, original, ms0, ctx) : original;
     // A mangled class still re-evaluates its static blocks / static field initializers when the
     // class is defined; strip those so their side effects don't re-run (instance fields never
     // run on the ObjectCreate path, so they're left alone). Non-class functions: no-op.
-    const ms = classStructure(original);
-    const pre = ms !== null ? neutralizeClassInitializers(original, ms.node, ms.offset, false) : original;
+    const ms = pruned === original ? ms0 : classStructure(pruned);
+    const pre = ms !== null ? neutralizeClassInitializers(pruned, ms.node, ms.offset, false) : pruned;
     source = rewritePrivateMembers(pre);
     // An arrow that reads a `#private` through its lexical `this` cannot be reconstructed:
     // the receiving instance is baked in lexically and is not recoverable. Reject it (the
@@ -3726,9 +3890,16 @@ function emitFunctionContent(fn: Function, name: string, ctx: Context): void {
   // Imperatively-assigned prototype members (`Ctor.prototype.method = ...`, the classic pre-ES6
   // pattern, or a monkey-patched class prototype) live on the `.prototype` object, not in the
   // function's source — emit its own properties (any enumerability) onto `<name>.prototype`,
-  // skipping `constructor` and the instance members the class source already declares.
+  // skipping `constructor`, the instance members the class source already declares, and any
+  // methods pruneClassMethods removed (those are deliberately gone — don't resurrect them).
   if (typeof ownProto === "object" && ownProto !== null) {
-    emitOwnProperties(`${name}.prototype`, ownProto, ctx, memberKeys.instanceKeys, false);
+    const pruned = ctx.prunedMethods.get(fn);
+    let skip = memberKeys.instanceKeys;
+    if (pruned !== undefined && pruned.size > 0) {
+      skip = new SetCtor<PropertyKey>(skip);
+      for (const k of pruned) skip.add(k);
+    }
+    emitOwnProperties(`${name}.prototype`, ownProto, ctx, skip, false);
   }
   // A frozen/sealed/non-extensible class prototype or constructor is emitted via this function
   // path, never through emitObject, so its extensibility state would otherwise be lost. Apply
@@ -4279,6 +4450,7 @@ async function bundle(fn: Function, replacer?: Replacer): Promise<string> {
   //    the existing value emitter (objects, prototypes, pruning, cycles, …).
   const { sharedIds } = analyzeSharedCells(fn);
   const genuinePlan = computeGenuineClasses(fn, sharedIds);
+  const keep = computeKeepSets(fn);
   const ctx: Context = {
     module: [],
     refs: new MapCtor(),
@@ -4287,7 +4459,9 @@ async function bundle(fn: Function, replacer?: Replacer): Promise<string> {
     imports: new SetCtor(),
     replacer: typeof replacer === "function" ? replacer : undefined,
     sourceBlocks: [],
-    keepSets: computeKeepSets(fn),
+    keepSets: keep.keepSets,
+    methodKeep: keep.methodKeep,
+    capturedAsValue: keep.capturedAsValue,
     symbols: new MapCtor(),
     alsContexts: [],
     genuineClasses: genuinePlan.genuine,
@@ -4301,6 +4475,7 @@ async function bundle(fn: Function, replacer?: Replacer): Promise<string> {
     bodyQueue: [],
     emittedFns: new SetCtor(),
     inProgressFns: new SetCtor(),
+    prunedMethods: new MapCtor(),
   };
   // 2. Recover the closure module's import bindings: localName → original source.
   type Binding = { source: string; imported?: string; default?: boolean; star?: boolean };

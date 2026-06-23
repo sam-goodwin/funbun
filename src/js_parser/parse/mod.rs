@@ -220,9 +220,12 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
             }
 
             // This property may turn out to be a type in TypeScript, which should be ignored
-            if let Some(property) =
+            if let Some(mut property) =
                 p.parse_property(js_ast::g::PropertyKind::Normal, &mut opts, None)?
             {
+                // The member's true start (captured before decorators/modifiers were parsed) so a
+                // source-rewriting consumer can delete the whole member by offset.
+                property.member_start = first_decorator_loc;
                 // read fields before move (G::Property is not Copy).
                 let prop_kind = property.kind;
                 let prop_key = property.key;

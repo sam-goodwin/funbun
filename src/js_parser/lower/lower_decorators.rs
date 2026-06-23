@@ -87,6 +87,7 @@ fn prop_copy(p: &Property) -> Property {
         ts_metadata: unsafe { core::ptr::read(&raw const p.ts_metadata) },
         initializer_start: p.initializer_start,
         initializer_end: p.initializer_end,
+        member_start: p.member_start,
     }
 }
 
@@ -109,6 +110,7 @@ fn prop_full_copy(p: &Property) -> Property {
         ts_metadata: unsafe { core::ptr::read(&raw const p.ts_metadata) },
         initializer_start: p.initializer_start,
         initializer_end: p.initializer_end,
+        member_start: p.member_start,
     }
 }
 

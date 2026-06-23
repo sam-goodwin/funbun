@@ -4647,6 +4647,7 @@ pub mod __gated_printer {
                 ts_metadata: Default::default(),
                 initializer_start: item_in.initializer_start,
                 initializer_end: item_in.initializer_end,
+                member_start: item_in.member_start,
             };
             if !IS_JSON {
                 if item.kind == G::PropertyKind::Spread {

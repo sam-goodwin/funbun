@@ -3258,7 +3258,7 @@ describe("optimality (radical)", () => {
     expect(fn()).toBe(5);
   });
 
-  test("class instance: prototype methods kept verbatim; correctness preserved", async () => {
+  test("class instance: an uncalled prototype method is pruned; correctness preserved", async () => {
     class Widget {
       used = 1;
       ownUnused = "UNUSED_MARKER_OWNFIELD";
@@ -3266,13 +3266,14 @@ describe("optimality (radical)", () => {
         return this.used;
       }
       neverCalled() {
-        return "PROTO_METHOD_KEPT";
+        return "PROTO_METHOD_BODY";
       }
     }
     const inst = new Widget();
     void inst;
     const code = serialize(() => inst.reach());
-    expect(code).toContain("neverCalled");
+    // Only `reach` is reachable; `neverCalled` is pruned from the emitted class.
+    expect(code).not.toContain("PROTO_METHOD_BODY");
     expect(await (await roundtrip(() => inst.reach()))()).toBe(1);
   });
 
@@ -12453,5 +12454,302 @@ describe("generators: Tier A (suspended-start + completed, portable)", () => {
     const g = agen();
     void g;
     expect(() => serialize(() => g)).toThrow(/[Aa]sync ?[Gg]enerator/);
+  });
+});
+
+// ── Class method pruning (non-#private) ──────────────────────────────────────
+// A captured class instance is reconstructed via `Object.create(Class.prototype)`,
+// and historically the WHOLE class (every prototype method) was emitted as one
+// `toString()` unit — so the replacer never saw individual methods and unreached
+// methods were dragged into the output. These tests pin the desired behavior:
+// the replacer is called for EXACTLY the reachable methods (the ones the closure
+// can actually call, transitively through `this`/`super`/getters), unreachable
+// methods are pruned from the output, and identity/behavior are preserved. When
+// reachability can't be determined statically (dynamic dispatch, the class captured
+// as a first-class value), it falls back to keeping every method.
+describe("class method pruning (non-#private)", () => {
+  let cmpN = 0;
+  const methodMeta = new WeakMap<Function, string>();
+  const tag = (label: string, fn: Function): void => void methodMeta.set(fn, label);
+
+  // Serialize, collecting the labels of every annotated method the replacer observed.
+  function serializeCollect(fn: Function): { code: string; observed: string[] } {
+    const observed: string[] = [];
+    const code = serialize(fn, (_k, v) => {
+      if (typeof v === "function" && methodMeta.has(v)) observed.push(methodMeta.get(v)!);
+      return v;
+    });
+    return { code, observed: observed.sort() };
+  }
+  async function rt<T extends Function>(fn: T): Promise<T> {
+    const code = serialize(fn);
+    using dir = tempDir(`closure-cmp-${cmpN++}`, { "mod.mjs": code });
+    return (await import(`${String(dir)}/mod.mjs`)).default as T;
+  }
+
+  test("calling one method observes & emits only that method", async () => {
+    class Svc {
+      read(id: number) {
+        return `READ_MARK:${id}`;
+      }
+      write(id: number, v: string) {
+        return `WRITE_MARK:${id}=${v}`;
+      }
+    }
+    tag("read", Svc.prototype.read);
+    tag("write", Svc.prototype.write);
+    const svc = new Svc();
+    const root = (id: number) => svc.read(id);
+
+    const { code, observed } = serializeCollect(root);
+    expect(observed).toEqual(["read"]); // ONLY the called method
+    expect(code).not.toContain("WRITE_MARK"); // uncalled method pruned
+    expect(code).toContain("READ_MARK");
+
+    const fn = await rt(root);
+    expect(fn(42)).toBe("READ_MARK:42");
+  });
+
+  test("a kept method's this.other() keeps the transitively-reached method only", async () => {
+    class Svc {
+      entry(id: number) {
+        return this.helper(id) + ":E";
+      }
+      helper(id: number) {
+        return `HELP_MARK:${id}`;
+      }
+      unused() {
+        return "UNUSED_MARK";
+      }
+    }
+    tag("entry", Svc.prototype.entry);
+    tag("helper", Svc.prototype.helper);
+    tag("unused", Svc.prototype.unused);
+    const svc = new Svc();
+    const root = (id: number) => svc.entry(id);
+
+    const { code, observed } = serializeCollect(root);
+    expect(observed).toEqual(["entry", "helper"]);
+    expect(code).not.toContain("UNUSED_MARK");
+
+    const fn = await rt(root);
+    expect(fn(7)).toBe("HELP_MARK:7:E");
+  });
+
+  test("a kept subclass method's super.m() keeps the superclass method", async () => {
+    class Base {
+      greet() {
+        return "BASE_GREET";
+      }
+      other() {
+        return "BASE_OTHER_UNUSED";
+      }
+    }
+    class Sub extends Base {
+      greet() {
+        return super.greet() + ":SUB";
+      }
+    }
+    tag("Base.greet", Base.prototype.greet);
+    tag("Base.other", Base.prototype.other);
+    tag("Sub.greet", Sub.prototype.greet);
+    const sub = new Sub();
+    const root = () => sub.greet();
+
+    const { code, observed } = serializeCollect(root);
+    expect(observed).toEqual(["Base.greet", "Sub.greet"]);
+    expect(code).not.toContain("BASE_OTHER_UNUSED");
+
+    const fn = await rt(root);
+    expect(fn()).toBe("BASE_GREET:SUB");
+  });
+
+  test("a super method's own this.other() call is followed transitively", async () => {
+    class Base {
+      greet() {
+        return "BASE:" + this.helper(); // reached only via super.greet() → this.helper()
+      }
+      helper() {
+        return "HELPER_MARK";
+      }
+      idle() {
+        return "IDLE_UNUSED_MARK";
+      }
+    }
+    class Sub extends Base {
+      greet() {
+        return super.greet() + ":SUB";
+      }
+    }
+    const sub = new Sub();
+    const root = () => sub.greet();
+
+    const { code } = serializeCollect(root);
+    expect(code).toContain("HELPER_MARK"); // reached through Base.greet's body
+    expect(code).not.toContain("IDLE_UNUSED_MARK");
+
+    const fn = await rt(root);
+    expect(fn()).toBe("BASE:HELPER_MARK:SUB");
+  });
+
+  test("calling an inherited method keeps it and prunes inherited & own siblings", async () => {
+    class Base {
+      inheritedUsed() {
+        return "INH_USED";
+      }
+      inheritedUnused() {
+        return "INH_UNUSED";
+      }
+    }
+    class Sub extends Base {
+      own() {
+        return "OWN_UNUSED";
+      }
+    }
+    const sub = new Sub();
+    const root = () => sub.inheritedUsed();
+
+    const { code } = serializeCollect(root);
+    expect(code).toContain("INH_USED");
+    expect(code).not.toContain("INH_UNUSED");
+    expect(code).not.toContain("OWN_UNUSED");
+
+    const fn = await rt(root);
+    expect(fn()).toBe("INH_USED");
+  });
+
+  test("two instances of one class keep the UNION of reached methods", async () => {
+    class Svc {
+      read() {
+        return "READ_U";
+      }
+      write() {
+        return "WRITE_U";
+      }
+      idle() {
+        return "IDLE_UNUSED";
+      }
+    }
+    const a = new Svc();
+    const b = new Svc();
+    const root = () => a.read() + b.write();
+
+    const { code } = serializeCollect(root);
+    expect(code).toContain("READ_U");
+    expect(code).toContain("WRITE_U");
+    expect(code).not.toContain("IDLE_UNUSED");
+
+    const fn = await rt(root);
+    expect(fn()).toBe("READ_UWRITE_U");
+  });
+
+  test("dynamic method dispatch (computed key) keeps all methods", async () => {
+    class Svc {
+      read() {
+        return "READ_D";
+      }
+      write() {
+        return "WRITE_D";
+      }
+    }
+    const svc = new Svc();
+    const root = (name: string) => (svc as any)[name]();
+
+    const { code } = serializeCollect(root);
+    expect(code).toContain("READ_D");
+    expect(code).toContain("WRITE_D");
+
+    const fn = await rt(root);
+    expect(fn("read")).toBe("READ_D");
+    expect(fn("write")).toBe("WRITE_D");
+  });
+
+  test("a getter reached through a kept method is preserved; an unused one is pruned", async () => {
+    class Svc {
+      get config() {
+        return "CONF_MARK";
+      }
+      get unusedCfg() {
+        return "UNUSED_CFG";
+      }
+      run() {
+        return this.config + ":R";
+      }
+    }
+    const svc = new Svc();
+    const root = () => svc.run();
+
+    const { code } = serializeCollect(root);
+    expect(code).toContain("CONF_MARK");
+    expect(code).not.toContain("UNUSED_CFG");
+
+    const fn = await rt(root);
+    expect(fn()).toBe("CONF_MARK:R");
+  });
+
+  test("a class captured directly keeps all methods (no pruning)", async () => {
+    class Svc {
+      read() {
+        return "READ_C";
+      }
+      write() {
+        return "WRITE_C";
+      }
+    }
+    const root = () => Svc;
+
+    const { code } = serializeCollect(root);
+    expect(code).toContain("READ_C");
+    expect(code).toContain("WRITE_C");
+
+    const Cls = (await rt(root))() as any;
+    const inst = new Cls();
+    expect(inst.read()).toBe("READ_C");
+    expect(inst.write()).toBe("WRITE_C");
+  });
+
+  test("a pruned instance keeps its constructor/prototype identity and runs the kept method", async () => {
+    class Svc {
+      kind() {
+        return this.constructor.name; // reads identity WITHOUT escaping `this` wholesale
+      }
+      used() {
+        return "USED_I";
+      }
+      unused() {
+        return "UNUSED_I";
+      }
+    }
+    const svc = new Svc();
+    const root = () => svc.kind() + ":" + svc.used();
+
+    const code = serialize(root);
+    expect(code).not.toContain("UNUSED_I"); // unused truly pruned
+
+    const fn = await rt(root);
+    // `this.constructor.name === "Svc"` ⇒ the reconstructed instance's prototype/constructor
+    // identity survived pruning; both reached methods run.
+    expect(fn()).toBe("Svc:USED_I");
+  });
+
+  test("a method only READ (not called) off the instance is still kept", async () => {
+    class Svc {
+      read() {
+        return "READ_REF";
+      }
+      write() {
+        return "WRITE_REF_UNUSED";
+      }
+    }
+    const svc = new Svc();
+    // `read` is taken as a value (not called through svc) — still reachable, so kept.
+    const root = () => svc.read;
+
+    const { code } = serializeCollect(root);
+    expect(code).toContain("READ_REF");
+    expect(code).not.toContain("WRITE_REF_UNUSED");
+
+    const fn = await rt(root);
+    expect((fn() as () => string).call(null)).toBe("READ_REF");
   });
 });
