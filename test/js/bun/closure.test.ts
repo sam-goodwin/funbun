@@ -10805,6 +10805,97 @@ describe("generality: prototype member preservation", () => {
     expect(out.g).toBe("G_PATCHED"); // overridden getter
   });
 
+  // KIND-FLIP overrides: a source METHOD replaced by an accessor (or vice versa) changes the
+  // runtime descriptor's shape. Detection must read the override off the LIVE descriptor, not
+  // assume the source member's kind.
+  test("a source method replaced by a getter round-trips as the getter", async () => {
+    class A {
+      m() {
+        return "METHOD_ORIG";
+      }
+    }
+    Object.defineProperty(A.prototype, "m", { get: () => "GETTER_OVERRIDE", configurable: true });
+    const a = new A();
+    const out = (await roundtrip(() => a))() as any;
+    expect(out.m).toBe("GETTER_OVERRIDE"); // accessor, not a callable method
+  });
+
+  test("a source getter replaced by a data method round-trips as the method", async () => {
+    class B {
+      get g() {
+        return "GETTER_ORIG";
+      }
+    }
+    Object.defineProperty(B.prototype, "g", {
+      value: function () {
+        return "METHOD_OVERRIDE";
+      },
+      configurable: true,
+      writable: true,
+    });
+    const b = new B();
+    const out = (await roundtrip(() => b))() as any;
+    expect(typeof out.g).toBe("function");
+    expect(out.g()).toBe("METHOD_OVERRIDE");
+  });
+
+  test("a source get/set pair replaced by a data value round-trips as the value", async () => {
+    class D {
+      get v() {
+        return "GETTER_ORIG";
+      }
+      set v(_x: string) {}
+    }
+    Object.defineProperty(D.prototype, "v", { value: "DATA_OVERRIDE", configurable: true, writable: true });
+    const d = new D();
+    const out = (await roundtrip(() => d))() as any;
+    expect(out.v).toBe("DATA_OVERRIDE");
+  });
+
+  // STATIC member overrides: a class's own static method/accessor replaced at runtime. The
+  // detection skips `static` from the function's own toString, so the anchor must advance past it.
+  test("a runtime override of a static method round-trips", async () => {
+    class S {
+      static s() {
+        return "STATIC_ORIG";
+      }
+      reach() {
+        return "REACH"; // an instance method so an instance is captured
+      }
+    }
+    (S as any).s = function () {
+      return "STATIC_OVERRIDE";
+    };
+    const inst = new S();
+    void inst;
+    const out = (await roundtrip(() => ({ inst, cls: S })))() as any;
+    expect(out.cls.s()).toBe("STATIC_OVERRIDE");
+    expect(out.inst.reach()).toBe("REACH"); // untouched instance method preserved
+  });
+
+  // A static method that uses `super` must NOT be falsely re-emitted standalone (that would be a
+  // syntax error) when it is NOT overridden — guards the static anchor fix.
+  test("a non-overridden static method using super stays valid", async () => {
+    class Base {
+      static base() {
+        return "BASE_STATIC";
+      }
+    }
+    class Sub extends Base {
+      static s() {
+        return super.base() + ":SUB";
+      }
+      hi() {
+        return "HI";
+      }
+    }
+    const inst = new Sub();
+    void inst;
+    const out = (await roundtrip(() => ({ inst, cls: Sub })))() as any;
+    expect(out.cls.s()).toBe("BASE_STATIC:SUB"); // imports cleanly, super resolves
+    expect(out.inst.hi()).toBe("HI");
+  });
+
   // KNOWN BUG: a NON-enumerable prototype member is dropped (emitOwnProperties on
   // <name>.prototype also uses enumerableOnly=true).
   test("non-enumerable prototype method round-trips", async () => {

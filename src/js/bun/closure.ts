@@ -925,37 +925,58 @@ function sourceDefinedMemberKeys(source: string): { staticKeys: Set<PropertyKey>
   return { staticKeys, instanceKeys };
 }
 
-// The instance-method keys whose live prototype function was REPLACED at runtime after the class
-// was declared (`Class.prototype.read = fn`, or `Object.defineProperty(Class.prototype, "read", …)`).
-// The emitted class source is reprinted from `toString()`, which still shows the ORIGINAL body, and
-// the prototype's own-property emit normally SKIPS every key the class body declares — so an
-// override would be silently lost (the stale original wins). These keys must be un-skipped so the
-// live override is re-emitted (overwriting the inline original on the reconstructed prototype).
+// The member keys (instance or static, per `isStatic`) whose live function was REPLACED at runtime
+// after the class was declared (`Class.prototype.read = fn`, `Class.s = fn`, or via
+// `Object.defineProperty`). The emitted class source is reprinted from `toString()`, which still
+// shows the ORIGINAL body, and the own-property emit normally SKIPS every key the class body
+// declares — so an override would be silently lost (the stale original wins). These keys must be
+// un-skipped so the live override is re-emitted (overwriting the inline original).
 //
 // Detection is by source identity, robust across method kinds and override mechanisms: an
 // un-replaced class method's own `toString()` is byte-identical to its text inside the class
 // source, so if the class source does NOT contain the live function's source at the member's start,
 // the method was replaced. `original` MUST be the unmodified `fn.toString()` (not a mangled/pruned
-// reconstruction) so a `#private`-reading method's live `#x` source still matches. Only
-// string/identifier-keyed, non-static, non-computed instance methods/accessors are considered.
-function overriddenPrototypeKeys(fn: Function, original: string): Set<PropertyKey> {
+// reconstruction) so a `#private`-reading method's live `#x` source still matches. Two subtleties:
+//   - KIND FLIP: the live function is read off the SOURCE member's kind; if that descriptor slot is
+//     empty (a method replaced by an accessor, or vice versa, or by a non-function value), the
+//     runtime shape no longer matches the source — that is itself an override, so flag the key.
+//   - STATIC ANCHOR: a static member's own `toString()` OMITS the `static` keyword (unlike
+//     get/set/async/*, which it keeps), so for statics the match anchor advances past `static` and
+//     the following whitespace — else every un-replaced static would falsely flag (and a static
+//     `super` method would then re-emit standalone: a syntax error).
+// Only string/identifier-keyed, non-computed members are considered.
+function overriddenMemberKeys(fn: Function, original: string, isStatic: boolean): Set<PropertyKey> {
   const result = new SetCtor<PropertyKey>();
-  const proto = (fn as { prototype?: object }).prototype;
-  if (typeof proto !== "object" || proto === null) return result;
+  const holder = isStatic ? (fn as object) : (fn as { prototype?: object }).prototype;
+  if (holder === null || (typeof holder !== "object" && typeof holder !== "function")) return result;
   const parsed = parseWithOffset(original);
   const members = parsed?.node?.body?.body;
   if (parsed === null || !$isJSArray(members)) return result;
   for (const m of members) {
-    if (m?.type !== "MethodDefinition" || m.static === true || m.computed === true) continue;
+    if (m?.type !== "MethodDefinition" || (m.static === true) !== isStatic || m.computed === true) continue;
     if (m.key?.type === "PrivateIdentifier") continue;
     const key = memberKeyOf(m);
     if (key === undefined || key === "constructor") continue;
-    const d = ObjectGetOwnPropertyDescriptor(proto, key);
+    const d = ObjectGetOwnPropertyDescriptor(holder, key);
     if (d === undefined) continue;
+    // Read the live function off the SOURCE member's kind. An empty slot means the live descriptor
+    // changed shape (method↔accessor, or replaced by a non-function value) — itself an override.
     const live = m.kind === "get" ? d.get : m.kind === "set" ? d.set : d.value;
-    if (typeof live !== "function") continue;
-    const at = typeof m.memberStart === "number" ? m.memberStart - parsed.offset : -1;
+    if (typeof live !== "function") {
+      result.add(key);
+      continue;
+    }
+    let at = typeof m.memberStart === "number" ? m.memberStart - parsed.offset : -1;
     if (at < 0) continue;
+    if (isStatic && original.startsWith("static", at)) {
+      // `memberStart` is the `static` keyword; the function's own toString omits it.
+      at += "static".length;
+      while (at < original.length) {
+        const c = original.charCodeAt(at);
+        if (c === 32 || c === 9 || c === 10 || c === 13) at++;
+        else break;
+      }
+    }
     let liveSrc: string;
     try {
       liveSrc = funcSource(live);
@@ -3938,17 +3959,27 @@ function emitFunctionContent(fn: Function, name: string, ctx: Context): void {
   // name/length/prototype and the static members (methods/fields the class expression recreates),
   // which would otherwise be duplicated or clobber a genuine-method reference.
   const memberKeys = sourceDefinedMemberKeys(reconstructed.source);
-  emitOwnProperties(name, fn, ctx, memberKeys.staticKeys, false);
+  // Override detection compares the LIVE members against the UN-mangled original source (#x intact).
+  const classOriginal = funcSource(fn);
+  // A source-declared STATIC method/accessor replaced at runtime is un-skipped so its override
+  // re-emits over the inline original (same rationale as the instance case below).
+  let staticSkip = memberKeys.staticKeys;
+  const overriddenStatic = overriddenMemberKeys(fn, classOriginal, true);
+  if (overriddenStatic.size > 0) {
+    staticSkip = new SetCtor<PropertyKey>(staticSkip);
+    for (const k of overriddenStatic) staticSkip.delete(k);
+  }
+  emitOwnProperties(name, fn, ctx, staticSkip, false);
   // Imperatively-assigned prototype members (`Ctor.prototype.method = ...`, the classic pre-ES6
   // pattern, or a monkey-patched class prototype) live on the `.prototype` object, not in the
   // function's source — emit its own properties (any enumerability) onto `<name>.prototype`,
   // skipping `constructor`, the instance members the class source already declares, and any
   // methods pruneClassMethods removed (those are deliberately gone — don't resurrect them). A
   // source-declared method REPLACED at runtime is un-skipped so its override re-emits over the
-  // inline original (overriddenPrototypeKeys, detected against the un-mangled original source).
+  // inline original (overriddenMemberKeys, detected against the un-mangled original source).
   if (typeof ownProto === "object" && ownProto !== null) {
     const pruned = ctx.prunedMethods.get(fn);
-    const overridden = overriddenPrototypeKeys(fn, funcSource(fn));
+    const overridden = overriddenMemberKeys(fn, classOriginal, false);
     let skip = memberKeys.instanceKeys;
     if ((pruned !== undefined && pruned.size > 0) || overridden.size > 0) {
       skip = new SetCtor<PropertyKey>(skip);
