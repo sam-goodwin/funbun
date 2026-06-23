@@ -12247,3 +12247,59 @@ describe("generality: deep bound-function chains", () => {
     expect(fn()).toEqual([105, 105]);
   });
 });
+
+describe("generality: deep prototype chains scale", () => {
+  // Serializing a value with a deep prototype / inheritance chain used to be super-linear in
+  // depth. Two distinct quadratic-or-worse sites:
+  //   1. emitBuiltin ran ~14 `instanceof` checks per object, each walking the FULL prototype chain
+  //      — O(depth) per object × N objects = O(depth²) for an Object.create chain. A memoized
+  //      "is any built-in prototype in this object's chain" guard now short-circuits in O(1).
+  //   2. computeGenuineClasses re-walked each class's whole superclass chain (genuineChain) and,
+  //      for every chain member, scanned every reachable function in perClassDisqualified — O(depth³)
+  //      for a `class extends` chain. genuineChain now memoizes chain suffixes (O(depth) total) and
+  //      perClassDisqualified short-circuits when a class declares no private fields.
+  // Measured on debug+ASAN with the prebuilt binary BEFORE the fix:
+  //   Object.create depth 1500 ≈ 2.2s, 2000 ≈ 3.8s; `class extends` depth 800 ≈ 8s (1600 timed out).
+  // The assertions below construct chains at a depth that would have taken many seconds (or hung)
+  // and assert correct round-trip behavior; the test simply completing quickly is the signal. The
+  // committed depths keep the test to a few seconds even on debug+ASAN.
+  test("deep Object.create chain round-trips with the leaf reachable", async () => {
+    const DEPTH = 1500;
+    let proto: any = { tag: "root" };
+    for (let i = 0; i < DEPTH; i++) proto = Object.create(proto);
+    const leaf = Object.create(proto);
+    leaf.value = 123;
+    void leaf;
+    const fn = await roundtrip(() => leaf);
+    const out = fn() as any;
+    expect(out.value).toBe(123);
+    // The whole inherited chain survives: `tag` lives ~1500 prototypes up.
+    expect(out.tag).toBe("root");
+  });
+
+  test("deep class-extends chain round-trips with instanceof and methods intact", async () => {
+    const DEPTH = 1200;
+    let C: any = class Base {
+      greet() {
+        return "hi";
+      }
+    };
+    const Base = C;
+    for (let i = 0; i < DEPTH; i++) {
+      const Prev = C;
+      C = class extends Prev {};
+    }
+    const Leaf = C;
+    const inst = new Leaf();
+    void inst;
+    void Leaf;
+    void Base;
+    const fn = await roundtrip(() => ({ inst, Leaf, Base }));
+    const out = fn() as any;
+    // The inherited method (declared ~1200 classes up the chain) is callable.
+    expect(out.inst.greet()).toBe("hi");
+    // instanceof through the reconstructed inheritance chain holds at both ends.
+    expect(out.inst instanceof out.Leaf).toBe(true);
+    expect(out.inst instanceof out.Base).toBe(true);
+  });
+});

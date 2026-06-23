@@ -1306,11 +1306,12 @@ function computeGenuineClasses(root: unknown, sharedIdsArg?: Set<number>): Genui
   // chain installs every brand). If an instance's chain includes a non-candidate class, it
   // would be rebuilt via ObjectCreate — unable to brand a genuine ancestor — so none of
   // its chain classes can be genuine; remove them all and repeat until stable.
+  const chainClassMemo = new MapCtor<object, Function[]>();
   let changed = true;
   while (changed) {
     changed = false;
     for (const o of objs) {
-      const chainClasses = instanceChainClasses(o);
+      const chainClasses = instanceChainClasses(o, chainClassMemo);
       if (chainClasses.length === 0) continue;
       if (chainClasses.some(C => !candidate.has(C))) {
         for (const C of chainClasses) if (candidate.delete(C)) changed = true;
@@ -1472,20 +1473,46 @@ function genuineClassId(fn: Function, ctx: Context): number {
 
 // The classes whose `.prototype` lies on `o`'s prototype chain (leaf-first) — i.e. the
 // constructor chain that built `o`.
-function instanceChainClasses(o: object): Function[] {
-  const classes: Function[] = [];
-  let p = ObjectGetPrototypeOf(o);
-  while (p !== null && p !== Object.prototype) {
-    const c = (p as any).constructor;
-    if (typeof c === "function" && c.prototype === p) {
-      // Stop at a builtin/native base (reconstructed via super(), not ObjectCreate) — only
-      // the user-class portion of the chain must be genuine for the fixpoint.
-      if (isNativeFunctionSource(c.toString())) break;
-      classes.push(c);
+const EMPTY_CLASSES: Function[] = [];
+// The user classes in `o`'s prototype chain (leaf-first), stopping at a builtin/native base (only
+// the user-class portion must be genuine for the fixpoint). Memoized by prototype object: the
+// chain SUFFIX from a given prototype is the same for every object sharing it, so a deep
+// Object.create / class-extends chain resolves in O(depth) total instead of re-walking O(depth)
+// per object (which made the fixpoint O(N²)). `memo` is scoped to one computeGenuineClasses call,
+// so a mutated prototype can't leave a stale entry across serialize() calls.
+function instanceChainClasses(o: object, memo: Map<object, Function[]>): Function[] {
+  const start = ObjectGetPrototypeOf(o);
+  if (start === null || start === Object.prototype) return EMPTY_CLASSES;
+  const cached = memo.get(start);
+  if (cached !== undefined) return cached;
+  // Walk up collecting not-yet-memoized prototypes (and whether each is a user-class prototype)
+  // until a cached result, the chain end, or a native base; then fill each bottom-up. Iterative so
+  // a deep chain doesn't recurse on the JS stack.
+  const pending: Array<[object, Function | null]> = [];
+  let p: object | null = start;
+  let tail: Function[] = EMPTY_CLASSES;
+  for (;;) {
+    if (p === null || p === Object.prototype) break;
+    const seen = memo.get(p);
+    if (seen !== undefined) {
+      tail = seen;
+      break;
     }
+    const c = ownConstructor(p);
+    if (c !== undefined && isNativeFunctionSource(c.toString())) {
+      memo.set(p, EMPTY_CLASSES); // native base: it and everything above contribute nothing
+      break;
+    }
+    pending.push([p, c ?? null]);
     p = ObjectGetPrototypeOf(p);
   }
-  return classes;
+  for (let i = pending.length - 1; i >= 0; i--) {
+    const [pp, c] = pending[i];
+    const result = c !== null ? [c, ...tail] : tail;
+    memo.set(pp, result);
+    tail = result;
+  }
+  return tail;
 }
 
 // The own (prototype + static) method/accessor function identities of class `C`.
@@ -2448,11 +2475,13 @@ function emitValue(value: unknown, ctx: Context): string {
   }
 }
 
-// A module namespace object (`import * as ns`) stringifies as `[object Module]`.
-// Captured at load so user code can't tamper with `Object.prototype.toString`.
-const objectToString = Object.prototype.toString;
+// A module namespace object (`import * as ns`) carries `Symbol.toStringTag === "Module"` as an OWN
+// property (an exotic-object invariant). Read the OWN descriptor rather than
+// `Object.prototype.toString.call(value)`: the latter does a `Get(value, @@toStringTag)` that walks
+// the whole prototype chain, so for a deep `Object.create` chain it cost O(depth) on EVERY object
+// (an O(N²) trap). The own-property read is O(1) and matches the same real namespace objects.
 function isModuleNamespaceObject(value: object): boolean {
-  return objectToString.$call(value) === "[object Module]";
+  return ObjectGetOwnPropertyDescriptor(value, Symbol.toStringTag)?.value === "Module";
 }
 
 function emitObject(value: object, ctx: Context): string {
@@ -2626,7 +2655,11 @@ function emitObjectBody(value: object, name: string, ctx: Context): () => void {
       }
     };
   }
-  if (value instanceof Error) {
+  // `value instanceof Error` walks the prototype chain; guard it with the O(1) memoized
+  // chain check so a deep `Object.create` chain doesn't pay an O(depth) walk per object
+  // (Error.prototype is in BUILTIN_PROTOTYPES). Error instances have a shallow chain, so the
+  // `instanceof` itself is cheap once the guard admits them.
+  if (chainHasBuiltinPrototype(value) && value instanceof Error) {
     return emitErrorBody(value, name, ctx);
   }
   // Plain object / class instance (genuine-private instances are handled earlier in emitObject).
@@ -2645,9 +2678,9 @@ function emitObjectBody(value: object, name: string, ctx: Context): () => void {
 // `instanceof`. Returns false (caller uses the default ObjectCreate path) when not applicable.
 function emitGenuinePrivateInstance(value: object, name: string, ctx: Context): (() => void) | null {
   const proto = ObjectGetPrototypeOf(value);
-  const ctor = (proto as any)?.constructor;
-  if (typeof ctor !== "function" || ctor.prototype !== proto) return null;
-  if (!ctx.genuineClasses.has(ctor)) return null;
+  if (proto === null) return null;
+  const ctor = ownConstructor(proto);
+  if (ctor === undefined || !ctx.genuineClasses.has(ctor)) return null;
   // Emit the class first so its (and its ancestors') reify factories are in ctx.classReify.
   emitValue(ctor, ctx);
   const reify = ctx.classReify.get(ctor);
@@ -2666,8 +2699,8 @@ function emitGenuinePrivateInstance(value: object, name: string, ctx: Context): 
   // binding declared after this instance (e.g. a hosted arrow held in its own private slot).
   const patchClasses: Function[] = [];
   for (let p: object | null = proto; p && p !== Object.prototype; p = ObjectGetPrototypeOf(p)) {
-    const c = (p as any).constructor;
-    if (typeof c === "function" && c.prototype === p && (ctx.classReify.get(c)?.fields.length ?? 0) > 0) {
+    const c = ownConstructor(p);
+    if (c !== undefined && (ctx.classReify.get(c)?.fields.length ?? 0) > 0) {
       patchClasses.push(c);
     }
   }
@@ -2753,13 +2786,24 @@ function emitPrivateFields(name: string, value: object, ctx: Context): void {
 // methods, prototype chain, and `instanceof` survive (its own public fields are
 // then assigned by the caller). NOTE: `#private` fields are invisible to
 // reflection and are not captured, and the constructor is not re-run.
+// A prototype's OWN `constructor` (a class/function whose `.prototype` is this object), or
+// undefined. Reads the own property only — `proto.constructor` for a plain `Object.create` chain
+// object is INHERITED from Object.prototype, so a bare `.constructor` access walks the whole chain
+// (O(depth)); doing that per object made deep prototype chains O(N²). A class prototype always has
+// its constructor as an OWN (non-enumerable) property, so this finds it in O(1) with no walk.
+function ownConstructor(proto: object): Function | undefined {
+  const d = ObjectGetOwnPropertyDescriptor(proto, "constructor");
+  const c = d?.value;
+  return typeof c === "function" && (c as Function).prototype === proto ? (c as Function) : undefined;
+}
+
 function objectBaseExpression(value: object, ctx: Context): string {
   const proto = ObjectGetPrototypeOf(value);
   if (proto === Object.prototype) return "{}";
   if (proto === null) return "Object.create(null)";
 
-  const ctor = (proto as any).constructor;
-  if (typeof ctor === "function" && ctor.prototype === proto) {
+  const ctor = ownConstructor(proto);
+  if (ctor !== undefined) {
     return `Object.create(${emitValue(ctor, ctx)}.prototype)`;
   }
   return `Object.create(${emitValue(proto, ctx)})`;
@@ -2950,6 +2994,9 @@ const BUILTIN_PROTOTYPES: Set<object> = (() => {
   };
   add(DateCtor.prototype);
   add(RegExpCtor.prototype);
+  // Error.prototype is the base of every error subclass, so this one entry covers the
+  // `instanceof Error` route in emitObjectBody (which the memoized guard short-circuits).
+  add(Error.prototype);
   add(MapCtor.prototype);
   add(SetCtor.prototype);
   add(NumberCtor.prototype);
@@ -3615,7 +3662,14 @@ function isAsyncLocalStorage(value: object): boolean {
   // side effects) or throw on a revoked proxy. AsyncLocalStorage is not a Proxy.
   if ($isProxyObject(value)) return false;
   try {
-    if ((value as any)?.constructor?.name !== "AsyncLocalStorage") return false;
+    // Use the prototype's OWN constructor, not `value.constructor`: the latter is inherited, so for
+    // a deep `Object.create` chain it walks the whole chain (O(depth)) on EVERY object emitValue
+    // touches — an O(N²) trap. An ALS instance's direct prototype carries `AsyncLocalStorage` as its
+    // own constructor (same instances the old `value.constructor.name` check matched).
+    const proto = ObjectGetPrototypeOf(value);
+    if (proto === null) return false;
+    const ctor = ownConstructor(proto);
+    if (ctor === undefined || ctor.name !== "AsyncLocalStorage") return false;
     return typeof (value as any).run === "function" && typeof (value as any).getStore === "function";
   } catch {
     return false;
